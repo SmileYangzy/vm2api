@@ -6,12 +6,12 @@ services:
     image: ${VM2API_EMULATION_IMAGE:-ghcr.io/dofastted/vm2api:v1.3.47@sha256:8783c24ec9aa79647f4e6c73b5e6ecacde95993adcc299867a69dcaea28fd44f}
     platform: linux/amd64
     cpus: 2.0
-    mem_limit: 2g
     pids_limit: 512
     environment:
       DOCKER_DEFAULT_PLATFORM: linux/amd64
       HOST: ${VM2API_BIND_HOST:-127.0.0.1}
-      KIN_VM_MEMORY: ${KIN_VM_MEMORY:-2g}
+      # Docker memory=0 means unlimited; override older .env values too.
+      KIN_VM_MEMORY: "0"
     volumes:
       # Static ARM64 client avoids the amd64 Go netpoll crash under QEMU.
       - ./.local/docker-arm64:/usr/local/bin/docker:ro

@@ -14,7 +14,6 @@ values = {
     "VM2API_CONTAINER_NAME": "vm2api-arm-experiment",
     "VM2API_BIND_HOST": "127.0.0.1",
     "PORT": "8787",
-    "KIN_VM_MEMORY": "2g",
 }
 try:
     fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

@@ -32,6 +32,8 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 `DOCKER_DEFAULT_PLATFORM=linux/amd64` 会被控制面的 `execFileSync` 继承，覆盖槽镜像 pull/build/run。
 因此当前版本无需修改槽位业务代码；不能仅设置 Compose 的 `platform` 而遗漏动态创建的槽位。
 本 override 保留上游 Docker socket/host network 设计，运行时数据迁到 `.local/amd64-emulation/`。
+控制面不设容器内存上限；槽位通过 `KIN_VM_MEMORY: "0"` 使用 Docker 的无限制设置，覆盖旧 `.env` 中的 2g 值。
+已有槽容器需要停止并重建才能解除旧限制（保留绑定挂载的槽位数据）；`docker update --memory 0` 不会清除已有上限。控制面由 Compose 重建应用配置。
 
 ## 固定依赖
 
