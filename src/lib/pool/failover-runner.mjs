@@ -339,6 +339,7 @@ export class FailoverRunner {
     model,
     stickyKey = null,
     stickyKeys = null,
+    stickyDeviceId = null,
     stream = false,
     deliveryMode = null,
     signal,
@@ -365,6 +366,7 @@ export class FailoverRunner {
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
       if (sessionId) payload.sessionId = sessionId
+      if (stickyDeviceId) payload.deviceId = stickyDeviceId
       for (const key of bindKeys) {
         const prev = this.stickyRouter.resolve?.(key)
         // A live pin on another account means this request only spilled for
@@ -399,6 +401,7 @@ export class FailoverRunner {
         selected = await this.scheduler.selectAndReserve({
           model,
           stickyKey,
+          stickyKeys: bindKeys,
           excluded,
           spilled,
           signal,
@@ -429,22 +432,24 @@ export class FailoverRunner {
       }
 
       if (!selected?.ok) {
-        return preferLastResult(
-          lastResult,
-          lastPolicy,
-          poolError('account_pool_exhausted', 'No eligible Claude accounts remain', {
-            excluded_accounts: [...excluded],
-            reason: selected?.reason || 'no_eligible_accounts',
-            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-            soonest_available_ms: selected?.soonest_available_ms ?? null,
-            wait_reasons: selected?.wait_reasons || [],
-            eligible: selected?.eligible ?? 0,
-            available: selected?.available ?? 0,
-            sticky_cleared: !!selected?.sticky_cleared,
-            attempt_count: attemptNo - 1,
-          }),
-          { attemptCount: attemptNo - 1 },
-        )
+        const exhausted = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', {
+          excluded_accounts: [...excluded],
+          reason: selected?.reason || 'no_eligible_accounts',
+          wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+          soonest_available_ms: selected?.soonest_available_ms ?? null,
+          wait_reasons: selected?.wait_reasons || [],
+          eligible: selected?.eligible ?? 0,
+          available: selected?.available ?? 0,
+          sticky_cleared: !!selected?.sticky_cleared,
+          attempt_count: attemptNo - 1,
+          last_reason: lastPolicy?.reason || null,
+          last_status: lastResult?.status ?? null,
+        })
+        // A stream-scope incomplete hop already parked its own account; it is not
+        // why the pool is empty. Masking here hides account_pool_exhausted behind
+        // a fabricated 502 (sub2api returns ErrNoAvailableAccounts here).
+        if (isUnfinishedLastResult(lastResult, lastPolicy)) return exhausted
+        return preferLastResult(lastResult, lastPolicy, exhausted, { attemptCount: attemptNo - 1 })
       }
       bindAll(
         {
