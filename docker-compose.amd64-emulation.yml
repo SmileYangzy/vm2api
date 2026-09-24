@@ -1,0 +1,22 @@
+# Experimental x86-64 emulation on Linux ARM64.
+# Requires a working qemu-x86_64 binfmt handler on the Docker host.
+# DOCKER_DEFAULT_PLATFORM is inherited by the slot pull/build/run commands.
+services:
+  vm2api:
+    image: ${VM2API_EMULATION_IMAGE:-ghcr.io/dofastted/vm2api:v1.3.47@sha256:8783c24ec9aa79647f4e6c73b5e6ecacde95993adcc299867a69dcaea28fd44f}
+    platform: linux/amd64
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 512
+    environment:
+      DOCKER_DEFAULT_PLATFORM: linux/amd64
+      HOST: ${VM2API_BIND_HOST:-127.0.0.1}
+      KIN_VM_MEMORY: ${KIN_VM_MEMORY:-2g}
+    volumes:
+      # Static ARM64 client avoids the amd64 Go netpoll crash under QEMU.
+      - ./.local/docker-arm64:/usr/local/bin/docker:ro
+      - ./.local/amd64-emulation/vms:/opt/vm2api/vms
+      - ./.local/amd64-emulation/data:/opt/vm2api/data
+      - ./.local/amd64-emulation/bin:/opt/vm2api/bin
+      - ./.local/amd64-emulation/share:/opt/vm2api/share
+      - ./.local/amd64-emulation/config:/opt/vm2api/src/config
