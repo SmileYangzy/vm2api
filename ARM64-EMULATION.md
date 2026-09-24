@@ -1,6 +1,7 @@
 # Oracle ARM64 上的 amd64 模拟部署（实验）
 
-适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
+初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
+当前固定控制面镜像：`v1.3.48`（2026-09-24 已升级并检查）。
 本分支使用已发布的 amd64 控制面和槽位镜像，在 Linux ARM64 上通过 QEMU 执行。
 Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本。
 
@@ -39,7 +40,7 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.47@sha256:8783c24ec9aa79647f4e6c73b5e6ecacde95993adcc299867a69dcaea28fd44f` |
+| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.48@sha256:5c94ec80532179ebb0770cc17b0bb79d56a2d3e40b4860b4fd37711d420d4813` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
 | 原生 Docker CLI | `docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c` |
 | 本次 Ubuntu guest | `ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e` |
@@ -51,6 +52,19 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.48 升级记录
+
+- 先停止控制面，备份 SQLite、配置、`.env` 和升级前 Compose；槽位继续运行。
+- 备份位于安装目录下 `.local/backups/pre-v1.3.48-20260924/state.tar.gz`，目录权限 0700、文件权限 0600。
+- 备份 SHA-256：`fb47370da7bac05aeb474bdaf0eae84159c0e614a26876a3bbfd271ac1a28e21`。
+- 核对新旧镜像的 Rust kernel、Go worker、egress、kernel wrapper 摘要一致后，只重建控制面。
+- 升级后容器版本为 1.3.48；`sticky_sessions.device_id` 已迁移，SQLite `quick_check` 返回 `ok`。
+- 管理台 HTTP 200，原槽位保持同一启动时间，Rust/CLI 健康 HTTP 200；两容器 `memory.max` 均为 `max`。
+- 本次仍未导入账号，因此未验证真实模型调用。
+- 如需回退，应先停止控制面，并同时恢复旧镜像配置和升级前数据库；备份包含敏感信息，不要上传 GitHub。
+
+### 安装步骤
 
 前提：Ubuntu ARM64、Docker Engine、Compose、Python 3、`file`、systemd-binfmt，
 当前用户可使用 Docker 和 `sudo`。端口 8787、容器名 `vm2api-arm-experiment`、
