@@ -1,7 +1,7 @@
 # Oracle ARM64 上的 amd64 模拟部署（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前固定控制面镜像：`v1.3.48`（2026-09-24 已升级并检查）。
+当前固定控制面镜像：`v1.3.51`（2026-09-25 已升级并检查）。
 本分支使用已发布的 amd64 控制面和槽位镜像，在 Linux ARM64 上通过 QEMU 执行。
 Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本。
 
@@ -40,7 +40,7 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.48@sha256:5c94ec80532179ebb0770cc17b0bb79d56a2d3e40b4860b4fd37711d420d4813` |
+| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.51@sha256:c62998439b11b34a5c951f7c9ec76b6251ac9a0d5c6c434e05e6e50dcffc6d11` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
 | 原生 Docker CLI | `docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c` |
 | 本次 Ubuntu guest | `ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e` |
@@ -52,6 +52,19 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.51 升级记录（2026-09-25）
+
+- 合并上游 `ee4cfc73af8354e8eb4e04869245f9ba81b1a8b2`，并将控制面升级到以上固定镜像。
+- 停止控制面后备份完整 `.local/amd64-emulation`、`.env` 和 Compose；槽位当时仍运行，故槽位日志不是停机快照。
+- 备份：`.local/backups/pre-v1.3.51-20260925/state.tar.gz`，目录 0700、文件 0600。
+- 备份 SHA-256：`b3ed2d0399468da171b42ba3741d4e9587da82f02ca3325f8960f751ac740ef2`。
+- 自动 CLI 同步成功 `1/1, failed=0`，槽容器已重启，Rust 健康 HTTP 200、CLI `ready_slots=20`。
+- 源码、镜像、运行时 share 和 vm-01 的 `cli-node` SHA-256 一致：`2539083cb26ac7915fbb6dd417c4e854b35d705e4799e9ab86f212ae514cddb1`。
+- 镜像中的 `cc-node`、entrypoint 和 unit-circuit 源码摘要与此次上游一致。
+- 管理台 HTTP 200、SQLite `quick_check=ok`、`sticky_sessions.generation` 已迁移，原生 Docker CLI 可用。
+- 控制面和槽位 `memory.max=max`，其他服务未重启。当前仍为 `no_credential`，真实模型请求未验证。
+- 回退需同时恢复旧镜像、数据库和运行时文件；此备份包含敏感数据，不提交仓库。
 
 ### 本机 1.3.48 升级记录
 
