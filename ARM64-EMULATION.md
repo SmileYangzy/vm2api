@@ -1,7 +1,7 @@
 # Oracle ARM64 上的 amd64 模拟部署（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前固定控制面镜像：`v1.3.51`（2026-09-25 已升级并检查）。
+当前固定控制面镜像：`v1.3.52`（2026-09-25 已升级并检查）。
 本分支使用已发布的 amd64 控制面和槽位镜像，在 Linux ARM64 上通过 QEMU 执行。
 Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本。
 
@@ -40,7 +40,7 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.51@sha256:c62998439b11b34a5c951f7c9ec76b6251ac9a0d5c6c434e05e6e50dcffc6d11` |
+| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.52@sha256:b1728e4a0cda5c653147141ea900f62fc88514948b58444cd4700b525d1b7096` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
 | 原生 Docker CLI | `docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c` |
 | 本次 Ubuntu guest | `ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e` |
@@ -52,6 +52,15 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.52 升级记录（2026-09-25）
+
+- 合并上游 `5b4af18d6968a898d9a87bb48991d6fee718f16b`，控制面固定到上表镜像。
+- 本版上游未修改 CLI 二进制，保留已同步的槽位文件，不额外重启槽位。
+- 备份：`.local/backups/pre-v1.3.52-20260925/state.tar.gz`，目录 0700、文件 0600；停止控制面后备份数据库和运行时文件，槽位仍运行。
+- 备份 SHA-256：`df65a1011c65096b7e1391c449fdd1879e9ebd2200c7d23a35c771bf795be2b2`。
+- 保留 ARM64 Docker CLI、QEMU 和不限制内存的配置。
+- Tailscale Serve 管理台：`http://oracle-sg.tail056706.ts.net:8787/console`，仅 tailnet 可访问；后端仍监听 `127.0.0.1:8787`。
 
 ### 本机 1.3.51 升级记录（2026-09-25）
 
