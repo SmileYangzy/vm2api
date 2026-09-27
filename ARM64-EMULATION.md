@@ -1,7 +1,7 @@
 # Oracle ARM64 上的 amd64 模拟部署（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前固定控制面镜像：`v1.3.52`（2026-09-25 已升级并检查）。
+当前固定控制面镜像：`v1.3.65`（2026-09-27 已升级并检查）。
 本分支使用已发布的 amd64 控制面和槽位镜像，在 Linux ARM64 上通过 QEMU 执行。
 Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本。
 
@@ -40,7 +40,7 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.52@sha256:b1728e4a0cda5c653147141ea900f62fc88514948b58444cd4700b525d1b7096` |
+| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.65@sha256:625cd9b0c04666bae727ae9e0d9a7fed4a5c2b146c59f8c1b5b6e2b2d1cae0fc` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
 | 原生 Docker CLI | `docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c` |
 | 本次 Ubuntu guest | `ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e` |
@@ -53,9 +53,17 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 ## 新部署
 
+### 本机 1.3.65 升级记录（2026-09-27）
+
+- 合并 origin/main 后，控制面镜像固定为 `v1.3.65@sha256:625cd9b0c04666bae727ae9e0d9a7fed4a5c2b146c59f8c1b5b6e2b2d1cae0fc`；保留 ARM64 Docker CLI、QEMU、槽容器与数据挂载。
+- 停止控制面后备份 `.env`、Compose 和 `.local/amd64-emulation`；备份 `.local/backups/pre-v1.3.65-20260927/state.tar.gz`，SHA-256 `af6f4a5d35cb5bb304f6fc5eb155eb6b06fbb725e531db493c17570eb24f5b30`，目录 0700、文件 0600。
+- 控制面 VERSION=1.3.65，`/health` 和 `/console` 均 HTTP 200，SQLite `quick_check=ok`。`vm-01` 的 Rust 健康 HTTP 200、`ready_slots=20`、`schedulable=true`。
+- 同步过程已复制新版 `cli-node`、`cc-node`、`kin-kernel`，槽内哈希与模板一致。QEMU 冷启动超过同步接口的 30 秒等待，接口返回 HTTP 400 `health_timeout`，但随后槽位恢复健康；以后升级需以槽位最终健康状态核验。
+- 未发起真实模型请求；当前检查不能证明真实推理性能或账号状态。
+
 ### 本机 1.3.52 升级记录（2026-09-25）
 
-- 合并上游 `5b4af18d6968a898d9a87bb48991d6fee718f16b`，控制面固定到上表镜像。
+- 合并上游 `5b4af18d6968a898d9a87bb48991d6fee718f16b`，当时控制面固定到 v1.3.52 镜像。
 - 本版上游未修改 CLI 二进制，保留已同步的槽位文件，不额外重启槽位。
 - 备份：`.local/backups/pre-v1.3.52-20260925/state.tar.gz`，目录 0700、文件 0600；停止控制面后备份数据库和运行时文件，槽位仍运行。
 - 备份 SHA-256：`df65a1011c65096b7e1391c449fdd1879e9ebd2200c7d23a35c771bf795be2b2`。
@@ -64,7 +72,7 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 ### 本机 1.3.51 升级记录（2026-09-25）
 
-- 合并上游 `ee4cfc73af8354e8eb4e04869245f9ba81b1a8b2`，并将控制面升级到以上固定镜像。
+- 合并上游 `ee4cfc73af8354e8eb4e04869245f9ba81b1a8b2`，并将控制面升级到当时的 v1.3.51 镜像。
 - 停止控制面后备份完整 `.local/amd64-emulation`、`.env` 和 Compose；槽位当时仍运行，故槽位日志不是停机快照。
 - 备份：`.local/backups/pre-v1.3.51-20260925/state.tar.gz`，目录 0700、文件 0600。
 - 备份 SHA-256：`b3ed2d0399468da171b42ba3741d4e9587da82f02ca3325f8960f751ac740ef2`。
