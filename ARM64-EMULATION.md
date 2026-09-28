@@ -1,8 +1,8 @@
 # Oracle ARM64 原生控制面 + amd64 槽位（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前应用基线：上游 `v1.3.74` / `2a14cbb65a1a6def3f7e2eb42ac5a04fc2f958ca`（2026-09-28）。
-控制面使用本地构建的 `vm2api-arm64-control:v1.3.74`：Node、Python、iptables、Docker CLI、
+当前应用基线：上游 `v1.3.75` / `b1b48272c60da6e33cbe598fa2a88e2f198db687`（2026-09-28）。
+控制面使用本地构建的 `vm2api-arm64-control:v1.3.75`：Node、Python、iptables、Docker CLI、
 `kin-egress` 和 `kin-worker` 原生运行在 ARM64；上游未提供 ARM64 版本的槽位 CLI、Rust kernel
 和 OAuth helper 继续通过 QEMU 执行。本方案不是全栈原生 ARM，也未做推理性能基准测试。
 
@@ -46,7 +46,7 @@
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 上游应用与 amd64 资产 | `ghcr.io/dofastted/vm2api:v1.3.74@sha256:5787d2491a5d868127cde9a9b3107d125442d4bd1b95b8c0b63c12052b707e35` |
+| 上游应用与 amd64 资产 | `ghcr.io/dofastted/vm2api:v1.3.75@sha256:7bbe799b37c529c8a48e06e7af85ee4fc6b1187950372b54217a73477ea41902` |
 | 原生 Node 22 | `node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c` |
 | 原生 Go builder | `golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
@@ -60,6 +60,25 @@
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.75 升级记录（2026-09-28）
+
+- 合入上游 v1.3.75；本次上游变化集中在代理池管理页与前端格式化工具，未修改 ARM helper、
+  槽位运行、egress 或 iptables 代码。原分支备份为 `backup/pre-v1.3.75-20260928`。
+- 上游仍只发布 amd64 控制面镜像，因此继续由固定上游镜像提供应用与网页产物，
+  由本分支构建 ARM64 Node 运行环境和原生 Go helpers。
+- 停止槽位和控制面后备份运行状态：
+  `.local/backups/pre-v1.3.75-20260928/state.tar.gz`，199070458 bytes，目录 0700、文件 0600，
+  SHA-256 `608257db1496c7afcbc86b50791adda1878f86061a8d15934dd5957981beb6ce`。
+  备份中的 Compose 已指向 v1.3.75；回退镜像配置须从备份 Git 分支取回，并恢复匹配的运行状态。
+- `vm2api-arm64-control:v1.3.75` 构建成功；13 项 Node egress 测试以及 Go
+  `internal/egress`、`internal/proxy` 测试通过。VERSION=1.3.75，Node `process.arch=arm64`，
+  两个 Go helper 均为静态 ARM aarch64。
+- 槽位冷启动后 Rust 健康 HTTP 200、`ready_slots=20`；槽内 DNS/HTTPS 出口正常。
+  本地 `/health`、本地与公网 `/console` 均返回 HTTP 200。管理员 `KySheep` 登录返回 HTTP 200。
+- SQLite `quick_check=ok`；users=1、accounts=1、vms=1、api_keys=0、proxies=3，与升级前一致。
+  空载一次采样：控制面约 54 MiB、槽位约 385 MiB，两个容器 restart count 均为 0。
+- 槽位仍为 `no_credential`；本次未验证真实模型请求、TTFT、吞吐或并发能力。
 
 ### 本机 1.3.74 / 原生 ARM64 控制面升级记录（2026-09-28）
 

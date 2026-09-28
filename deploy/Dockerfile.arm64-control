@@ -1,7 +1,7 @@
 # Native ARM64 control plane with upstream amd64 slot assets.
 # Build from the same release checkout as UPSTREAM_IMAGE. QEMU is still needed
 # for the closed amd64 kernel/OAuth/CLI executables, not for host networking.
-ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.74@sha256:5787d2491a5d868127cde9a9b3107d125442d4bd1b95b8c0b63c12052b707e35
+ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.75@sha256:7bbe799b37c529c8a48e06e7af85ee4fc6b1187950372b54217a73477ea41902
 FROM --platform=linux/amd64 ${UPSTREAM_IMAGE} AS upstream
 
 FROM --platform=linux/arm64 golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS helpers
