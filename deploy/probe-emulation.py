@@ -24,7 +24,13 @@ def request(path, method="GET", timeout=240):
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        return {"http_status": error.code, "body": json.load(error)}
+        try:
+            body = json.load(error)
+        except (ValueError, UnicodeDecodeError):
+            body = {"ok": False, "error": "Non-JSON HTTP error response"}
+        if not isinstance(body, dict):
+            body = {"ok": False, "error": "Unexpected HTTP error response"}
+        return {**body, "http_status": error.code}
 
 # These paths contain only health/runtime fields, never export the entire VM.
 def sanitize(value):
@@ -52,6 +58,7 @@ if args.action != "status":
     result = request("/api/panel/vms/vm-01/" + args.action, "POST")
     detail = result.get("data", {})
     action_summary = {"action": args.action, "ok": result.get("ok"),
+                      "http_status": result.get("http_status", 200),
                       "error": result.get("error"),
                       "boot": detail.get("boot"), "halt": detail.get("halt")}
     print(json.dumps(sanitize(action_summary), ensure_ascii=False))

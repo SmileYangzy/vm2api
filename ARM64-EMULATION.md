@@ -1,9 +1,15 @@
-# Oracle ARM64 上的 amd64 模拟部署（实验）
+# Oracle ARM64 原生控制面 + amd64 槽位（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前固定控制面镜像：`v1.3.65`（2026-09-27 已升级并检查）。
-本分支使用已发布的 amd64 控制面和槽位镜像，在 Linux ARM64 上通过 QEMU 执行。
-Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本。
+当前应用基线：上游 `v1.3.74` / `2a14cbb65a1a6def3f7e2eb42ac5a04fc2f958ca`（2026-09-28）。
+控制面使用本地构建的 `vm2api-arm64-control:v1.3.74`：Node、Python、iptables、Docker CLI、
+`kin-egress` 和 `kin-worker` 原生运行在 ARM64；上游未提供 ARM64 版本的槽位 CLI、Rust kernel
+和 OAuth helper 继续通过 QEMU 执行。本方案不是全栈原生 ARM，也未做推理性能基准测试。
+
+`deploy/Dockerfile.arm64-control` 复用固定上游镜像的应用和网页产物，从当前 checkout 编译 Go helpers，
+并显式覆盖本分支的 `src/lib/vm/egress.mjs`。构建会校验 checkout 与镜像的 VERSION 一致。
+其他 checkout 源码修改不会自动进入此镜像；增加应用补丁时须显式 COPY 或改为完整源码构建。
+原生 helpers 放入 entrypoint 使用的 `image-bin`，确保重启不会被 amd64 版本覆盖。
 
 ## 实测结论（2026-09-24）
 
@@ -40,7 +46,9 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 控制面 | `ghcr.io/dofastted/vm2api:v1.3.65@sha256:625cd9b0c04666bae727ae9e0d9a7fed4a5c2b146c59f8c1b5b6e2b2d1cae0fc` |
+| 上游应用与 amd64 资产 | `ghcr.io/dofastted/vm2api:v1.3.74@sha256:5787d2491a5d868127cde9a9b3107d125442d4bd1b95b8c0b63c12052b707e35` |
+| 原生 Node 22 | `node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c` |
+| 原生 Go builder | `golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
 | 原生 Docker CLI | `docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c` |
 | 本次 Ubuntu guest | `ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e` |
@@ -52,6 +60,27 @@ Docker CLI 使用静态 ARM64 版本，其余应用二进制保持上游版本�
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.74 / 原生 ARM64 控制面升级记录（2026-09-28）
+
+- 合入上游 v1.3.74；原分支备份为 `backup/pre-v1.3.74-20260928`。
+- 停止控制面与槽位后备份 `.env`、Compose 和运行数据：
+  `.local/backups/pre-v1.3.74-20260928/state.tar.gz`，目录 0700、文件 0600，
+  SHA-256 `17274fe305598409f7fbb25135a902509eb5b0a9d393c78f96b097c68db831bd`。
+  此快照的 Compose 已改为新镜像；回退镜像配置需从备份 Git 分支取回，同时恢复匹配的数据库和运行文件。
+- 原 amd64 Go egress 在 QEMU 中出现 `taggedPointerPack` / netpoll 崩溃，amd64 iptables 出现
+  `Failed to initialize nft: Protocol not supported`。改为原生控制面后，Go helper 与 iptables 正常运行。
+- Oracle 宿主 INPUT 默认 REJECT 会阻断 REDIRECT 到本机的代理 TCP/DNS。程序现按代理的网桥、
+  源/目标子网和 helper 端口插入 ACCEPT，先检查避免重复，并在删除代理时对称清理。
+  保留原有 FORWARD DROP，不放开全局端口，也不修改其他防火墙规则。
+- 验证：Node `process.arch=arm64`，两个 Go helper 为静态 ARM aarch64；13 项 Node egress 测试、
+  Go `internal/egress` 和 `internal/proxy` 测试通过。槽内 DNS 与经既有 SOCKS 出口的 HTTPS 成功，
+  本地 `/health` 和公网管理台 HTTP 200；Rust 健康 HTTP 200、CLI 内部 `ready_slots=20`。
+  控制面重启后原生二进制与 DNS/HTTPS 仍正常，槽容器保持运行，未自动重启。
+- SQLite `quick_check=ok`，users/accounts/vms/proxies 数量与备份一致。管理员 ID 保持不变。
+  升级前后均保留一条账号记录，但该行 credentials 为空对象，槽内无实际 credentials.json；
+  当前 `no_credential`，真实模型调用、TTFT、吞吐与并发上限尚未验证。
+- 一次空载采样：控制面约 52 MiB，槽位约 391 MiB。这不是性能对照实验或容量承诺。
 
 ### 本机 1.3.65 升级记录（2026-09-27）
 
@@ -110,7 +139,8 @@ python3 deploy/init-emulation-env.py
 docker pull --platform linux/amd64 ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e
 docker tag ghcr.io/dofastted/kin-os-ubuntu@sha256:d2c63cd5a7e2cb95d40b0b32ef4c60be578c909e10b0ee56df7ab269fb94e01e ghcr.io/dofastted/kin-os-ubuntu:24.04
 
-docker compose -f docker-compose.yml -f docker-compose.amd64-emulation.yml up -d --no-build
+docker compose --progress plain -f docker-compose.yml -f docker-compose.amd64-emulation.yml -f docker-compose.arm64-native.yml build
+docker compose -f docker-compose.yml -f docker-compose.amd64-emulation.yml -f docker-compose.arm64-native.yml up -d --no-build
 python3 deploy/probe-emulation.py start
 # 冷启动需等待，之后检查 kernel_detail.rust_health。
 python3 deploy/probe-emulation.py status
@@ -130,11 +160,13 @@ python3 deploy/probe-emulation.py status
 - 远端目标：`127.0.0.1:8787`。
 - 浏览器：`http://127.0.0.1:18787/console`。
 
-管理员用户名为 `admin`。在服务器终端查看本实例密码：
+首次初始化默认管理员用户名为 `admin`；现有部署的登录身份以数据库为准。
+`.env` 用于初始化或 fallback，单独修改它不会更新已有管理员的密码 hash。
+在服务器终端查看私有初始化配置：
 
 ```bash
 cd /home/ubuntu/vm2api-arm-experiment-20260924
-grep '^VM2API_ADMIN_PASSWORD=' .env
+grep '^VM2API_ADMIN_' .env
 ```
 
 在管理台为 `vm-01` 导入自己的账号凭证，再用管理台测试聊天。
@@ -148,13 +180,13 @@ Compose 只管理控制面；槽位由控制面创建，需要先单独停止：
 
 ```bash
 python3 deploy/probe-emulation.py stop
-docker compose -f docker-compose.yml -f docker-compose.amd64-emulation.yml stop
+docker compose -f docker-compose.yml -f docker-compose.amd64-emulation.yml -f docker-compose.arm64-native.yml stop
 ```
 
 恢复：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.amd64-emulation.yml up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.amd64-emulation.yml -f docker-compose.arm64-native.yml up -d --no-build
 python3 deploy/probe-emulation.py start
 ```
 

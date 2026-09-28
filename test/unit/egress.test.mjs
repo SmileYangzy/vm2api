@@ -58,6 +58,33 @@ test('iptables plan redirects tcp and dns, returns subnet, drops the rest', () =
   assert.ok(plan.del.some((row) => row.includes('-X')))
 })
 
+test('host INPUT allows only bridge subnet helper ports and removes the same rules', () => {
+  const plan = iptablesPlan({
+    chain: 'KEGa1b2c3d4', bridge: 'kega1b2c3d4', subnet: '172.31.0.0/24',
+    tcpPort: 20010, dnsPort: 20011,
+  })
+  const allows = plan.add.filter((row) => row.includes('-I') && row.includes('INPUT'))
+  assert.equal(allows.length, 2)
+  for (const rule of allows) {
+    const arg = (name) => rule[rule.indexOf(name) + 1]
+    assert.equal(arg('INPUT'), '1') // Must precede the host's terminal REJECT.
+    assert.equal(arg('-i'), 'kega1b2c3d4')
+    assert.equal(arg('-s'), '172.31.0.0/24')
+    assert.equal(arg('-d'), '172.31.0.0/24')
+    assert.equal(arg('-j'), 'ACCEPT')
+    if (arg('-p') === 'tcp') {
+      assert.equal(arg('--dports'), '20010,20011')
+    } else {
+      assert.equal(arg('-p'), 'udp')
+      assert.equal(arg('--dport'), '20011')
+    }
+    const spec = rule.slice(5)
+    assert.ok(plan.add.some((row) => JSON.stringify(row) === JSON.stringify(['-t', 'filter', '-C', 'INPUT', ...spec])))
+    assert.ok(plan.del.some((row) => JSON.stringify(row) === JSON.stringify(['-t', 'filter', '-D', 'INPUT', ...spec])))
+  }
+  assert.equal(plan.del.filter((row) => row.includes('INPUT')).length, allows.length)
+})
+
 test('slot network is bound proxy net and never host', () => {
   const vm = { proxy: { id: 'px-a1b2c3d4' } }
   assert.equal(slotNetworkForVm(vm, { KIN_VM_NETWORK: 'host' }), 'kin-eg-px-a1b2c3d4')

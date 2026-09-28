@@ -1,0 +1,50 @@
+# Native ARM64 control plane with upstream amd64 slot assets.
+# Build from the same release checkout as UPSTREAM_IMAGE. QEMU is still needed
+# for the closed amd64 kernel/OAuth/CLI executables, not for host networking.
+ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.74@sha256:5787d2491a5d868127cde9a9b3107d125442d4bd1b95b8c0b63c12052b707e35
+FROM --platform=linux/amd64 ${UPSTREAM_IMAGE} AS upstream
+
+FROM --platform=linux/arm64 golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS helpers
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=arm64
+WORKDIR /src/worker
+COPY worker/go.mod worker/go.sum ./
+RUN go mod download
+COPY worker/ ./
+COPY VERSION /source-version
+COPY --from=upstream /opt/vm2api/VERSION /upstream-version
+RUN cmp /source-version /upstream-version \
+    && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-egress ./cmd/kin-egress \
+    && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-worker ./cmd/kin-worker
+
+FROM --platform=linux/arm64 docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS dockercli
+FROM --platform=linux/arm64 node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+WORKDIR /opt/vm2api
+# The official image supplies its tested application, web build and slot assets.
+COPY --from=upstream /opt/vm2api/ /opt/vm2api/
+# Branch patch: scoped host INPUT rules for redirected slot traffic.
+COPY src/lib/vm/egress.mjs /opt/vm2api/src/lib/vm/egress.mjs
+# The standalone OAuth helper still needs the amd64 dynamic loader under QEMU.
+COPY --from=upstream /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
+COPY --from=upstream /usr/lib64/ /usr/lib64/
+RUN test -e /lib64 || ln -s usr/lib64 /lib64
+# The upstream entrypoint refreshes mounted binaries on every boot. Replace the
+# image sources so restarts cannot silently reinstall the amd64 Go helpers.
+COPY --from=helpers /out/kin-egress /out/kin-worker /opt/vm2api/image-bin/
+COPY --from=upstream /usr/local/bin/vm2api-entrypoint /usr/local/bin/vm2api-entrypoint
+ENV NODE_ENV=production \
+    HOST=127.0.0.1 \
+    PORT=8787 \
+    KIN_PROJECT_ROOT=/opt/vm2api \
+    KIN_DATA_DIR=/opt/vm2api/data \
+    KIN_KERNEL_BIN=/opt/vm2api/bin/kin-kernel \
+    KIN_EGRESS_BIN=/opt/vm2api/bin/kin-egress \
+    KIN_WORKER_BIN=/opt/vm2api/bin/kin-worker \
+    KIN_CODEX_KERNEL_BIN=/opt/vm2api/bin/kin-codex-kernel \
+    KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth \
+    DOCKER_DEFAULT_PLATFORM=linux/amd64
+EXPOSE 8787
+ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]

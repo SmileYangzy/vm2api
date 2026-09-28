@@ -1,0 +1,9 @@
+# Add after docker-compose.yml and docker-compose.amd64-emulation.yml.
+# Control plane is ARM64; dynamically created slot guests stay amd64.
+services:
+  vm2api:
+    image: vm2api-arm64-control:v1.3.74
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.arm64-control
