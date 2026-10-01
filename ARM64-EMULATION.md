@@ -74,6 +74,9 @@
 - Oracle INPUT 放行继续限定到代理网桥、源/目标子网和 helper 端口，并保留上游 NAT 规则的顺序。
 - 修复新版集群打包与原生控制面混用二进制的问题：远端包选取独立 amd64 helper，
   本机保持原生 ARM；测试检查 ELF 架构并确认错误的 ARM 远端包会被拒绝。
+  修复后的集群、egress 与 release 相关测试共 51 项，50 通过、1 项因未提供 ssh-keygen 跳过。
+  部署后检查实际 slotPayload：本机 worker/egress 的 ELF 架构为 AArch64（183），
+  远端包中两项 helper 均为 x86-64（62）。本次未在真实 SSH 节点执行建槽。
 - 集群远程 iptables 生成测试覆盖新 INPUT 检查/插入配对。完整 Node 单元测试：
   2038 项，2028 通过、10 项按上游条件跳过、0 失败。
 - 完整 Go worker `go test ./...` 通过（config、credential、egress、oauth、oauthcmd、proxy、
