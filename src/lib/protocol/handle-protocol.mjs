@@ -109,7 +109,7 @@ import {
   pinConversationCacheTtl,
   resolveCacheTtl,
 } from './cache-ttl.mjs'
-import { trackCachePrefix } from './cache-prefix.mjs'
+import { describeCacheContinuity, trackCachePrefix } from './cache-prefix.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
 import { dispatchStreamInference } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
@@ -193,7 +193,16 @@ export function createHandleProtocol(deps) {
     const summary = formatPoolSelectionSummary(details)
     logBag.error_code = originalCode || mapped.body?.error?.code
     logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    // Only a known wake time (cooldown / RPM / window reset) earns a Retry-After.
+    if (mapped.body?.error?.code === 'pool_overloaded' && Number(result?.retryAfterSec) > 0) {
+      mapped.retryAfterSec = Number(result.retryAfterSec)
+    }
     return mapped
+  }
+
+  function sendMapped(res, mapped) {
+    if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+    return json(res, mapped.status, mapped.body)
   }
 
   function acceptAssistantHop(result) {
@@ -347,6 +356,7 @@ export function createHandleProtocol(deps) {
       outbound_body: null,
       outbound_headers: null,
       outbound_summary: null,
+      cache_continuity: null,
       vm_id: null,
       account_id: null,
       workspace: 'client',
@@ -691,6 +701,10 @@ export function createHandleProtocol(deps) {
         ? stickyRouter.familyPoolKey(req, familySession, { trusted: familyTrusted })
         : stickyRouter?.familyKey?.(req, familySession, 'anthropic') || null
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
+    // An explicit child counts against its root's conversation window, not a
+    // new one. Without a local root record there is no relation to trust.
+    const rootWindowKey = parentSession ? stickyRouter?.canonicalSessionKey?.(parentSession) || null : null
+    const windowKey = rootWindowKey && stickyRouter?.resolve?.(rootWindowKey) ? rootWindowKey : undefined
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
     const outboundSessionId = resolveOutboundSessionId(callerSession, {
@@ -904,6 +918,7 @@ export function createHandleProtocol(deps) {
         deviceKey,
         skipSessionSeat: seatless,
         familyKey,
+        windowKey,
         familyVmId,
         pinVmId,
         ownerScope,
@@ -913,18 +928,23 @@ export function createHandleProtocol(deps) {
         signal: clientAbort.signal,
         applyAttempt: async (body, selected, extra = {}) => {
           try {
-            touchTelemetrySession(cfg.paths.project, selected.vmId)
+            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)
           } catch {}
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
+          const keptSession = extra.freshSlot ? '' : stickyBound?.sessionId || ''
+          const keptAccount = extra.freshSlot ? '' : stickyBound?.accountId || ''
+          const keptVm = extra.freshSlot ? '' : stickyBound?.vmId || ''
           const attemptSessionId = resolveOutboundSessionId(callerSession, {
             ...sessionContext,
             accountId: selected.accountId,
-            boundSessionId: stickyBound?.sessionId || '',
-            boundAccountId: stickyBound?.accountId || '',
-            boundVmId: stickyBound?.vmId || '',
+            boundSessionId: keptSession,
+            boundAccountId: keptAccount,
+            boundVmId: keptVm,
             vmId: selected.vmId,
-            epoch: `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
+            epoch: extra.freshSlot
+              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
+              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
           })
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
@@ -959,6 +979,7 @@ export function createHandleProtocol(deps) {
             hopBody = prepareCliHopBody(repaired ? body : hopBody, {
               stream: upstreamStream,
               repaired,
+              cacheTtl: requestedCacheTtl,
             })
             hopBody = await materializeRemoteImageSources(hopBody)
             if (identity) {
@@ -966,14 +987,15 @@ export function createHandleProtocol(deps) {
                 officialClient: officialTraffic,
                 sessionId: attemptSessionId,
                 mode: sessionMode,
-                accountId: selected.accountId,
-                boundSessionId: stickyBound?.sessionId || '',
-                boundAccountId: stickyBound?.accountId || '',
-                boundVmId: stickyBound?.vmId || '',
+                boundSessionId: keptSession,
+                boundAccountId: keptAccount,
+                boundVmId: keptVm,
                 vmId: selected.vmId,
                 epoch: attemptStartedAt,
               })
             }
+            preserveCacheBreakpoints = true
+            cacheTtl = requestedCacheTtl
             if (getRouting()?.logging?.mode === 'debug') logBag.outbound_body = hopBody
 
             // 0注入 hides CLI billing + env and the standing Node left in the leftover.
@@ -994,6 +1016,16 @@ export function createHandleProtocol(deps) {
             logBag.official_cc_inference = 'cli-hop'
             logBag.provider = 'local_cli'
             logBag.outbound_summary = summarizeBody(hopBody)
+            logBag.cache_continuity = describeCacheContinuity({
+              inbound,
+              outbound: hopBody,
+              layer: 'node_object',
+              ttl: requestedCacheTtl,
+              sessionId: attemptSessionId,
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              requestId: logCtx.request_id,
+            })
             noteCachePrefix(selected, attemptSessionId, hopBody)
             return { body: hopBody, meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true } }
           }
@@ -1053,6 +1085,16 @@ export function createHandleProtocol(deps) {
           if (getRouting()?.logging?.mode === 'debug') logBag.outbound_body = prepared.body
           logBag.outbound_headers = redactHeaders(prepared.headers || {})
           logBag.outbound_summary = summarizeBody(prepared.body)
+          logBag.cache_continuity = describeCacheContinuity({
+            inbound,
+            outbound: prepared.body,
+            layer: 'node_object',
+            ttl: cacheTtl,
+            sessionId: attemptSessionId,
+            vmId: selected.vmId,
+            accountId: selected.accountId,
+            requestId: logCtx.request_id,
+          })
           noteCachePrefix(selected, attemptSessionId, prepared.body)
           return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
         },
@@ -1162,7 +1204,8 @@ export function createHandleProtocol(deps) {
     logBag.vm_id = result?.vmId || null
     logBag.account_id = result?.accountId || null
     logBag.final_account_id = result?.accountId || null
-    logBag.attempt_count = result?.attemptCount || null
+    // Zero executions is a real 0, not unknown; the VM is the last one that ran.
+    logBag.attempt_count = result?.attemptCount ?? 0
     logBag.final_state = result?.finalState || result?.terminalState || null
     logBag.upstream_status = result?.status ?? null
     logBag.usage = result?.body?.usage || result?.usage || null
@@ -1225,7 +1268,7 @@ export function createHandleProtocol(deps) {
       if (!res.headersSent) {
         const mapped = mapProtocolClientError(result, logBag, result?.body?.error?.code || 'upstream_error')
         if (!isClientCancelledResult(result) && mapped.body?.error?.code !== 'client_cancelled') stats.errors++
-        return json(res, mapped.status, mapped.body)
+        return sendMapped(res, mapped)
       }
       if (result?.ok && protocol !== 'anthropic.messages') {
         res.write('data: [DONE]\n\n')
@@ -1244,7 +1287,7 @@ export function createHandleProtocol(deps) {
       const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
       const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
       if (mapped.body?.error?.code !== 'client_cancelled') stats.errors++
-      return json(res, mapped.status, mapped.body)
+      return sendMapped(res, mapped)
     }
 
     let output

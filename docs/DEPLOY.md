@@ -147,6 +147,17 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 Node 听 `:8787`。HTTPS 放在 nginx。
 
 ```nginx
+# 集群页终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
+location ~ ^/api/panel/cluster/nodes/[^/]+/shell$ {
+  proxy_pass http://127.0.0.1:8787;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_buffering off;
+  proxy_read_timeout 3600s;
+}
+
 location / {
   proxy_pass http://127.0.0.1:8787;
   proxy_http_version 1.1;
@@ -158,13 +169,15 @@ location / {
 }
 ```
 
+`Connection ""` 会剥掉 Upgrade，终端握手拿不到 101，面板里一直连不上；所以 shell 路径单独放在前面。
+
 ## 本机 Node（备选）
 
 仓内已有 `bin/kin-*`。还要 `npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`，以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
 
 ## 一键安装 / 更新
 
-`deploy/install.sh` 对齐 sub2api / CLIProxyAPI：查 GitHub 最新 Release → checkout tag → 重建控制面。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。构建前若 `.dockerignore` 挡住 `CHANGELOG.md` 会自动补 `!CHANGELOG.md` 并重试一次。
+`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译。控制台是仓内 `web/dist`，打进镜像，不再在镜像构建里跑 `pnpm build`。`--from-source` 也只拷贝这份预编译产物。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
 
 ### 两类安装错误
 

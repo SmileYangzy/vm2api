@@ -1,5 +1,127 @@
 # Changelog
 
+## 1.3.89 — 2026-10-01
+
+- 集群 VM 放置：存在集群节点时，管理员可把 Claude / Rust VM 创建到 SSH 加入的 VPS。节点槽位使用自包含镜像 `vm2api/kin-slot-<kernel>:<sha12>`，经 SSH streamlocal 管理容器并中继 kernel / worker socket；凭据以节点副本为准，导入推送、刷新拉回。SOCKS5 出口在节点上按槽位成对部署（`kin-02` / `kin-02-egress`，网络 `kin-02-net`），槽位删除或换出口时回收；节点槽位允许使用与内存上限等量的 swap。本机/节点差异收敛到 `slotHost(vm)` 契约；Codex、官方 CC 初始化、wrap 修复/提升、引擎与 auth_scheme 切换在节点上返回 `remote_unsupported`。面板：VM 标出所在服务器（本机 `local`），集群页显示各节点 Docker 运行/总数，节点 Docker 列表按槽位把出口排在一起。新增 `POST /api/panel/cluster/nodes/:id/{preflight,slot-image}`。
+- 集群页终端：nginx 必须对 `/api/panel/cluster/nodes/<id>/shell` 透传 `Upgrade`（见 `docs/DEPLOY.md`「反代」）；`Connection ""` 会让终端一直连不上。
+- 节点槽位隔离：`~/.claude` 改为独立挂载（宿主侧 `claude/`），控制面对槽位文件的读写不再跟随符号链接（写用 `O_EXCL` 临时文件 + 句柄授权 + rename，读用 `O_NOFOLLOW`），槽内进程无法借符号链接让控制面读取其他槽位凭据或写出槽位目录。已有节点槽位在下次启动 / 重载时自动重建并迁移凭据。
+- 节点槽位镜像 tag 只取内容哈希，不再带版本号：只改版本号的发布不会让节点上已有镜像失效。镜像缺失时启动 / 重载会自动在节点上构建（同节点同内核单飞），不再直接报错要求手动准备。
+- 导入凭据换票前，把 VM 记录上的出口同步为代理池当前绑定：换票已经用池里的 SOCKS5，记录没跟上时节点槽位会因为没有出口拒绝启动，表现为换票 502。
+- 新建 VM 自动编号跳过已删除 VM 留下用量 / 账号历史的序号，新槽位不再显示旧账号和旧花费；创建弹窗名称留空时交给后端编号，不再在前端推算。
+- 修复 #194：SOCKS5 IPv6 地址在导入、持久化加载、探测、URL 生成和 endpoint 比较中统一规范化；socket 使用裸 IPv6，URL / 地址展示使用 `[host]:port`，保留 IPv4、hostname 和凭证编码行为。
+- 设置 → SOCKS5 新增「IPv6 代理出口」，默认关闭。开启后才能探测、绑定和使用 IPv6 literal 代理；关闭会停止对应运行出口，保留槽位、绑定和探测历史，不计作代理故障。代理池和槽位网络状态显示「IPv6 已关闭」，远端出口同步失败单独提示；槽位网桥仍为 IPv4，DNS / 路由策略不变。
+- 单个槽位可覆盖全局配额（5h/7d 硬闸、最大会话、会话空闲、打满阻断、周仓拆分）。未改的项继续跟随设置 → 配额；槽位详情「运行」里查看和编辑，热更新，不进容器。GPT 槽位不使用这套配额。
+- 节点 Docker 页会列出已登记但还没有容器的槽位（没有出口时不会创建容器），避免这台 VPS 看起来是空的。
+
+已部署机升级：更新 Node 控制面（`src/`、`package*.json`）和 `web/dist`，`npm ci --omit=dev`（需要 `ssh2`、`ws`），重启一次 Node；按上条补 nginx 终端路径。二进制与 1.3.88 相同。节点槽位镜像 tag 只随 `/opt/kin` 内二进制内容变化；变了之后节点槽位下次启动会自动重建镜像。
+
+## 1.3.88 — 2026-10-01
+
+- 修复 #191 / #94：cli-hop 的 `stop_reason=max_tokens` 是正常截断，不再被槽内 CLI 转为 API 错误；保留内容、真实 usage 和 `message_delta` / `message_stop`，不触发自动重试。交互式 CLI 的输出上限恢复提示不变。移除 Node 的旧 `max_tokens<=64 → 1024` 规避分支；可配置的 `compatibility.min_max_tokens` 下限仍生效。
+- 修复 #190：kin-egress 拒绝原目标等于当前连接本地监听地址的直连流量，避免本机 / 同内网 SOCKS 对私网 direct 时形成自转发环路。控制面的启动等待和健康探测改用 `ss` 检查 LISTEN 状态，不再连接透明转发端口。
+- 更新预编译 `kin-egress` 和 `cli-node`；Rust kernel、web 控制台及其他二进制源码不变。本次仅包含上述两项修复及回归测试，不包含另一个任务的集群 / 槽位放置改动。
+
+已部署机升级：更新 Node 控制面、宿主机 / 远端出口的 `kin-egress` 和槽内 `share/wrap-cli/cli-node`，重启相关进程。仅改 Node 或版本号不能修复旧二进制；Rust kernel 无需重编。
+
+## 1.3.87 — 2026-09-30
+
+- 恢复面板用户管理（撤回 `3420f8a`）。admin 在侧栏「用户」页（`#/users`）新建、编辑角色/启用/自建配额、删除用户；每行「改密码」弹窗带确认密码与 8–128 位校验。改他人密码立即踢掉该用户全部会话；改自己密码保留当前会话、踢掉其它设备。`GET/POST/PATCH/DELETE /api/panel/users` 仅 admin / master key。
+- 改密后 SQLite `users` 为准，`VM2API_ADMIN_PASSWORD` 不再能登录同名账号。
+- 集群页接入 VPS 改为 SSH：控制面主动拨出（本机在 NAT 后可用，远端在 NAT 后可经已接入节点跳转），首连核对并固定主机指纹。常驻连接带 keepalive 和指数退避重连；指纹不符或认证失败停住等人工重连。凭证按 `VM2API_DB_SECRET` 加密落库。
+- 集群节点弹出式管理面板：xterm 终端（一次性票据 WebSocket）、远端 Docker（经 SSH 转发 docker.sock：信息、一键安装、建容器、启停重启、日志、删除）、连接详情。本机另开 unix socket 桥，`docker -H unix://<data>/cluster/<id>/docker.sock` 可直接用本机 docker CLI 管远端。去掉集群页示意行。
+- 集群页本机面板新增「链路」：控制面运行形态（进程 / 容器 host|bridge）、监听地址、公网出口与是否在 NAT 后（由已连接节点观测，不依赖第三方 IP 服务）、面板端口是否公网可达、本机 Docker 与槽容器数、集群出站就绪数。`GET /api/panel/cluster/local`。
+- 新依赖 `ssh2`、`ws`（Node）和 `@xterm/xterm`（web）；新迁移 `026_cluster_nodes`。
+
+已部署机升级：更新 Node 控制面（`src/`、`package*.json`）和 `web/dist`，本机 Node 部署先 `npm ci --omit=dev`（新增 `ssh2`、`ws`；镜像构建已包含），重启一次 Node。
+
+## 1.3.86 — 2026-09-30
+
+- 控制台侧栏左上角品牌区重做：vm2api 标识 + 放大的版本徽标（链到对应 GitHub Release）+ GitHub 仓库链接；移除 `Anthropic` / `GPT` 平台标签。侧栏折叠为图标时只留标识。
+- 登录后每天首次打开控制台，右下角弹出一次 GitHub Star 提示，10 秒后自动隐藏（悬停/聚焦时暂停，可手动关闭）。按本地日期记在 `localStorage` 的 `vm2api_star_hint_day`，当天不再出现。
+- `web/dist` 随本版重编。
+- 管理员（`role=admin`）不再受用户级并发上限（`users.concurrency`）约束；普通用户上限不变。
+- GPT-6.1 Sol 按官方价计费。标准档每百万 token：输入 $2、缓存读 $0.10、缓存写 $2.50、输出 $10。输入超过 272K 时整单按 2 倍输入和缓存、1.5 倍输出；Flex 为该档一半，Fast 为两倍。
+- Codex 额度查询的 `chatgpt-account-id` 优先用 access token 里的账号 ID。导入记录没有账号 ID 时也会带上。
+
+已部署机升级：更新 Node 控制面（`src/`）和 `web/dist`，重启一次 Node。不改 kernel / cli-node，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.85 — 2026-09-30
+
+- Claude Code 子 agent 不再排在主会话后面：带 `x-claude-code-agent-id` 的请求（Claude Code 2.1.139+，主线程不带）按子会话调度。会话 ID 由主会话 `session_id` + agent ID 派生（稳定 UUID），各 agent 各自一个 CLI 会话、各自串行，可用主会话所在 VM 的任意空闲执行位；会话窗口计在主会话头上，不新占 `max_sessions`。嵌套 agent（带 `x-claude-code-parent-agent-id`）同样挂在主会话下。主会话自己的多轮仍按 v1.3.7 规则串行。
+
+已部署机升级：只更新 Node 控制面（`src/`）并重启一次 Node。不改 kernel / cli-node，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.84 — 2026-09-29
+
+- 控制台创建槽位恢复「平台」选项：Claude（anthropic，默认）/ GPT（openai）。虚拟机页和导入向导共用同一弹窗，两处都能直接建 GPT 空槽，账号稍后用 OAuth 或 auth.json 导入。此前 `2288ab3` 把创建请求写死为 `platform: 'anthropic'`，控制台无法新建 GPT 槽。后端 `/api/panel/vms/create` 本就按请求体 `platform` / `family` 盖章，未改。
+- `web/dist` 随本版重编。
+
+已部署机升级：只需更新 `web/dist` 静态文件，不必重启 Node。不改 kernel / cli-node，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.83 — 2026-09-29
+
+- cli-hop 缓存：Node 清洗后写最后消息及 `messages.length>=4` 时倒数第二 user 断点，TTL 用入站会话已 pin 值。kernel 不再重打 last。native CLI 保留消息标记，自产 system/tools 沿用同一请求 TTL，总数 <= 4，thinking 不打点。独立 CLI 非 native 行为未扩大。
+- 调试日志增加有界 `cache_continuity`：入站/出站历史首差类型（图片/文本/结构）、断点与 TTL，层级标为 Node 对象，不把 Node 出站当成最终 wire，不保存完整提示词和图片。
+- C1 客户端图片预算：运行中的 OMP 是 18.4.2 二进制（`/home/mci777/.bun/bin/omp`），可读源码只有 `/mnt/x/oh-my-pi` v16.4.3 与全局 `@oh-my-pi/pi-coding-agent@17.4.0`。18.4.2 二进制仍按 provider 名查表（unknown 地板 5），没有 `compat.imageBudget` 入口。未改旧 node_modules、未重命名 provider、未把未知代理默认成 Anthropic。精确阻塞见 issues CSV。
+- 原事故 SQLite replay 因 200k/24 条截断跳过，不用客户端重建冒充。线上 usage 与 f123 差异闭环前不宣称缓存已治愈。
+- 发布基于 main v1.3.82，合入缓存连续性 PR #176；该 PR 原预留 1.3.81，因 1.3.82 已先发布顺延为 1.3.83。本版不改 kernel / cli-node 字节。
+
+本机改动未部署。覆盖控制面并重编 kernel / cli-node 才生效；不要 `wrap-cli/sync` 除非二进制字节变化。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.82 — 2026-09-29
+
+- cli-hop 恢复调用方 system：kin 分支只保留 billing、可选身份句、Timezone 和 Node/caller 原文，不再追加槽内 cwd、Platform、Notes 或默认 agent。真实 Claude Code 子代理的 agent prompt / Notes 不再误删，首尾空白保留。
+- 常驻约束默认不启用：`agent_standing_presets` 缺 map/key 为关闭，显式 true 仍开启；三种预设和约束文本不改。控制台预览与开关保存使用相同默认值，usage 不再扣除未注入的约束。
+- cli-node 按 Linux x64 baseline 重编并 UPX 压缩。补齐 native 快捷入口配置初始化与版本常量导入；否则重新编译的 native job 会在启动或首次查询时失败。
+- 发布基于 main v1.3.80；不合入独立的缓存连续性 PR #176（该 PR 预留 1.3.81）。
+
+部署需替换槽内 cli-node 并重启对应 kernel/CLI，配置热读不能加载新 ELF。保留旧文件回滚，不删除槽容器，不覆盖 live routing.json。system 文本变化后首次前缀冷写；不保证 cache_read 数值必然上升，0注入、约束关闭、无 agent 的真实模型输出单独验证。
+
+## 1.3.80 — 2026-09-29
+
+- 虚拟机页：每行和每张卡片右侧加「⋯」扩展菜单——测试链接、查看统计、重新授权、刷新令牌、恢复状态，重置槽位和删除排在分隔线后。点击一台 VM 不再跳到 `/vm/:id`，改为弹出详情卡；卡内保留「完整页面」入口，详情页不变。
+- 虚拟机列表更紧凑：类型列显示调用形式 `Console` / `OAuth` / `API`（Claude 槽刷新走 OAuth 接口、推理走 `Authorization: Bearer` 调 Console，所以完整 OAuth 与 Setup Token 都归 Console；只有 `x-api-key` 是 API；GPT 槽是 OAuth），Console 用 Anthropic 陶土橙、OAuth 蓝、API 白。`pro` / `max` 挪到账号列，优先级写成「优先级-N」，今日与 7D 请求合成一列。列头可拖动排序，顺序存浏览器，Alt+←/→ 可用键盘移动，右上角一键恢复默认。
+- 用量窗口在列表、网格卡片、详情卡、统计弹窗共用一套：5h / 7d / Fable 三行，条、百分比、窗口费用、重置倒计时对齐。GPT 槽的「查询额度 / 重置券」放在窗口下方。
+- 成本列的累计改取 `/usage` 账号行。`/api/panel/vms` 本来就不带费用字段，此前读 `vm.total_cost` 恒为 0。
+- 统计弹窗改成可视化：指标卡、今日 / 最高日信息卡、费用与请求双轴趋势、模型分布环形图、入站端点分布。后端 `GET /api/panel/vms/:id` 的 `billing.usage_stats` 带出近 30 个上海自然日的按日用量、模型排名和入站路径排名，日界与 `billing.today` 一致；老前端忽略这个字段。
+- 详情卡和四个弹窗改用原生滚动：Radix `ScrollArea` 在弹窗里不出滚动条，长内容下半部分看不到。
+- Sonnet 5.5 在 Node 出站清洗中沿用 Opus 5.5 的兼容策略：强制 `tool_choice` 转为 `auto`，指定客户端工具加 `strict: true`。不注入提示词，不保证一定调用该工具；Sonnet 5 保持原强制调用语义。
+- Messages / Chat / Responses 保留 strict 工具标记与结构化输出；`output_config.effort` 不再挡住 `response_format` / `text.format` 的 schema 转换，cli-hop 补齐嵌套对象的 `additionalProperties`。Responses 补传工具选择。
+
+已部署机升级：只覆盖控制面并重启 Node 一次；`web/dist` 是静态文件，单独更新不必重启，但 `billing.usage_stats` 需要新的 Node 才有。不改 kernel / cli-node，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.79 — 2026-09-29
+
+- 槽位 `settings.env` 不再把 `CLAUDE_CODE_USE_BEDROCK` 和 `CLAUDE_CODE_USE_VERTEX` 写成 `1`。官方 CLI 会把 `1` 当成启用 Amazon Bedrock / Vertex，推理去连 `169.254.169.254` 拿 AWS 凭证，不再请求 Anthropic。这两个变量现在固定为 `0`，调用方传入的 `1` 不会生效。
+
+已部署机升级：覆盖控制面并重启 Node 一次。已有槽的 `settings.json` 要等下一次种子重写（保存种子策略或官方初始化）才会变成 `0`。kernel / cli-node 未变，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.78 — 2026-09-29
+
+- Claude Code 出站身份对齐 2.1.284。默认 Sonnet 为 `claude-sonnet-5-5`：`max_tokens` 128000/128000，默认 effort `medium`，知识截止 June 2026。Sonnet 5 仍保留，缺省输出 64000。
+- 计费头在 first-party 且 prompt/turn 索引合法时，于 `cc_turn_origin` 后追加 `cc_prompt_index` 与 `cc_turn_index`。`cch` 种子和公式不变。
+- 槽位种子默认写入 `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`。cli-node 在该开关打开时，用 body 里的 `cc_prompt_id` 发送 `x-claude-code-prompt-id`。
+- 换票二进制 `kin-oauth-auth` 按 2.1.284 重编并 UPX 压缩到约 14MB。Node、worker 回退和二进制的 UA 都是 `claude-cli/2.1.284`。
+
+已部署机升级：覆盖控制面并重启 Node 一次，使新的 `bin/kin-oauth-auth` 生效。仓内 kernel / cli-node ELF 这次没有重编，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.77 — 2026-09-29
+
+- 双号池空闲位优先：粘性 / family / 设备只是偏好。绑定槽忙时这一轮借同平台空闲合格槽，绑定不动；预约竞争失败不再停下等原槽，前 4 个候选失败后第 5 个仍可达。
+- 重试预算：同一请求在同一 VM 最多 3 次实际执行（含传输层隐藏重试），空跳先换空闲 VM；不再累计逻辑 slot 坏位、不再因计数把 VM 标过载或重启 CLI。`max_total_attempts` / `max_account_switches` 用完后只尝试未试过的 VM，直到总 deadline。
+- 占位闭环：预约被额度 / 熔断 / Fable 拒绝时按逆序归还本次拿到的执行位、额度计数与会话窗口；`release()` 幂等。活跃请求的会话窗口不被空闲过期清掉，空闲从最后一次释放起算。迁移不回收其他在飞请求的执行位；迟到的完成不会把已迁走 / 已释放的绑定写回。
+- 显式子请求（有 `parent_session_id` / `root_session_id` 且父会话本地已绑定）计入父会话窗口，不新占 `max_sessions`，仍各占执行位；借到别的 VM 的一轮不在那里新开长期窗口。
+- OpenAI：并发 / RPM 同步检查并占位，kernel 初始化期间不再超卖；候选每跳重新读取、不再截断前 4 个；会话窗口按 `max_sessions` 计，不再拿 `session_slots` 顶替；绑定槽忙不解绑；`previous_response_id` 续接只在原账号，原账号不可用返回 `409 response_not_portable`。
+- #163：裸 429 不再按模型名定范围，改为当前执行单元短冷却并触发一次 `/usage`（与定时探测同一单飞、有界队列、超时与退避，失败不写 0%）；点名模型的才按模型冷却，每分钟限流按 RPM。正在服务或持有会话的账号，最新真实样本超过 `usage_probe.stale_sec` 即重新探测，不再以 reset 未到当作新鲜。额度 / 凭证硬排除时，该账号所有绑定会话连同会话窗口一起迁走。
+- 错误与日志：真实容量耗尽返回 `429 pool_overloaded`（号池负载过高，稍后再试），仅在已知恢复时刻带 `Retry-After`；没有合格账号返回 `503 pool_unavailable`；执行过的失败保留上游本义与最后执行的 VM / 账号 / 尝试数，零执行记 0。日志里没分到执行位显示「未分配执行位」，不再显示「未绑定账号」。
+
+已部署机升级：覆盖控制面与前端并重启 Node 一次。kernel / cli-node 未变，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
+
+## 1.3.76 — 2026-09-28
+
+- 空跳或客户端取消：坏掉的 native slot 直接跳过，同一会话改用下一个，直到 20 个用满。不在这次错误上重启 CLI。VM 还有坏 slot 且没有在飞请求时，闲时重启 CLI。20 个 slot 都坏了，把 VM 标成过载并重启 CLI。
+
+已部署机升级：只覆盖控制面并重启 Node 一次。二进制未变，不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
 
 ## 1.3.75 — 2026-09-28
 

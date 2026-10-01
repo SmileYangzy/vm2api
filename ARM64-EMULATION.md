@@ -1,14 +1,15 @@
 # Oracle ARM64 原生控制面 + amd64 槽位（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前应用基线：上游 `v1.3.75` / `b1b48272c60da6e33cbe598fa2a88e2f198db687`（2026-09-28）。
-控制面使用本地构建的 `vm2api-arm64-control:v1.3.75`：Node、Python、iptables、Docker CLI、
+当前应用基线：上游 `v1.3.89` / `33d0582cb336871d756219e321e867c75f941462`（2026-10-01）。
+控制面使用本地构建的 `vm2api-arm64-control:v1.3.89`：Node、Python、iptables、Docker CLI、
 `kin-egress` 和 `kin-worker` 原生运行在 ARM64；上游未提供 ARM64 版本的槽位 CLI、Rust kernel
 和 OAuth helper 继续通过 QEMU 执行。本方案不是全栈原生 ARM，也未做推理性能基准测试。
 
-`deploy/Dockerfile.arm64-control` 复用固定上游镜像的应用和网页产物，从当前 checkout 编译 Go helpers，
-并显式覆盖本分支的 `src/lib/vm/egress.mjs`。构建会校验 checkout 与镜像的 VERSION 一致。
-其他 checkout 源码修改不会自动进入此镜像；增加应用补丁时须显式 COPY 或改为完整源码构建。
+`deploy/Dockerfile.arm64-control` 从当前 checkout 安装 Node 依赖、复制应用源码和已提交的 `web/dist`，
+从 `worker/` 编译原生 Go helpers，并使用 checkout 中的 amd64 kernel、OAuth 和 wrap-cli 资产。
+固定上游镜像只提供剩余 amd64 动态程序所需的库和加载器；构建会校验它与 checkout 的 VERSION。
+应用、网页和本分支的 `src/lib/vm/egress.mjs` 补丁直接进入镜像，不依赖同版本发布镜像中的旧应用。
 原生 helpers 放入 entrypoint 使用的 `image-bin`，确保重启不会被 amd64 版本覆盖。
 
 ## 实测结论（2026-09-24）
@@ -46,7 +47,7 @@
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| 上游应用与 amd64 资产 | `ghcr.io/dofastted/vm2api:v1.3.75@sha256:7bbe799b37c529c8a48e06e7af85ee4fc6b1187950372b54217a73477ea41902` |
+| amd64 动态库来源 | `ghcr.io/dofastted/vm2api:v1.3.89@sha256:05dc3fbdc1263e3069e9ad09bef02ac827a191fb33a9cc1aed04580cca37517d` |
 | 原生 Node 22 | `node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c` |
 | 原生 Go builder | `golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
@@ -60,6 +61,18 @@
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.89 升级记录（2026-10-01）
+
+- 上游最新提交 `33d0582cb336871d756219e321e867c75f941462`。上游历史与旧 v1.3.75 分支分叉，
+  本次以完整最新上游树为代码基线，移植原有 8 个 ARM 部署文件及 egress 源码/测试补丁，
+  最终以双亲 merge 保留旧分支历史；升级前分支为 `backup/pre-v1.3.89-20261001`。
+- 原生镜像改为直接使用合并后的源码和已提交网页资产，并编译最新 Go worker/egress。
+  新增的 Node 依赖（ssh2、ws）在 ARM64 Node 22 环境安装。
+- Oracle INPUT 放行继续限定到代理网桥、源/目标子网和 helper 端口，并保留上游 NAT 规则的顺序。
+- 集群远程 iptables 生成测试覆盖新 INPUT 检查/插入配对。完整 Node 单元测试：
+  2038 项，2028 通过、10 项按上游条件跳过、0 失败。
+- 部署备份及最终验证结果在升级完成时记录于本节。
 
 ### 本机 1.3.75 升级记录（2026-09-28）
 

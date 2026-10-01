@@ -33,9 +33,12 @@ import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
+import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
+import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
-import { listQuotaFromHeaders } from '../pool/quota-window.mjs'
+import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
@@ -933,13 +936,16 @@ export async function buildProbeOne({
     lastProbe: qAfter.last_probe,
     probeSource: qAfter.probe_source,
     quota: qAfter,
-    policy: resolveTierPolicy(
-      {
-        tiers: accountQuota?.tiers,
-        quota: accountQuota?.config,
-        concurrency: accountQuota?.concurrency,
-      },
-      tier,
+    policy: applyVmQuotaPolicy(
+      resolveTierPolicy(
+        {
+          tiers: accountQuota?.tiers,
+          quota: accountQuota?.config,
+          concurrency: accountQuota?.concurrency,
+        },
+        tier,
+      ),
+      vmQuotaOverrideOf(vm),
     ),
   })
   const data = {
@@ -1224,7 +1230,7 @@ function hostStats() {
   }
 }
 
-function quotaFromAccount(acc, quotaConfig) {
+export function quotaFromAccount(acc, quotaConfig) {
   const u = acc?.unified || {}
   const listed = listQuotaFromHeaders(u)
   const sonnet = u.seven_day_sonnet || {}
@@ -1234,18 +1240,38 @@ function quotaFromAccount(acc, quotaConfig) {
       : u['7d_oi'] || {}
   const fable = u.fable || null
   const extra = u.extra_usage || null
+  const o5 = u.official?.['5h'] || u['5h'] || {}
+  const o7 = u.official?.['7d'] || u['7d'] || {}
+  const o5Limited = isOfficialWindowLimited(o5)
+  const o7Limited = isOfficialWindowLimited(o7)
+  const effectiveU5 = o5Limited
+    ? 1.0
+    : listed.utilization_5h != null
+      ? listed.utilization_5h
+      : o5.utilization != null
+        ? Number(o5.utilization)
+        : null
+  const effectiveU7 = o7Limited
+    ? 1.0
+    : listed.utilization_7d != null
+      ? listed.utilization_7d
+      : o7.utilization != null
+        ? Number(o7.utilization)
+        : null
+  const effectiveStatus5 = o5Limited ? 'rejected' : listed.status_5h || o5.status || null
+  const effectiveStatus7 = o7Limited ? 'rejected' : listed.status_7d || o7.status || null
   const q = {
-    utilization_5h: listed.utilization_5h,
-    utilization_7d: listed.utilization_7d,
+    utilization_5h: effectiveU5,
+    utilization_7d: effectiveU7,
     utilization_7d_sonnet: sonnet.utilization != null ? Number(sonnet.utilization) : null,
     utilization_7d_oi:
       oi.utilization != null ? Number(oi.utilization) : fable?.utilization != null ? Number(fable.utilization) : null,
-    reset_5h: listed.reset_5h || u.official?.['5h']?.reset || u['5h']?.reset || null,
-    reset_7d: listed.reset_7d || u.official?.['7d']?.reset || u['7d']?.reset || null,
+    reset_5h: listed.reset_5h || o5.reset || null,
+    reset_7d: listed.reset_7d || o7.reset || null,
     reset_7d_sonnet: sonnet.reset || null,
     reset_7d_oi: oi.reset || listed.reset_7d_oi || null,
-    status_5h: listed.status_5h || null,
-    status_7d: listed.status_7d || null,
+    status_5h: effectiveStatus5,
+    status_7d: effectiveStatus7,
     status_7d_sonnet: sonnet.status || null,
     status_7d_oi: oi.status || listed.status_7d_oi || null,
     extra_usage: extra,
@@ -1351,6 +1377,7 @@ function proxyConfigured(v, hit) {
 }
 
 function canImportCredential(v, hit) {
+  if (hit ? hit.blocked_reason : proxyBlockedReason(v.proxy)) return false
   if (hit) return !!(hit.enabled && hit.status !== 'dead' && hit.status !== 'fail')
   const base = v.proxy || {}
   const scheme = String(base.scheme || base.kind || '').toLowerCase()
@@ -1369,12 +1396,14 @@ function mergeVmProxy(v, poolSnap) {
   return {
     proxy: {
       id: hit?.id || base.id || v.proxy_id || null,
-      host: hit?.host || base.host || null,
+      host: normalizeSocksHost(hit?.host || base.host) || hit?.host || base.host || null,
       port: hit?.port ?? base.port ?? null,
       scheme: hit?.scheme || base.scheme || (hit?.id === 'px-local' || base.id === 'px-local' ? 'local' : 'socks5'),
       has_auth: hit?.has_auth ?? !!(base.url && /\/\/[^/@]+@/.test(base.url)),
       status: hit?.status ?? null,
       enabled: hit?.enabled ?? null,
+      blocked_reason: hit ? hit.blocked_reason || null : proxyBlockedReason(base),
+      address_family: hit?.address_family || socksProxyFamily(base) || null,
       latency_ms: hit?.latency_ms ?? null,
       last_error: hit?.last_error || null,
       last_probe_at: hit?.last_probe_at || null,
@@ -1395,12 +1424,15 @@ function enrichVm(v, accountQuota, active, extras = {}) {
   const runtime = findRuntime(accountQuota, v)
   const liveCred = extras.liveById instanceof Map ? extras.liveById.get(v.id) : extras.liveById?.[v.id]
   const workerCred = liveCred || runtime?.worker_status?.credential || null
+  const quotaOverride = isCodexVm(v) ? null : v.quota_override || null
+  const globalQuotaConfig = extras.routingConfig?.quota || accountQuota?.config || {}
+  const vmQuotaConfig = applyVmQuotaConfig(globalQuotaConfig, quotaOverride)
   const q = quotaFromAccount(
     {
       ...acc,
       last_used_at: acc?.last_used_at || runtime?.last_used_at || null,
     },
-    accountQuota?.config,
+    vmQuotaConfig,
   )
   const fablePool = fablePoolFields(acc, runtime, extras.pool || {}, extras.routingConfig || {}, v)
   const scheduleLevel = resolveCredentialScheduleLevel({
@@ -1428,14 +1460,15 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         },
         q,
       ).key
-  const policy = resolveTierPolicy(
+  const inheritedPolicy = resolveTierPolicy(
     {
       tiers: extras.routingConfig?.tiers || accountQuota?.tiers,
-      quota: extras.routingConfig?.quota || accountQuota?.config,
+      quota: globalQuotaConfig,
       concurrency: extras.routingConfig?.concurrency || accountQuota?.concurrency,
     },
     tierKey,
   )
+  const policy = applyVmQuotaPolicy(inheritedPolicy, quotaOverride)
   const safety = Number(policy.limit_5h ?? policy.safety_ratio ?? 0.85)
   const weeklySafety = Number(policy.limit_7d ?? policy.weekly_safety_ratio ?? 0.8)
   const sessionLimit = extras.sessionLimit || accountQuota?.sessions || null
@@ -1513,6 +1546,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     resolved_dataplane: resolveKernelDataplane(v, extras.routingConfig || {}),
     note: v.note || null,
     region: v.region || null,
+    node_id: v.node_id || null,
     timezone: v.timezone || null,
     timezone_source: v.timezone_source || 'auto',
     locale: v.locale || null,
@@ -1539,6 +1573,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     max_rpm: acc?.max_rpm ?? v.max_rpm ?? 0,
     session_slots: isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {}),
     session_slots_override: isCodex ? false : v.session_slots_override === true,
+    quota_override: quotaOverride,
+    quota_policy: isCodex ? null : vmQuotaView(policy, vmQuotaConfig),
+    quota_inherited: isCodex ? null : vmQuotaView(inheritedPolicy, globalQuotaConfig),
     rpm: acc?.rpm ?? 0,
     allowed_models: Array.isArray(v.allowed_models) ? v.allowed_models : null,
     weight: v.weight ?? 1,
@@ -2000,6 +2037,12 @@ function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}
     byModel = []
   }
   if (!cost && !byModel.length) return null
+  let usageStats = null
+  try {
+    usageStats = vmId ? requestLog?.vmUsageStats?.({ vmId, days: 30 }) || null : null
+  } catch {
+    usageStats = null
+  }
   return {
     source: billing?.source || 'anthropic-official',
     currency: billing?.currency || 'USD',
@@ -2011,6 +2054,7 @@ function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}
     window_7d: window7d,
     total,
     by_model: byModel,
+    usage_stats: usageStats,
     today_cost: today?.total_cost || 0,
     total_cost: total?.total_cost || 0,
     window_5h_cost: window5h?.total_cost || 0,

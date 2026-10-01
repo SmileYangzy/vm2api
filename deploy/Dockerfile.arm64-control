@@ -1,7 +1,7 @@
-# Native ARM64 control plane with upstream amd64 slot assets.
-# Build from the same release checkout as UPSTREAM_IMAGE. QEMU is still needed
-# for the closed amd64 kernel/OAuth/CLI executables, not for host networking.
-ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.75@sha256:7bbe799b37c529c8a48e06e7af85ee4fc6b1187950372b54217a73477ea41902
+# Native ARM64 control plane built from the merged checkout, including web/dist.
+# The pinned amd64 release supplies dynamic libraries for remaining x86 assets.
+# QEMU is still required for the upstream kernel/OAuth/CLI executables.
+ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.89@sha256:05dc3fbdc1263e3069e9ad09bef02ac827a191fb33a9cc1aed04580cca37517d
 FROM --platform=linux/amd64 ${UPSTREAM_IMAGE} AS upstream
 
 FROM --platform=linux/arm64 golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS helpers
@@ -23,18 +23,29 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /opt/vm2api
-# The official image supplies its tested application, web build and slot assets.
-COPY --from=upstream /opt/vm2api/ /opt/vm2api/
-# Branch patch: scoped host INPUT rules for redirected slot traffic.
-COPY src/lib/vm/egress.mjs /opt/vm2api/src/lib/vm/egress.mjs
-# The standalone OAuth helper still needs the amd64 dynamic loader under QEMU.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+# Source and committed assets follow the Git merge, even when a release tag's
+# application image predates the latest commit with the same VERSION.
+COPY src ./src
+COPY scripts ./scripts
+COPY VERSION CHANGELOG.md ./
+COPY docker/kin-os ./docker/kin-os
+COPY web/dist ./web/dist
+COPY bin/kin-kernel bin/kin-codex-kernel bin/kin-oauth-auth /opt/vm2api/image-bin/
+COPY share/wrap-cli /opt/vm2api/image-wrap-cli/
+# Dynamic x86 kernel assets need their loader when invoked under QEMU.
 COPY --from=upstream /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=upstream /usr/lib64/ /usr/lib64/
 RUN test -e /lib64 || ln -s usr/lib64 /lib64
 # The upstream entrypoint refreshes mounted binaries on every boot. Replace the
 # image sources so restarts cannot silently reinstall the amd64 Go helpers.
 COPY --from=helpers /out/kin-egress /out/kin-worker /opt/vm2api/image-bin/
-COPY --from=upstream /usr/local/bin/vm2api-entrypoint /usr/local/bin/vm2api-entrypoint
+COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
+RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
+    && rm -f /opt/vm2api/src/lib/oauth/auth.js \
+    && cp -a /opt/vm2api/src/config /opt/vm2api/image-config \
+    && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share
 ENV NODE_ENV=production \
     HOST=127.0.0.1 \
     PORT=8787 \
