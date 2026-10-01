@@ -33,6 +33,8 @@ COPY VERSION CHANGELOG.md ./
 COPY docker/kin-os ./docker/kin-os
 COPY web/dist ./web/dist
 COPY bin/kin-kernel bin/kin-codex-kernel bin/kin-oauth-auth /opt/vm2api/image-bin/
+# Cluster nodes require amd64 payloads; local helpers are replaced by ARM64 below.
+COPY bin/kin-worker bin/kin-egress /opt/vm2api/cluster-bin-amd64/
 COPY share/wrap-cli /opt/vm2api/image-wrap-cli/
 # Dynamic x86 kernel assets need their loader when invoked under QEMU.
 COPY --from=upstream /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
@@ -56,6 +58,8 @@ ENV NODE_ENV=production \
     KIN_WORKER_BIN=/opt/vm2api/bin/kin-worker \
     KIN_CODEX_KERNEL_BIN=/opt/vm2api/bin/kin-codex-kernel \
     KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth \
+    KIN_CLUSTER_WORKER_BIN=/opt/vm2api/cluster-bin-amd64/kin-worker \
+    KIN_CLUSTER_EGRESS_BIN=/opt/vm2api/cluster-bin-amd64/kin-egress \
     DOCKER_DEFAULT_PLATFORM=linux/amd64
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]

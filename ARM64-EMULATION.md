@@ -11,6 +11,8 @@
 固定上游镜像只提供剩余 amd64 动态程序所需的库和加载器；构建会校验它与 checkout 的 VERSION。
 应用、网页和本分支的 `src/lib/vm/egress.mjs` 补丁直接进入镜像，不依赖同版本发布镜像中的旧应用。
 原生 helpers 放入 entrypoint 使用的 `image-bin`，确保重启不会被 amd64 版本覆盖。
+集群远端节点按上游约束使用 amd64。镜像在 `cluster-bin-amd64` 保留独立的 amd64 worker/egress，
+通过 `KIN_CLUSTER_WORKER_BIN` 和 `KIN_CLUSTER_EGRESS_BIN` 供远端镜像打包使用；本机继续使用 ARM64 helper。
 
 ## 实测结论（2026-09-24）
 
@@ -70,9 +72,25 @@
 - 原生镜像改为直接使用合并后的源码和已提交网页资产，并编译最新 Go worker/egress。
   新增的 Node 依赖（ssh2、ws）在 ARM64 Node 22 环境安装。
 - Oracle INPUT 放行继续限定到代理网桥、源/目标子网和 helper 端口，并保留上游 NAT 规则的顺序。
+- 修复新版集群打包与原生控制面混用二进制的问题：远端包选取独立 amd64 helper，
+  本机保持原生 ARM；测试检查 ELF 架构并确认错误的 ARM 远端包会被拒绝。
 - 集群远程 iptables 生成测试覆盖新 INPUT 检查/插入配对。完整 Node 单元测试：
   2038 项，2028 通过、10 项按上游条件跳过、0 失败。
-- 部署备份及最终验证结果在升级完成时记录于本节。
+- 完整 Go worker `go test ./...` 通过（config、credential、egress、oauth、oauthcmd、proxy、
+  telemetry、upstream），均在 ARM64 Go builder 中运行。
+- 停止控制面与槽位后备份 `.env`、旧 Compose 和完整运行状态：
+  `.local/backups/pre-v1.3.89-20261001/state.tar.gz`，199137618 bytes，目录 0700、文件 0600，
+  SHA-256 `41847e38d087d314840081226598f0a5279df47272c899732a9dc8c911fea74f`。
+  该快照保留 v1.3.75 配置；回退需使用匹配的旧镜像、数据库和运行文件。
+- VERSION=1.3.89，Node `process.arch=arm64`，两个 helper 为静态 ARM aarch64；
+  运行容器中的 server、egress 源码及 `web/dist/index.html` 哈希与 checkout 一致。
+- 冷启动后 Rust 健康 HTTP 200、CLI 内部 `ready_slots=20`；槽内 DNS/HTTPS 出口成功，
+  本地 `/health` 与公网管理台 HTTP 200。`ready_slots` 不代表实测并发上限。
+- SQLite `quick_check=ok`；与备份相比 users=1、accounts=1、vms=1、api_keys=0、proxies=3，
+  管理员 ID/用户名/角色/状态保持一致，私有配置中的管理员凭据登录 HTTP 200。
+- 槽位仍为 `no_credential`，与升级前相同；真实模型调用及推理性能尚未验证。
+- 控制面重启后原生二进制、DNS/HTTPS 与槽位 Rust 健康仍正常，数据库/登录核验再次通过。
+  公网 WebSocket Upgrade 请求到达新版集群票据鉴权（无票据返回 401、空响应体）。
 
 ### 本机 1.3.75 升级记录（2026-09-28）
 
