@@ -64,6 +64,32 @@
 
 ## 新部署
 
+### 本机 1.3.102 升级记录（2026-10-04）
+
+- 合并上游 `a3b267c99d3fc9b356ade2bb0e3c858f891db19e`（v1.3.102，共 79 个新增提交），
+  保留 Oracle INPUT 规则和原生 ARM64 控制面/amd64 集群 payload 分离适配。
+- 更新固定的 amd64 库来源和本地 ARM64 镜像到 v1.3.102；应用源码、网页资产与 Go helpers
+  从合并后的 checkout 构建。新增 https-proxy-agent 依赖在原生 ARM64 Node 环境安装。
+- 新增的出口进程归属测试使用 `KIN_EGRESS_BIN` 指向原生 helper；集群镜像测试显式使用
+  其 amd64 夹具，避免测试被控制面的 ARM64 helper 环境变量污染。原有断言均保留。
+- Node 单元回归共 2106 项，最终 2096 通过、10 项按上游条件跳过；两份受影响测试
+  定向复测 37 项全部通过。完整 Go `go test -race ./...` 在 ARM64 builder 中通过。
+- 停止控制面和 vm-01 后保存完整运行状态、私有环境和匹配的旧 Compose/Dockerfile：
+  `.local/backups/pre-v1.3.102-20261004/state.tar.gz`，644574823 bytes，目录 0700、文件 0600，
+  SHA-256 `f1207fcc3df4fe9c42341b70f894cc68599cb24838938ccf5596c51dedae9ff6`。旧镜像 `vm2api-arm64-control:v1.3.89` 保留。
+- 以新镜像重建控制面，启动原 vm-01，并通过 `/api/panel/wrap-cli/sync` 同步、重启
+  CLI/kernel；未删除槽容器或凭证。同步完成时 ready_slots=20，运行核验时为 19，reachable=true。
+- VERSION=1.3.102、Node process.arch=arm64，本机 worker/egress 的 ELF e_machine=183，
+  集群 amd64 payload 的两项 helper 均为 62。控制面 server、egress、kernel-router 和
+  web/dist/index.html 哈希与 checkout 一致；槽内 cli-node/kernel.bin 与最新模板一致。
+- 本地 /health、/console、受保护的 VM 详情及公网 /console 均 HTTP 200；
+  槽内到 Anthropic 的未认证 HTTPS 探测返回预期的 401。
+- SQLite quick_check=ok，users=1、accounts=2、vms=1、api_keys=2、proxies=3，
+  关键记录 ID 及管理员认证字段与升级前一致；cache_ttl=1h 保留。
+- 一次极小 Sonnet 5.5 流式验收 HTTP 200，返回预期内容和 message_stop，终态 verified：
+  首个文字 2120 ms，总耗时 2251 ms，统计费用 $0.03444。
+  此项仅验证推理链路，不代表长上下文或并发性能。
+
 ### 本机 1.3.89 升级记录（2026-10-01）
 
 - 上游最新提交 `33d0582cb336871d756219e321e867c75f941462`。上游历史与旧 v1.3.75 分支分叉，
