@@ -1,8 +1,8 @@
 # Oracle ARM64 原生控制面 + amd64 槽位（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前应用基线：上游 `v1.3.102` / `a3b267c99d3fc9b356ade2bb0e3c858f891db19e`（2026-10-04）。
-控制面使用本地构建的 `vm2api-arm64-control:v1.3.102`：Node、Python、iptables、Docker CLI、
+当前应用基线：上游 `v1.3.104` / `021018a78a629f212cce1780969a48545c907ebe`（2026-10-04）。
+控制面使用本地构建的 `vm2api-arm64-control:v1.3.104`：Node、Python、iptables、Docker CLI、
 `kin-egress` 和 `kin-worker` 原生运行在 ARM64；上游未提供 ARM64 版本的槽位 CLI、Rust kernel
 和 OAuth helper 继续通过 QEMU 执行。本方案不是全栈原生 ARM，也未做推理性能基准测试。
 
@@ -49,7 +49,7 @@
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| amd64 动态库来源 | `ghcr.io/dofastted/vm2api:v1.3.102@sha256:641331db0b8978b190079021c8cf5e04504001979230c168e89d8a79d2a51c4b` |
+| amd64 动态库来源 | `ghcr.io/dofastted/vm2api:v1.3.104@sha256:16d35151fcef6030e8d1f1d06bcd745a43482be77ff4299142c8cde126a824a5` |
 | 原生 Node 22 | `node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c` |
 | 原生 Go builder | `golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |
@@ -63,6 +63,27 @@
 当前机器曾安装发行版 `qemu-user-static` / `binfmt-support` 用于初次排查，后续新部署无需依赖其旧版 QEMU。
 
 ## 新部署
+
+### 本机 1.3.104 升级记录（2026-10-04）
+
+- 合并上游 `021018a78a629f212cce1780969a48545c907ebe`，本次新增 4 个提交，主要修复
+  host 单一凭据刷新管理及 cli-node guard 对 bootstrap、setup-token、panel 请求的误杀。
+  保留原生 ARM64 控制面、amd64 集群 payload 和 Oracle egress INPUT 适配。
+- 固定 amd64 库来源和原生控制面镜像到 v1.3.104；应用、网页和 Go helpers 从合并后的 checkout 构建。
+  cli-node guard、official bootstrap、setup-token 和 panel shell 的 37 项相关检查全部通过。
+  首轮测试缺少生产镜像未打包的 web/src；补齐只读测试挂载后复测通过，无业务源码调整。
+- 在控制面及 vm-01 停止后保存完整运行状态、私有环境及匹配的旧 Compose/Dockerfile：
+  `.local/backups/pre-v1.3.104-20261004/state.tar.gz`，739058400 bytes，目录 0700、文件 0600，
+  SHA-256 `0af5a1fcbebb22e35fa50ec7ef202278ff456427ac0641ffe9b4060292014c57`。
+- 重建控制面并恢复原槽位，wrap-cli 同步及重启接口 HTTP 200，vm-01 同步成功。
+  槽内 cli-node 和 kin-kernel.bin 哈希与当前 checkout 的模板完全一致。
+- VERSION=1.3.104、Node process.arch=arm64，本机 worker/egress 为静态 ARM aarch64。
+  运行中的 VERSION、cli-node guard 源码及 web/dist/index.html 哈希与 checkout 一致；
+  公网 /console HTML 哈希也与当前提交一致，/health 与公网 /console 均 HTTP 200。
+- SQLite quick_check=ok；users=2、accounts=1、vms=1、api_keys=2、proxies=3。
+  所有这些表的记录 ID、管理员认证字段及密钥身份字段与升级前一致，真实账号并发配置仍为 4。
+  Rust reachable=true、ready_slots=20；同步后实际 Opus 5.5 请求返回 HTTP 200、终态 verified。
+- 上游此版本仍按请求数展示密钥额度，美元累计已在后端记录；本次仅同步上游实现。
 
 ### 本机 1.3.102 升级记录（2026-10-04）
 
