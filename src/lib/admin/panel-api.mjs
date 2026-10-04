@@ -28,6 +28,7 @@ import {
 } from '../vm/slot-engine.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { queryOpenaiQuota, resetOpenaiQuota } from '../oauth/openai-quota.mjs'
+import { queryClaudeResetCredits, redeemClaudeResetCredit } from '../oauth/claude-reset-credits.mjs'
 import { canOfficialUsage, credentialModeOfVm, isSetupTokenMode } from '../oauth/credential-mode.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
@@ -57,6 +58,7 @@ import {
   probeFromPassiveHeaders,
   shouldHopOfficialUsage,
   shouldProbeFable,
+  usageErrorText,
 } from '../oauth/crs-usage-probe.mjs'
 import { proxyHasVm } from '../vm/proxy-pool.mjs'
 import { collectLivePanelCredentials } from './panel-live-credentials.mjs'
@@ -549,6 +551,7 @@ export async function buildVmList({
   proxyPool = null,
   ownerUserId = null,
   role = 'admin',
+  requestLog = null,
 } = {}) {
   try {
     accountQuota?.runtimeRepo?.clearExpired?.(Date.now())
@@ -566,6 +569,23 @@ export async function buildVmList({
       liveById,
       projectRoot: cfg.paths.project,
     }),
+  )
+  const accounts = (() => {
+    try {
+      return accountQuota?.snapshot?.().accounts || []
+    } catch {
+      return []
+    }
+  })()
+  stampVmBilling(
+    vms,
+    (() => {
+      try {
+        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+      } catch {
+        return null
+      }
+    })(),
   )
   return ok({ items: vms, active_vm: active, total: vms.length, proxy_pool: summarizeProxyPool(proxyPool) })
 }
@@ -751,6 +771,56 @@ export async function buildOpenaiQuotaReset({ cfg, id, rotate = true } = {}) {
   })
 }
 
+function claudeResetFail(result) {
+  const status = result.status || 400
+  return fail(
+    makeError({
+      type:
+        status === 404
+          ? ErrorType.NOT_FOUND
+          : status >= 500
+            ? ErrorType.UPSTREAM
+            : status === 409
+              ? ErrorType.API
+              : ErrorType.INVALID_REQUEST,
+      code: result.error || 'claude_reset_failed',
+      message: result.message || 'Claude 限额重置失败',
+      status,
+    }),
+  )
+}
+
+export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
+  const result = await queryClaudeResetCredits({
+    projectRoot: cfg.paths.project,
+    vmId: id,
+    ...(transport ? { transport } : {}),
+    ...(now ? { now } : {}),
+  })
+  if (!result.ok) return claudeResetFail(result)
+  return ok({
+    vm_id: id,
+    source: 'claude-reset-credits',
+    ...result,
+  })
+}
+
+export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, transport, now } = {}) {
+  const result = await redeemClaudeResetCredit({
+    projectRoot: cfg.paths.project,
+    vmId: id,
+    idempotencyKey,
+    ...(transport ? { transport } : {}),
+    ...(now ? { now } : {}),
+  })
+  if (!result.ok) return claudeResetFail(result)
+  return ok({
+    vm_id: id,
+    source: 'claude-reset-redeem',
+    ...result,
+  })
+}
+
 function applyFableProbeResult(accountQuota, accountId, found) {
   if (found?.tier !== 'pro' && found?.tier !== 'max') return null
   const saved = accountQuota.repo.get(accountId)
@@ -856,7 +926,7 @@ export async function buildProbeOne({
   accountQuota.ensure({
     account_id: accountId,
     vm_id: vm.id,
-    email: vm.claude?.email,
+    email: vm.email || vm.codex?.email || vm.claude?.email,
     max_concurrency: vm.policy?.maxConcurrency,
     max_rpm: vm.policy?.maxRpm ?? 0,
   })
@@ -1003,7 +1073,7 @@ export async function buildProbeOne({
         ? null
         : rateLimited
           ? '官方 /usage 限流，请稍后再试'
-          : result.error || result.usage_error || null,
+          : usageErrorText({ error: result.error || result.usage_error }) || null,
     usage_scope_missing: result.usage_scope_missing === true,
     credential_scope_required: result.credential_scope_required || null,
   }
@@ -1055,7 +1125,7 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
     return {
       account_id: a.account_id,
       vm_id: a.vm_id,
-      email: a.email,
+      email: a.email || vm?.email || vm?.codex?.email || vm?.claude?.email || null,
       credential_mode: vm && vmHasClaudeCredential(vm) ? credentialModeOfVm(vm) : null,
       ...quotaFromAccount(a, accountQuota?.config),
       inflight: a.inflight,
@@ -1561,6 +1631,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     oauth_source: v.oauth_source || null,
     credential_mode: v.credential_mode || v.claude?.mode || 'oauth',
     auth_scheme: v.auth_scheme || v.claude?.auth_scheme || null,
+    can_claude_reset: isCodex ? false : v.can_claude_reset === true,
     has_refresh: !!(v.has_refresh || workerCred?.has_refresh),
     has_session_key: !!v.has_session_key,
     proxy: merged.proxy,
@@ -1596,6 +1667,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     status_7d_oi: isCodex ? null : q.status_7d_oi,
     codex_usage: v.codex_usage || null,
     reset_credits: isCodex ? v.reset_credits || v.codex?.reset_credits || null : null,
+    claude_reset_credits: isCodex ? null : v.claude_reset_credits || null,
     plan_type: isCodex ? v.plan_type || null : null,
     ...(q.weekly_split ? { weekly_split: q.weekly_split } : {}),
     fable_inflight: fablePool.fable_inflight,
@@ -1864,7 +1936,8 @@ export function lookupBilling(index, accOrVm) {
 function attachBillingMeta(billing, accounts = []) {
   if (!billing) return null
   const labeled = (billing.accounts || []).map((row) => {
-    const acc = (accounts || []).find((a) => a.account_id === row.account_id || a.vm_id === row.vm_id)
+    // Slot ids get reused: a vm_id match would stamp the slot's current email on an older account's row.
+    const acc = (accounts || []).find((a) => (row.account_id ? a.account_id === row.account_id : a.vm_id === row.vm_id))
     return {
       ...row,
       email: acc?.email || row.email || null,

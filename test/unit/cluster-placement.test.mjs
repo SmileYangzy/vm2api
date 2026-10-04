@@ -262,6 +262,9 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   })
   for (const k of envKeys) delete process.env[k]
   process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  // Use this test's amd64 fixtures independently of native controller defaults.
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
   fs.chmodSync(process.env.KIN_CODEX_KERNEL_BIN, 0o755)
 
   const a = slotImageSpec(root, 'ubuntu-24.04')

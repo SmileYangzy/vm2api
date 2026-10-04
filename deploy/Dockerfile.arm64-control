@@ -1,7 +1,7 @@
 # Native ARM64 control plane built from the merged checkout, including web/dist.
 # The pinned amd64 release supplies dynamic libraries for remaining x86 assets.
 # QEMU is still required for the upstream kernel/OAuth/CLI executables.
-ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.89@sha256:05dc3fbdc1263e3069e9ad09bef02ac827a191fb33a9cc1aed04580cca37517d
+ARG UPSTREAM_IMAGE=ghcr.io/dofastted/vm2api:v1.3.102@sha256:641331db0b8978b190079021c8cf5e04504001979230c168e89d8a79d2a51c4b
 FROM --platform=linux/amd64 ${UPSTREAM_IMAGE} AS upstream
 
 FROM --platform=linux/arm64 golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS helpers

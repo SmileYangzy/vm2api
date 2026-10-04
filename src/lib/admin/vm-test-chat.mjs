@@ -17,7 +17,7 @@ import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { hostProxyUrlForVm, isLocalEgressProxy } from '../vm/egress.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
 import { snapshotOauth } from '../vm/execution-context.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
@@ -189,7 +189,7 @@ export async function syncCodexCatalog({
   let lastError = null
   for (const target of targets) {
     const direct = isLocalEgressProxy(target.proxy)
-    const proxyUrl = boundProxyUrl(target.proxy)
+    const proxyUrl = hostProxyUrlForVm(target)
     if (!proxyUrl && !fetchImpl && !direct) {
       lastError = {
         ok: false,
@@ -471,7 +471,7 @@ export function testChatCredentialMode(vm = {}) {
     flavor: vm.claude?.flavor,
     source: vm.claude?.source,
   })
-  if (inferred === 'setup-token' || inferred === 'apikey') return inferred
+  if (inferred === 'setup-token' || inferred === 'official-setup-token' || inferred === 'apikey') return inferred
   return credentialModeOfVm(vm)
 }
 
@@ -927,7 +927,13 @@ export async function runVmTestChat(opts = {}) {
     })
   }
   const unofficial =
-    !codex && (cliHop || opts.unofficial === true || credMode === 'setup-token' || credMode === 'apikey')
+    !codex &&
+    (cliHop ||
+      opts.unofficial === true ||
+      credMode === 'setup-token' ||
+      credMode === 'official-setup-token' ||
+      credMode === 'apikey')
+
   const cliLayout = !codex && cliHop ? resolveCliSystemLayout(vm, routing) : null
   push(
     'info',
@@ -1108,7 +1114,7 @@ export async function runVmTestChat(opts = {}) {
         push('info', 'Codex hop 401，尝试刷新 OAuth')
         const tok = await refreshCodexAccessToken({
           refreshToken,
-          proxyUrl: boundProxyUrl(vm.proxy),
+          proxyUrl: hostProxyUrlForVm(vm),
           fetchImpl: opts.fetchImpl,
         })
         if (tok.ok) {
@@ -1148,7 +1154,7 @@ export async function runVmTestChat(opts = {}) {
   const text = result?.text || extractText(result?.body)
   const usage = result?.usage || result?.body?.usage || null
   let errObj = result?.ok ? null : extractError(result, { wrapHop: !codex })
-  if (errObj && result?.status === 401 && credMode === 'setup-token') {
+  if (errObj && result?.status === 401 && (credMode === 'setup-token' || credMode === 'official-setup-token')) {
     errObj = {
       ...errObj,
       code: 'setup_token_invalid',

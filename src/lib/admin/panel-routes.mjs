@@ -32,6 +32,8 @@ import {
 import {
   canOfficialCc,
   isApiKeyMode,
+  isAnySetupTokenMode,
+  isOfficialSetupTokenMode,
   isSetupTokenMode,
   looksLikeConsoleApiKey,
   credentialModeOfVm,
@@ -64,15 +66,6 @@ import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { defaultSeedPolicy, seedTelemetryContract, standardSeedPolicy } from '../protocol/seed-policy.mjs'
 
 import { runVmTestChat, resolveTestModels, syncCodexCatalog } from './vm-test-chat.mjs'
-import {
-  startConcurrentTest,
-  getConcurrentTest,
-  listConcurrentTests,
-  cancelConcurrentTest,
-  listSavedReports,
-  readSavedReport,
-} from './concurrent-test.mjs'
-import { startProbeTest, getProbeTest, listProbeTests, cancelProbeTest, getProbeCatalog } from './probe-test.mjs'
 import { publicKeyView } from './api-keys.mjs'
 import { publicEndpointView, fetchUpstreamModels, API_ENDPOINT_PRESETS } from './api-endpoints.mjs'
 import { publicUserView } from './panel-users.mjs'
@@ -163,7 +156,7 @@ import {
   egressEnabled,
   ensureProxyEgress,
   stopProxyEgress,
-  boundProxyUrl,
+  hostProxyUrlForVm,
   hasBoundExit,
   isLocalEgressProxy,
   dnsUpstreamChain,
@@ -370,9 +363,9 @@ export function createPanelHandler(ctx) {
     reloadActiveVm(cfg)
     const vm = getVm(cfg.paths.project, id)
     accountQuota.ensure({
-      account_id: vm?.claude?.account_uuid || id,
+      account_id: vm?.account_uuid || vm?.claude?.account_uuid || id,
       vm_id: id,
-      email: vm?.claude?.email || null,
+      email: vm?.email || vm?.codex?.email || vm?.claude?.email || null,
       type: normalizeCredentialMode(vm?.claude?.mode),
       max_concurrency: vm?.policy?.maxConcurrency || 2,
       max_rpm: vm?.policy?.maxRpm ?? 0,
@@ -1349,6 +1342,7 @@ export function createPanelHandler(ctx) {
             routingConfig: ctx.routingConfig,
             poolScheduler: ctx.poolScheduler,
             proxyPool,
+            requestLog,
             role: ident.role,
             ownerUserId: ident.role === 'user' ? req.panelUserId : null,
           }),
@@ -1581,6 +1575,12 @@ export function createPanelHandler(ctx) {
           })
         }
         return json(res, 200, panel.ok({ id, reload: reloaded }))
+      }
+      // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
+        const issued = ctx.slotShell.issueTicket(p.split('/')[4])
+        if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
+        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
       }
       // POST /api/panel/vms/:id/collect-identity
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/collect-identity$/.test(p)) {
@@ -1859,6 +1859,22 @@ export function createPanelHandler(ctx) {
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
       }
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/claude-reset\/query$/.test(p)) {
+        const id = p.split('/')[4]
+        const result = await panel.buildClaudeResetQuery({ cfg, id })
+        if (result.status) return json(res, result.status, result.body)
+        return json(res, 200, result)
+      }
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/claude-reset\/redeem$/.test(p)) {
+        const id = p.split('/')[4]
+        const result = await panel.buildClaudeResetRedeem({
+          cfg,
+          id,
+          idempotencyKey: req.headers['idempotency-key'],
+        })
+        if (result.status) return json(res, result.status, result.body)
+        return json(res, 200, result)
+      }
 
       // POST /api/panel/vms/:id/test-chat — sub2api-style model connectivity test
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/test-chat$/.test(p)) {
@@ -1883,7 +1899,7 @@ export function createPanelHandler(ctx) {
         const vm = getVm(cfg.paths.project, id)
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
         const mode = credentialModeOfVm(vm)
-        if (!isSetupTokenMode(mode) && !isApiKeyMode(mode)) {
+        if (!isAnySetupTokenMode(mode) && !isApiKeyMode(mode)) {
           return json(res, 400, {
             ok: false,
             error: {
@@ -1951,109 +1967,6 @@ export function createPanelHandler(ctx) {
           refresh,
         })
         return json(res, 200, panel.ok(payload))
-      }
-
-      // Concurrent persistent-conversation load test
-      if (req.method === 'POST' && p === '/api/panel/concurrent-test') {
-        const body = await readBody(req, 32 * 1024).catch(() => ({}))
-        const result = startConcurrentTest({
-          concurrency: body.concurrency,
-          turns: body.turns,
-          models: body.models,
-          stocks: body.stocks,
-          max_tokens: body.max_tokens,
-          stream: body.stream,
-          timeout_ms: body.timeout_ms,
-          baseUrl: `http://127.0.0.1:${cfg.port}`,
-          apiKey: cfg.api_key,
-          dataDir: cfg.paths?.data || path.join(cfg.paths.project, 'data'),
-        })
-        if (!result.ok) {
-          const status = result.error?.code === 'run_in_progress' ? 409 : 400
-          return json(res, status, { ok: false, error: result.error, data: result.data || null })
-        }
-        return json(res, 200, panel.ok(result.data))
-      }
-      if (req.method === 'GET' && p === '/api/panel/concurrent-test') {
-        const includeText = url.searchParams.get('text') === '1'
-        return json(res, 200, panel.ok(getConcurrentTest(null, { includeText })))
-      }
-      if (req.method === 'GET' && p === '/api/panel/concurrent-tests') {
-        return json(res, 200, panel.ok({ items: listConcurrentTests() }))
-      }
-      if (req.method === 'GET' && p === '/api/panel/concurrent-test-reports') {
-        const day = url.searchParams.get('day') || null
-        const dataDir = cfg.paths?.data || path.join(cfg.paths.project, 'data')
-        return json(res, 200, panel.ok(listSavedReports(dataDir, day)))
-      }
-      if (req.method === 'GET' && /^\/api\/panel\/concurrent-test-reports\/\d{4}-\d{2}-\d{2}\/[^/]+$/.test(p)) {
-        const day = p.split('/')[4]
-        const name = decodeURIComponent(p.split('/')[5] || '')
-        const dataDir = cfg.paths?.data || path.join(cfg.paths.project, 'data')
-        const data = readSavedReport(dataDir, day, name)
-        if (!data) return json(res, 404, { ok: false, error: { message: 'report not found' } })
-        return json(res, 200, panel.ok(data))
-      }
-      if (req.method === 'POST' && /^\/api\/panel\/concurrent-test\/[^/]+\/cancel$/.test(p)) {
-        const id = p.split('/')[4]
-        const result = cancelConcurrentTest(id)
-        if (!result.ok) return json(res, 404, { ok: false, error: result.error })
-        return json(res, 200, panel.ok(result.data))
-      }
-      if (req.method === 'GET' && /^\/api\/panel\/concurrent-test\/[^/]+$/.test(p)) {
-        const id = p.split('/')[4]
-        const includeText = url.searchParams.get('text') === '1'
-        const data = getConcurrentTest(id, { includeText })
-        if (!data) return json(res, 404, { ok: false, error: { message: 'run not found' } })
-        return json(res, 200, panel.ok(data))
-      }
-
-      if (req.method === 'GET' && p === '/api/panel/probe-test/catalog') {
-        return json(res, 200, panel.ok(getProbeCatalog()))
-      }
-      if (req.method === 'POST' && p === '/api/panel/probe-test') {
-        const body = await readBody(req, 32 * 1024).catch(() => ({}))
-        const result = startProbeTest({
-          suite: body.suite,
-          models: body.models,
-          cases: body.cases,
-          forms: body.forms,
-          questions: body.questions,
-          sample: body.sample ?? body.sample_size,
-          random: body.random,
-          seed: body.seed,
-          max_tokens: body.max_tokens,
-          concurrency: body.concurrency,
-          timeout_ms: body.timeout_ms,
-          baseUrl: `http://127.0.0.1:${cfg.port}`,
-          apiKey: cfg.api_key,
-          dataDir: cfg.paths?.data || path.join(cfg.paths.project, 'data'),
-        })
-        if (!result.ok) {
-          const status = result.error?.code === 'run_in_progress' ? 409 : 400
-          return json(res, status, { ok: false, error: result.error, data: result.data || null })
-        }
-        return json(res, 200, panel.ok(result.data))
-      }
-      if (req.method === 'GET' && p === '/api/panel/probe-test') {
-        const includeText = url.searchParams.get('text') === '1' || url.searchParams.get('raw') === '1'
-        return json(res, 200, panel.ok(getProbeTest(null, { includeText })))
-      }
-      if (req.method === 'GET' && p === '/api/panel/probe-tests') {
-        return json(res, 200, panel.ok({ items: listProbeTests() }))
-      }
-      if (req.method === 'POST' && /^\/api\/panel\/probe-test\/[^/]+\/cancel$/.test(p)) {
-        const id = p.split('/')[4]
-        const result = cancelProbeTest(id)
-        if (!result.ok) return json(res, 404, { ok: false, error: result.error })
-        return json(res, 200, panel.ok(result.data))
-      }
-      if (req.method === 'GET' && /^\/api\/panel\/probe-test\/[^/]+$/.test(p)) {
-        const id = p.split('/')[4]
-        const includeText = url.searchParams.get('text') === '1' || url.searchParams.get('raw') === '1'
-        const data = getProbeTest(id, { includeText })
-        if (!data) return json(res, 404, { ok: false, error: { message: 'run not found' } })
-        return json(res, 200, panel.ok(data))
       }
 
       // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
@@ -2833,15 +2746,16 @@ export function createPanelHandler(ctx) {
               scope: body.scope || (inference ? 'user:inference' : null),
               source: body.source || (inference ? 'claude-setup-token' : 'access-token'),
             }
-            if (inference) {
+            if (looksLikeOfficialSetupToken(accessToken) || (inference && !String(body.refresh_token || '').trim())) {
+              oauth.type = 'official-setup-token'
+              oauth.mode = 'official-setup-token'
+              oauth.refresh_token = ''
+              oauth.scope = 'user:inference'
+              oauth.source = body.source || 'claude-setup-token'
+              if (!oauth.expires_at) oauth.expires_at = Date.now() + 365 * 24 * 60 * 60 * 1000
+            } else if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
-              if (!oauth.refresh_token) {
-                oauth.refresh_token = ''
-                if (!oauth.expires_at) {
-                  oauth.expires_at = Date.now() + 365 * 24 * 60 * 60 * 1000
-                }
-              }
             }
           } else {
             return json(res, 400, { ok: false, error: { message: 'sessionKey or access_token required' } })
@@ -3011,12 +2925,13 @@ export function createPanelHandler(ctx) {
                 proxyUrl: slotProxy.proxyUrl,
                 vmId: id,
               })
-          if (
+          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
+            oauth.type = 'official-setup-token'
+            oauth.mode = 'official-setup-token'
+          } else if (
             normalizeOauthFlavor(flavor) === 'setup_token' ||
             oauth.flavor === 'setup_token' ||
-            oauth.flavor === 'setup-token' ||
-            oauth.flavor === SETUP_TOKEN_FLAVOR ||
-            looksLikeOfficialSetupToken(code)
+            oauth.flavor === 'setup-token'
           ) {
             oauth.type = 'setup-token'
             oauth.mode = 'setup-token'
@@ -3151,6 +3066,15 @@ export function createPanelHandler(ctx) {
             error: { code: 'credential_kind_mismatch', message: 'Console API Key 不能转为 Setup Token' },
           })
         }
+        if (isOfficialSetupTokenMode(existing.claude?.mode) || isOfficialSetupTokenMode(cred?.type || cred?.mode)) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'credential_kind_mismatch',
+              message: '官方 Setup Token 只有 inference，不能转为完整 Setup Token',
+            },
+          })
+        }
         if (isSetupTokenMode(existing.claude?.mode) || isSetupTokenMode(cred?.type || cred?.mode)) {
           return json(
             res,
@@ -3216,7 +3140,7 @@ export function createPanelHandler(ctx) {
           }
           const tok = await refreshCodexAccessToken({
             refreshToken,
-            proxyUrl: boundProxyUrl(vm.proxy),
+            proxyUrl: hostProxyUrlForVm(vm),
           })
           if (!tok.ok) {
             return json(res, 502, {
@@ -3238,7 +3162,10 @@ export function createPanelHandler(ctx) {
             error: { code: 'credential_mode_unsupported', message: 'Console API Key 不能刷新' },
           })
         }
-        if (isSetupTokenMode(vm?.claude?.mode) && !vm?.claude?.has_refresh) {
+        if (
+          isOfficialSetupTokenMode(vm?.claude?.mode) ||
+          (isSetupTokenMode(vm?.claude?.mode) && !vm?.claude?.has_refresh)
+        ) {
           return json(res, 400, {
             ok: false,
             error: { code: 'credential_mode_unsupported', message: '官方 Setup Token（无 refresh）不能刷新' },
@@ -3654,6 +3581,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/proxies') {
         const ident = panelIdentity(req)
         const snap = ident.role === 'user' ? proxyPool.snapshot({ ownerUserId: req.panelUserId }) : proxyPool.snapshot()
+        if (ident.role !== 'admin') delete snap.config.dns_primary
         return json(res, 200, panel.ok(snap))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/local') {
@@ -3711,7 +3639,9 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'GET' && p === '/api/panel/proxies/config') {
-        return json(res, 200, panel.ok(proxyPool.snapshot().config))
+        const config = proxyPool.snapshot().config
+        if (panelIdentity(req).role !== 'admin') delete config.dns_primary
+        return json(res, 200, panel.ok(config))
       }
       if (req.method === 'PUT' && p === '/api/panel/proxies/config') {
         const body = await readBody(req, 64 * 1024)

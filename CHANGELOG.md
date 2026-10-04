@@ -1,5 +1,110 @@
 # Changelog
 
+## Unreleased
+
+## 1.3.102 — 2026-10-04
+
+- 修复 SSH 扩展节点的 SOCKS5 槽在换票提交时启动失败：远端 `egress.json` 字符串先编码为 Buffer，再按字节分块写入 SFTP，避免 `buffer is not a Buffer`；原子替换和 0600 权限不变。
+- 修复 Cookie（sessionKey）换票的 authorize 请求漏传 `organization_uuid`，被上游以 400 `Invalid request format` 拒绝；重编 `bin/kin-oauth-auth`，授权码换票协议不变。
+
+已部署机升级：更新 Node 控制面（`src/`）、`bin/kin-oauth-auth` 和 `web/dist`，重启一次 Node。kernel / `cli-node` / `kin-worker` / `kin-egress` 与 1.3.101 相同，**不需要 `wrap-cli/sync`**，不需要重启槽容器。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.101 — 2026-10-04
+
+- 修复 OAuth 凭证刷新、落盘更新及 401 恢复触发共享 kernel/CLI 重启，导致同槽其它并发请求断流的问题（#224）。CLI 在创建 API client 前读取最新凭证；刷新后仅重试当前请求，保留在途请求及现有进程。
+- 修复启动时读取 VM 摘要中的套餐字段错误，把 Max 槽凭证写成 Pro 的问题（#226）。按已识别的 Max 套餐修复历史 Pro 默认值，保留 token、凭证 generation 和其它有效套餐。
+- 修复出口 PID 文件过期或 PID 被复用时误认进程、误发 SIGTERM 的问题（#227）。启动、停止和探测均核对 kin-egress 可执行文件及其配置路径，兼容已替换的可执行文件和等价路径写法。
+- 重新构建控制台产物，与当前前端源码保持一致。
+
+已部署机升级：更新 Node 控制面（`src/`）和 `web/dist`，重启一次 Node。kernel / `cli-node` / `kin-worker` 与 1.3.100 相同，**不需要 `wrap-cli/sync`**，不需要重启槽容器。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.100 — 2026-10-04
+
+- 下线控制台压测页（研报并发、能力/答题探针）及对应管理 API（`/api/panel/concurrent-test*`、`/api/panel/probe-test*`）。侧栏不再显示「压测」。虚拟机测试与 `GET /api/panel/test-models` 保留。
+
+已部署机升级：更新 Node 控制面（`src/`）和 `web/dist`，重启一次 Node。kernel / `cli-node` / `kin-worker` 与 1.3.99 相同，**不需要 `wrap-cli/sync`**。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.99 — 2026-10-03
+
+- 修复 GPT 槽（无 `account_uuid`、用量行 `account_id` 等于槽 id 且没有 email）在 VM 页被当成 leftover，累计/窗口费用显示 $0。`lemeryvorhees@gmail.com`（`vm-codex-01`）日志里有费用，`vm-01` 因为用量行带着 email 所以正常。现在 leftover 判定与后端一致：没有 uuid 的槽保留该行；`/usage` 用槽 email 补上；`GET /api/panel/vms` 也盖费用字段。
+
+已部署机升级：更新 Node 控制面（`src/`）和 `web/dist`，重启一次 Node。kernel / `cli-node` / `kin-worker` 与 1.3.98 相同，**不需要 `wrap-cli/sync`**。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.98 — 2026-10-03
+
+- Codex hop 把公开 API 的 `service_tier: "fast"` 改写成官方线值 `priority`，并在 kernel envelope 里带上 Codex 兼容头和 `x-codex-routing-hint`。客户端 Authorization 不转发，由 kernel 贴所选 OAuth。`bin/kin-codex-kernel` 按 codex-proxy-rs 出站契约补齐：body 规范化（`store=false`、string input、system→developer、拒绝字段剥离）、默认 originator/version、≥15MiB 先 HTTP、WS close 1009 不当传输重试、SOCKS5/`socks5h` 含 IPv6 literal。Unix-socket 查询契约不变。已运行的 Codex kernel 进程要重启；不要 `docker rm`。
+
+- Codex 默认 UA / kernel `version` 对齐官方 `@openai/codex@0.160.0`（`codex_cli_rs/0.160.0 (linux x86_64)`）。目录 `auto` 失败时的 fallback 从 0.158.0 改为 0.160.0。开源 UA 形状仍是 `{originator}/{version} ({os} {os_version}; {arch})`；kernel 出站保持 linux amd64 稳定身份。
+
+已部署机升级：更新 Node 控制面（`src/`）、`web/dist`、`bin/kin-codex-kernel`，重启一次 Node，并杀掉已跑的 `kin-codex-kernel` 子进程让新 ELF 起来。kernel / `cli-node` / `kin-worker` 与 1.3.97 相同，**不需要 `wrap-cli/sync`**。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.97 — 2026-10-03
+
+- 修复 Claude Code 2.1.283+ 的 auto mode 分类请求（输出 `<severity>N</severity>`，`stop_sequences: ["</severity>"]`）不被识别为官方流量、被按 `official_full` 改写的问题（#220）。改写后分类提示词被换成官方 CLI 提示词，原缓存标记失效，`max_tokens` 64 被 `min_max_tokens` 抬到 128，费用放大且部分结论被截断。现在官方身份和分类用途共用同一套识别：security monitor 前缀 + 规则段标记，判决格式（`<block>`、`<severity>`、`classify_result`）只决定透传方式，不再参与识别；transcript 拆成多条 user 消息也能识别。kernel 与 cli-node 对 XML 分类的一致性校验同样去掉 `<block>` 要求，只看 “无 `tool_choice` + 含 `<transcript>`”。重编 `bin/kin-kernel`、`share/wrap-cli/kin-kernel.bin` 和 UPX 压缩的 `share/wrap-cli/cli-node`。
+
+已部署机升级：更新 Node 控制面（`src/`）、`bin/kin-kernel`、`share/wrap-cli/kin-kernel.bin`、`share/wrap-cli/cli-node`，重启一次 Node，**需要 `wrap-cli/sync`**。Node 与 kernel/CLI 必须一起更新：只换 Node 时 `<severity>` 分类会被旧 kernel 以 400 `invalid_request_context` 拒绝。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.96 — 2026-10-03
+
+- 修复绑定本地出口（`px-local`）的槽生成授权链接时报「该槽未绑定健康的 SOCKS5」/「虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接」。本地出口没有 SOCKS URL，控制面按约定传空串表示直连，但授权链接入口和 `kin-oauth-auth` 把空串当成未绑定。现在空串按宿主机默认路由直连：授权链接、粘贴授权码换票和 sessionKey 导入都可用于本地出口槽。未绑定出口（`null`）仍拒绝，远程 SOCKS5 行为不变。
+- 修复 Cookie（sessionKey）换票（含 Setup Token 运行模式）必定失败，报 `CLAUDE_WEB is not defined`。自 2026-09-27 换票服务重构起，`kin-oauth-auth` 打包产物引用了 `claude.ai` 地址常量却没有定义它，请求 `/api/organizations` 前就抛出 ReferenceError。现已补上常量并重编 `bin/kin-oauth-auth`；sessionKey 导入恢复为先经槽位出口访问 `claude.ai/api/organizations`。授权链接粘贴 code 换票不受影响。
+- 修复 Arch 槽（`kin-os-arch`，镜像里没有 `hostname` 命令）「采集特征」一直报 `guest_identity_invalid`，「全槽更新 → 重载并采集」把该槽报为失败。现在没有 `hostname` 时改用 `uname -n`（同一个内核 nodename），有 `hostname` 的镜像行为不变。（#212）
+- 修复非 `vm-N` 命名的槽（如 `claude-ios-*`）自愈凭据后 `.credentials.json` 留成 `root:600`，容器用户读不到票据。`slotUidGidFromHomeDir` 原来只认 `vm-N`；现在按槽 ID 走与容器 `--user` 相同的映射（非数字 ID 共用序号 1）。凭据已有 `subscriptionType` 时也会重新校正属主。
+
+已部署机升级：更新 Node 控制面（`src/`）和 `bin/kin-oauth-auth`，重启一次 Node。kernel / `cli-node` / `kin-worker` 与 1.3.95 相同，不需要 `wrap-cli/sync`；从 1.3.94 或更早升级时，仍要按 1.3.95 说明对挂载 `kin-worker` 的槽执行 `docker restart`（不要 `docker rm`）。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.95 — 2026-10-03
+
+- 限额重置的 `reset-status` / `reset-redeem` 固定使用 `claude-cli/<version> (external, cli)`。遥测 UA `claude-code/` 会被上游标成 `ineligible_reason=surface`，查询次数为 0。普通 `/api/oauth/usage` 仍用遥测 UA。
+- 面板按平台显示按钮：Claude 槽始终显示「限额查询 / 限额重置」，Codex 槽始终显示「券查询 / 重置券」，不再要求 `credential_mode=oauth`。带 `user:profile` 的转换后 Setup Token 可以查询兑换；官方一年期 token 和 API Key 点查询仍会 400。
+- 官方 `claude setup-token`（一年期、仅 `user:inference`、无 refresh）落盘为 `official-setup-token`，面板显示「官方 Setup Token」，与 Cookie/授权链转换的完整 Setup Token 区分。旧文件按 source/flavor/无 refresh+仅 inference 识别。`office-setup-token` 视为同一类型。
+
+已部署机升级：更新 Node 控制面（`src/`）、`web/dist`、`bin/kin-worker`，重启一次 Node，并对挂载 `kin-worker` 的槽执行 `docker restart`（不要 `docker rm`）。kernel / `cli-node` 未变，不需要 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.94 — 2026-10-03
+
+- Claude 完整 OAuth 槽可以查询并兑换原生限额重置。面板在用量窗口和详情额度区沿用 GPT 重置券的「查询 / 使用」按钮，使用前二次确认。`POST /api/panel/vms/:id/claude-reset/query` 只读；`POST /api/panel/vms/:id/claude-reset/redeem` 必须带 `Idempotency-Key`，由服务端选择下一次可兑换的 grant。请求经槽内 worker 出站，响应和落盘都不含 grant / 组织 ID。未确认的兑换会按组织挡住后续兑换。Setup Token 和 API Key 不显示这组按钮。槽内 `kin-worker` 需要带 `reset-status` / `reset-redeem` 的新二进制，只更新 Node 时查询会返回 worker 不支持。
+- 修复 Claude Code auto 权限分类请求经过 Node、kernel、native CLI 时被普通请求策略改写的问题。按原始分类约定识别用途并逐 job 传递，保留分类 system/cache、合法 thinking、采样、预算和 stop；支持关闭 thinking 的模型保留显式 disabled。已知必须 adaptive 的 XML 分类只增加一次 2048 token 余量并校验上限。不静默切换客户端指定模型，旧强制工具与模型能力冲突或旧运行时缺能力时明确报错。
+- 分类链路保留真实上游错误、request-id/retry-after、JSON 的上游 id/stop_sequence 和正常 max_tokens 终结；零上游执行不消耗执行预算或惩罚账户。日志只保存有界分类摘要。更新 Rust kernel 两份副本及 UPX 压缩的 cli-node，新增跨层分类和旧 CLI 组合回归。
+- 修复登录页的导入排序与 JSX 格式，使 web CI 的 Prettier 检查通过；重编控制台。
+
+已部署机升级：更新 Node 控制面（`src/`）、`web/dist`、`bin/kin-worker`、`bin/kin-kernel`、`share/wrap-cli/kin-kernel.bin` 和 `share/wrap-cli/cli-node`，重启一次 Node。**需要 `wrap-cli/sync`** 将配套 kernel/CLI 同步进 Claude 槽；各槽还需更新并重载 kin-worker，才能使用原生限额重置。不要 `docker rm` 槽，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+
+## 1.3.93 — 2026-10-03
+
+- 槽运维终端启动时把 `CLAUDE_CONFIG_DIR` 指到 `$HOME/.claude`。令牌仍只放在该目录的 `credentials.json`；若缺少官方入口 `.credentials.json` 或家目录 `~/.claude.json`，会话里补上指向 `.claude` 内文件的链接。`claude` 仍启动该槽的 cli-node。
+- 换票从授权响应原文提取 `subscriptionType`（`pro` / `max` / `team` / `enterprise`）并写入槽凭证 `claudeAiOauth`。原文没有套餐时用该 VM 已识别的 `account_tier`，仍没有则记 `pro`。重写凭证时保留已有值。
+- 新版本启动时给旧凭证补上缺失的 `subscriptionType`（已识别套餐，否则 `pro`），已有值不改。
+- 每个 Claude 槽只留内核的一个 `cli-node`。运维终端里的交互进程在会话还连着时保留；断开后若进程还在（cli-node 不响应 SIGHUP）则杀掉。
+
+已部署机升级：更新 Node 控制面（`src/`）和 `share/wrap-cli/cli-node`，并把新 ELF 装进每个 Claude 槽的 `cli-home/.kin/cli-node` 后重启该槽的 cli-node。kernel 未变。不要 `docker rm` 槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.92 — 2026-10-02
+
+- SOCKS5 透明出口的 `dns_primary` 支持自定义 HTTPS DoH URL（域名、IPv4 / IPv6 literal、路径 / 查询参数及端口），仍使用同一字符串设置；设置页可选择 Cloudflare 域名或编辑自定义 URL。自定义上游优先，其后保留原有 fallback 顺序，`auto` 和已有选项行为不变。拒绝 userinfo、fragment、无效主机 / 端口及原始逗号，避免逗号分隔的上游配置被拆成多项。域名经 SOCKS5 代理解析，不新增 DNS bootstrap 或改写传输实现。
+- 代理列表 / 配置读取接口仅向管理员返回 `dns_primary`，租户响应省略该字段，避免自定义 DoH URL 的路径 / 查询令牌泄露；其它配置字段及权限边界不变。
+- DoH 仅跟随 HTTPS 重定向，拒绝降级到 HTTP，避免自定义解析服务通过 307 / 308 将 DNS 查询转发为明文；正常 TLS 证书 / 主机名校验保持开启。
+- VM 详情「运维」tab 新增槽容器终端（Claude 槽；GPT 槽没有容器不显示）：点「打开终端」后经 Docker Engine exec 进入 `kin-xx`，以容器自身用户运行 bash，支持全屏程序与窗口缩放；本机与集群节点槽位走同一路径。鉴权沿用集群终端的 30s 一次性 ticket（`POST /api/panel/vms/:id/shell-ticket`），仅管理员可用，同时最多 8 个会话；断开后清理该会话在容器内的全部进程。终端空行输入 `/usage`（同「探测」，显示 5h / 7d / Fable / Sonnet 窗口）、`/wrap`（重装 wrap-cli 并重启 kernel）、`/reload`（重载 worker）、`/help`、`/clear` 即执行面板快捷指令，上方也有对应按钮；`/usr/bin/...` 之类非指令输入原样交给 shell，vim / less 内不拦截 `/`。反代需对 `/api/panel/vms/<id>/shell` 透传 Upgrade（`docs/DEPLOY.md` 已更新）。集群页终端改用同一组件，行为不变。
+
+已部署机升级：更新 Node 控制面（`src/`）、`web/dist` 和 `bin/kin-egress`，重启一次 Node；依赖、`kin-kernel`、`cli-node` 未变，无需 `wrap-cli/sync`。nginx 把集群终端那条 Upgrade location 扩到 `^/api/panel/(cluster/nodes|vms)/[^/]+/shell$`。
+
+## 1.3.91 — 2026-10-02
+
+- 修复客户端取消后 native CLI 的共享 stdin 被 `await cancelJob` 堵住：取消异步处理，任务真正结束后才 ack，已结束 / 未知 job 的取消也可幂等确认；一个卡住的 slot 不再堵住其他 19 个。内核按 job 状态区分 CLI 已结束与仍占有任务，拒绝错配 / 重复 ack，避免释放正在运行的新 job。
+- Node 每次 hop 生成独立 ID，经鉴权 cancel 路由显式取消；提前取消和 HTTP 提交中断均安全处理，完整 JSONL 写入后才执行取消，保留断开连接兜底。
+- CLI 原始 HTTP / 网络错误直接保留 code、status、type、message、retry-after，流式与非流式一致；native 请求不再经过交互式错误渲染或隐藏重试 / 非流式 fallback，真实故障不再统一成 `incomplete_response`。新增网络、中断、空流、CLI 和 kernel 故障码；本地故障不罚账号。
+- 有界恢复：先关闭未 ack 的 slot 并重发取消，探活共享 stdin，必要时仅重启 CLI（3 次 / 10 分钟，等待 10/30/60 秒）。CLI 恢复耗尽或 kernel 不可达，Node watchdog 才重启容器（3 次 / 小时，等待 1/5/15 分钟）；仍失败则停重启、排除 VM 并通知。请求失败 / slot 忙不再绕过 watchdog 自行重启，cc-node/crag 例外保留。
+- 健康字段改为 `healthy` / `unhealthy_reason` / `recovering` / `closed_slots` / `cli_restarts`；旧 `wedged_slots` 移除。更新 `bin/kin-kernel`、`share/wrap-cli/kin-kernel.bin`、`share/wrap-cli/cli-node`；只换 Node 代码不能修复旧槽内进程。上线时需同步这两种新二进制，保留 VM、路由与数据。
+
+## 1.3.90 — 2026-10-01
+
+- 修复 #198：SOCKS5 地址是 IPv6 literal（如 `socks5h://[::1]:1080`）时，Codex OAuth 换票 / 刷新 / 目录、Claude 身份引导、OpenAI 额度、出口地理查询和 `kin-oauth-auth` 换票都在连代理之前报 `getaddrinfo ENOTFOUND [::1]`。根因是 socks-proxy-agent 10.1.0 把 URL 里带方括号的主机名原样拿去连接；Node 侧统一经 `src/lib/vm/proxy-agent.mjs` 建 agent，`kin-oauth-auth` 重新打包同一修复。IPv4 / hostname 代理行为不变。
+- 修复 #196：本地出口（`px-local`）的 GPT 槽位，推理由宿主 Codex kernel 自己读 `HTTPS_PROXY` / `ALL_PROXY` 走部署代理，而目录同步、额度、token 刷新、OAuth 换票由 Node 直连，同一账号出现两个出口，直连不通时这些请求失败。现在由 Node 按 kernel 原有顺序（`HTTPS_PROXY` > `https_proxy` > `ALL_PROXY` > `all_proxy`，`HTTP_PROXY` 不用于 https）解析一次，写进 kernel 配置并要求必须走该代理；kernel 启动时去掉继承的代理变量，主机侧请求用同一个地址。HTTP(S) 代理新增 `https-proxy-agent` 支持；代理地址协议不认识时直接报错，不再静默直连。本地 Claude 槽位仍直连。`NO_PROXY` 不再影响本地 GPT 槽位的出口。
+- 修复 #197：同一槽位 id 下有旧账号的计费行时（1.3.89 之前的 id 复用，或同一槽位重新登录别的账号），总览计费条不再把旧账号的费用显示成当前账号、也不再出现重复 chip；旧账号显示自己的邮箱，没有邮箱时显示「vm-xx 旧账号」，只有当前账号的 chip 链接到槽位。后端计费行的邮箱改为按账号匹配。
+
+已部署机升级：更新 Node 控制面（`src/`、`package*.json`）、`web/dist` 和 `bin/kin-oauth-auth`，`npm ci --omit=dev`（新增 `https-proxy-agent`），重启一次 Node。已在运行的本地出口 GPT 槽位 Codex kernel 需重启该槽位才会改用显式代理配置。
+
 ## 1.3.89 — 2026-10-01
 
 - 集群 VM 放置：存在集群节点时，管理员可把 Claude / Rust VM 创建到 SSH 加入的 VPS。节点槽位使用自包含镜像 `vm2api/kin-slot-<kernel>:<sha12>`，经 SSH streamlocal 管理容器并中继 kernel / worker socket；凭据以节点副本为准，导入推送、刷新拉回。SOCKS5 出口在节点上按槽位成对部署（`kin-02` / `kin-02-egress`，网络 `kin-02-net`），槽位删除或换出口时回收；节点槽位允许使用与内存上限等量的 swap。本机/节点差异收敛到 `slotHost(vm)` 契约；Codex、官方 CC 初始化、wrap 修复/提升、引擎与 auth_scheme 切换在节点上返回 `remote_unsupported`。面板：VM 标出所在服务器（本机 `local`），集群页显示各节点 Docker 运行/总数，节点 Docker 列表按槽位把出口排在一起。新增 `POST /api/panel/cluster/nodes/:id/{preflight,slot-image}`。

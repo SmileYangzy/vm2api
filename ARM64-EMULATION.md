@@ -1,8 +1,8 @@
 # Oracle ARM64 原生控制面 + amd64 槽位（实验）
 
 初始适配基线：`v1.3.47` / `081289cb3e04b60949b10babecde61d0b869b268`。
-当前应用基线：上游 `v1.3.89` / `33d0582cb336871d756219e321e867c75f941462`（2026-10-01）。
-控制面使用本地构建的 `vm2api-arm64-control:v1.3.89`：Node、Python、iptables、Docker CLI、
+当前应用基线：上游 `v1.3.102` / `a3b267c99d3fc9b356ade2bb0e3c858f891db19e`（2026-10-04）。
+控制面使用本地构建的 `vm2api-arm64-control:v1.3.102`：Node、Python、iptables、Docker CLI、
 `kin-egress` 和 `kin-worker` 原生运行在 ARM64；上游未提供 ARM64 版本的槽位 CLI、Rust kernel
 和 OAuth helper 继续通过 QEMU 执行。本方案不是全栈原生 ARM，也未做推理性能基准测试。
 
@@ -49,7 +49,7 @@
 
 | 用途 | 镜像 / 摘要 |
 | --- | --- |
-| amd64 动态库来源 | `ghcr.io/dofastted/vm2api:v1.3.89@sha256:05dc3fbdc1263e3069e9ad09bef02ac827a191fb33a9cc1aed04580cca37517d` |
+| amd64 动态库来源 | `ghcr.io/dofastted/vm2api:v1.3.102@sha256:641331db0b8978b190079021c8cf5e04504001979230c168e89d8a79d2a51c4b` |
 | 原生 Node 22 | `node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c` |
 | 原生 Go builder | `golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437` |
 | QEMU 10.2.3 | `tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0` |

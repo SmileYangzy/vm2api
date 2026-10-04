@@ -12,6 +12,7 @@ import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
+import { isCodexVm } from './vm-kind.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -183,6 +184,25 @@ function readPid(file) {
     return 0
   }
 }
+
+function ownsEgressProcess(pid, configPath) {
+  if (!pidAlive(pid)) return false
+  try {
+    // PID files survive container restarts; a live PID may belong to another
+    // process or another proxy. Verify both before reusing or signaling it.
+    const exe = fs.readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '')
+    const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
+    const configIndex = args.indexOf('-config')
+    if (path.basename(exe) !== 'kin-egress' || configIndex <= 0 || !args[configIndex + 1]) return false
+    const argument = args[configIndex + 1]
+    const actualConfig = path.isAbsolute(argument)
+      ? path.resolve(argument)
+      : path.resolve(fs.readlinkSync(`/proc/${pid}/cwd`), argument)
+    return actualConfig === path.resolve(configPath)
+  } catch {
+    return false
+  }
+}
 export function inspectEgressNetwork(proxyId, run = docker) {
   const name = networkName(proxyId)
   if (!name) return null
@@ -270,13 +290,30 @@ export const DNS_UPSTREAMS = Object.freeze([
 export const DNS_PRIMARY_AUTO = 'auto'
 
 export function validDnsPrimary(value) {
-  return value === DNS_PRIMARY_AUTO || DNS_UPSTREAMS.includes(value)
+  if (value === DNS_PRIMARY_AUTO || DNS_UPSTREAMS.includes(value)) return true
+  // The upstream chain is comma-delimited. Reject URL forms that URL() would
+  // silently normalize or that cannot be carried unchanged to kin-egress.
+  if (typeof value !== 'string' || /[\s\x00-\x1f\x7f\\,#]/.test(value)) return false
+  if (/%(?![a-f0-9]{2})/i.test(value)) return false
+  const authority = /^https:\/\/(\[[^\]]+\]|[^/:?#]+)(?::([0-9]+))?(?:[/?]|$)/.exec(value)
+  if (!authority || authority[1].includes('@')) return false
+  if (authority[2] != null && (Number(authority[2]) < 1 || Number(authority[2]) > 65535)) return false
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.hash) return false
+    // URL() validates bracketed IPv6 literals and numeric IPv4 addresses.
+    if (authority[1].startsWith('[')) return true
+    const host = authority[1].replace(/\.$/, '')
+    return host.length <= 253 && host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))
+  } catch {
+    return false
+  }
 }
 
 // Operator picks which DNS to try first; the rest stay behind it as fallback.
 // 'auto' -> '' so kin-egress uses its built-in order.
 export function dnsUpstreamChain(primary) {
-  if (!DNS_UPSTREAMS.includes(primary)) return ''
+  if (primary === DNS_PRIMARY_AUTO || !validDnsPrimary(primary)) return ''
   return [primary, ...DNS_UPSTREAMS.filter((u) => u !== primary)].join(',')
 }
 
@@ -309,7 +346,7 @@ export function startEgressProcess({
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   const existing = readPid(pidFile)
-  if (existing && pidAlive(existing)) {
+  if (ownsEgressProcess(existing, cfgPath)) {
     try {
       const old = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
       if (
@@ -349,14 +386,14 @@ export function stopEgressProcess(projectRoot, proxyId) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pidFile = path.join(dir, 'egress.pid')
   const pid = readPid(pidFile)
-  if (pid && pidAlive(pid)) {
+  if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
     try {
       process.kill(pid, 'SIGTERM')
     } catch (error) {
       if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
     }
     // Keep the PID while termination is pending so policy reconciliation can verify/retry it.
-    if (pidAlive(pid)) return { ok: true }
+    if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) return { ok: true }
   }
   try {
     fs.rmSync(pidFile, { force: true })
@@ -369,7 +406,9 @@ export function stopEgressProcess(projectRoot, proxyId) {
 export function inspectEgressProcess(projectRoot, proxyId) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pid = readPid(path.join(dir, 'egress.pid'))
-  if (!pid || !pidAlive(pid)) return { ok: false, pid: pid || null, reason: 'not_running' }
+  if (!ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
+    return { ok: false, pid: pid || null, reason: 'not_running' }
+  }
   let listenTcp = ''
   try {
     listenTcp = String(JSON.parse(fs.readFileSync(path.join(dir, 'egress.json'), 'utf8')).listen_tcp || '')
@@ -398,6 +437,29 @@ export function boundProxyUrl(proxy) {
   if (isLocalEgressProxy(proxy)) return ''
   assertProxyAllowed(proxy)
   return socksProxyUrl(proxy)
+}
+
+// reqwest's order for an https destination; HTTP_PROXY only covers http:// destinations.
+const LOCAL_PROXY_ENV_KEYS = Object.freeze(['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy'])
+
+/**
+ * Deployment proxy behind a local Codex slot. A host-launched Codex kernel would
+ * read these variables on its own while node-fetch ignores them, splitting one
+ * account across two exits; Node resolves the URL once and hands the kernel the
+ * same value. NO_PROXY does not apply: the exit is chosen per slot, not per host.
+ */
+export function localEgressProxyUrl(env = process.env) {
+  for (const key of LOCAL_PROXY_ENV_KEYS) {
+    const value = String(env?.[key] || '').trim()
+    if (value) return value.replace(/^socks5:\/\//i, 'socks5h://')
+  }
+  return ''
+}
+
+/** Exit for a host-side request made for this VM. Local Claude slots run in a container without proxy env, so theirs stay direct. */
+export function hostProxyUrlForVm(vm) {
+  if (!isLocalEgressProxy(vm?.proxy)) return boundProxyUrl(vm?.proxy)
+  return isCodexVm(vm) ? localEgressProxyUrl() : ''
 }
 
 function waitListen(host, port, timeoutMs = 8000) {

@@ -1,3 +1,4 @@
+import type { BillingAccountRow } from '@/types/panel-overview'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { isCodexVm } from '@/lib/vm-kind'
@@ -10,15 +11,15 @@ function num(v: unknown): number {
 /**
  * A usage row keyed by the slot id rather than the account uuid, with no email —
  * left behind by an earlier credential on the same slot. Not this account's data.
+ * No uuid (GPT / unbound) is the live row, not leftover — same as
+ * `isLeftoverVmKeyedAccount`.
  */
 export function isLeftoverUsageRow(row: UsageAccountRow, vm: Vm): boolean {
   const id = String(row.account_id || '')
   if (!id) return false
-  return (
-    id === String(vm.id || '') &&
-    id !== String(vm.account_uuid || '') &&
-    !row.email
-  )
+  const uuid = String(vm.account_uuid || '')
+  if (!uuid) return false
+  return id === String(vm.id || '') && id !== uuid && !row.email
 }
 
 /**
@@ -26,12 +27,32 @@ export function isLeftoverUsageRow(row: UsageAccountRow, vm: Vm): boolean {
  * slot with no real credential bound, not an actual account. Distinct from
  * `isLeftoverUsageRow` (which needs a `Vm` to compare against); this one
  * only needs the row itself, for list-wide filtering. Mirrors index.html's
- * `isLeftoverUsageAccount(a)`.
+ * `isLeftoverUsageAccount(a)`. Spend on that key is a live GPT/slot row.
  */
 export function isLeftoverUsageAccount(row: UsageAccountRow): boolean {
   const id = String(row.account_id || '')
   const vmId = String(row.vm_id || '')
-  return !!id && id === vmId && !row.email
+  if (!id || id !== vmId || row.email) return false
+  return (
+    num(row.total_cost) === 0 &&
+    num(row.today_cost) === 0 &&
+    num(row.requests) === 0 &&
+    num(row.window_5h_cost) === 0 &&
+    num(row.window_7d_cost) === 0
+  )
+}
+
+/**
+ * The slot a billing row may be shown as. Slot ids get reused, so a row from an
+ * earlier account on the same id belongs to that account, not the slot's current one.
+ */
+export function billingRowSlot(
+  row: BillingAccountRow,
+  byId: Map<string, Vm>
+): Vm | undefined {
+  const vm = row.vm_id ? byId.get(String(row.vm_id)) : undefined
+  if (!vm?.account_uuid) return vm
+  return vm.account_uuid === row.account_id ? vm : undefined
 }
 
 export function usageAccountForVm(

@@ -3,7 +3,7 @@
 # DOCKER_DEFAULT_PLATFORM is inherited by the slot pull/build/run commands.
 services:
   vm2api:
-    image: ${VM2API_EMULATION_IMAGE:-ghcr.io/dofastted/vm2api:v1.3.89@sha256:05dc3fbdc1263e3069e9ad09bef02ac827a191fb33a9cc1aed04580cca37517d}
+    image: ${VM2API_EMULATION_IMAGE:-ghcr.io/dofastted/vm2api:v1.3.102@sha256:641331db0b8978b190079021c8cf5e04504001979230c168e89d8a79d2a51c4b}
     platform: linux/amd64
     cpus: 2.0
     pids_limit: 512

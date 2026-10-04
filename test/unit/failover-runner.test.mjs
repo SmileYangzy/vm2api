@@ -70,6 +70,38 @@ function success(text = 'ok') {
   }
 }
 
+test('unsupported classifier runtime stops without counting execution or cooling accounts', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'classifier-runtime',
+    model: 'claude-sonnet-4-6',
+    canonicalBody: { model: 'claude-sonnet-4-6' },
+    callAttempt: async () => {
+      calls++
+      return {
+        ok: false,
+        status: 400,
+        upstreamExecutions: 0,
+        terminalState: 'rejected',
+        body: {
+          error: {
+            type: 'invalid_request_error',
+            code: 'classifier_runtime_unsupported',
+            message: 'unsupported runtime',
+          },
+        },
+      }
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(result.attemptCount, 0)
+  assert.equal(result.body.error.code, 'classifier_runtime_unsupported')
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(scheduler.selectCalls, 1)
+})
+
 test('account1 quota exhausted rotates to account2 and commits final sticky', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const attempts = new Attempts()
@@ -1102,6 +1134,37 @@ test('one VM gets at most three executions for a request, hidden retries include
   assert.equal(result.vmId, 'vm-01')
   assert.equal(result.attemptCount, 2)
   assert.deepEqual(seen, ['vm-01', 'vm-01'])
+})
+
+test('a hop that failed with a kernel-named cause ends with that cause, not incomplete_response', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const seen = []
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const result = await runner.run({
+    requestId: 'req-network',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      return {
+        ok: false,
+        status: 502,
+        committed: false,
+        terminalState: 'incomplete',
+        body: {
+          type: 'error',
+          error: { type: 'api_error', code: 'upstream_network_error', message: 'fetch failed: ECONNRESET' },
+        },
+      }
+    },
+  })
+  assert.equal(result.status, 502)
+  assert.equal(result.body.error.code, 'upstream_network_error')
+  assert.ok(seen.includes('vm-02'), 'a network failure moves on to another VM')
+  assert.deepEqual(scheduler.cooldowns, [], 'no account is penalised for it')
 })
 
 test('the fifth candidate is reached after four VMs fail', async () => {
