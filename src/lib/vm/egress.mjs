@@ -106,7 +106,22 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
   // REDIRECT delivers bridge traffic to host INPUT. Allow only this proxy's
   // subnet and helper ports, ahead of host default-reject rules (e.g. Oracle).
   const inputRules = [
-    ['-i', bridge, '-s', subnet, '-d', subnet, '-p', 'tcp', '-m', 'multiport', '--dports', `${tcp},${dns}`, '-j', 'ACCEPT'],
+    [
+      '-i',
+      bridge,
+      '-s',
+      subnet,
+      '-d',
+      subnet,
+      '-p',
+      'tcp',
+      '-m',
+      'multiport',
+      '--dports',
+      `${tcp},${dns}`,
+      '-j',
+      'ACCEPT',
+    ],
     ['-i', bridge, '-s', subnet, '-d', subnet, '-p', 'udp', '--dport', dns, '-j', 'ACCEPT'],
   ]
   return {

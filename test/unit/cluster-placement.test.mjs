@@ -252,7 +252,15 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
     fakeElf(path.join(root, f), 1)
   }
   fakeElf(path.join(root, 'bin/kin-codex-kernel'), 1)
-  const envKeys = ['KIN_KERNEL_BIN', 'KIN_WORKER_BIN', 'KIN_EGRESS_BIN', 'KIN_CODEX_KERNEL_BIN', 'KIN_WRAP_CLI_ROOT', 'KIN_CLUSTER_WORKER_BIN', 'KIN_CLUSTER_EGRESS_BIN']
+  const envKeys = [
+    'KIN_KERNEL_BIN',
+    'KIN_WORKER_BIN',
+    'KIN_EGRESS_BIN',
+    'KIN_CODEX_KERNEL_BIN',
+    'KIN_WRAP_CLI_ROOT',
+    'KIN_CLUSTER_WORKER_BIN',
+    'KIN_CLUSTER_EGRESS_BIN',
+  ]
   const saved = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]))
   t.after(() => {
     for (const [k, v] of Object.entries(saved)) {
@@ -288,8 +296,16 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {
   const root = tmpDir('kin-arm-cluster-payload-')
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  for (const file of ['share/wrap-cli/cli-node', 'share/wrap-cli/cc-node', 'bin/kin-kernel',
-    'bin/kin-codex-kernel', 'bin/kin-worker', 'bin/kin-egress', 'amd64/kin-worker', 'amd64/kin-egress']) {
+  for (const file of [
+    'share/wrap-cli/cli-node',
+    'share/wrap-cli/cc-node',
+    'bin/kin-kernel',
+    'bin/kin-codex-kernel',
+    'bin/kin-worker',
+    'bin/kin-egress',
+    'amd64/kin-worker',
+    'amd64/kin-egress',
+  ]) {
     fakeElf(path.join(root, file), 1)
   }
   for (const name of ['kin-worker', 'kin-egress']) {
@@ -298,8 +314,15 @@ test('amd64 node payload stays separate from native ARM control helpers', (t) =>
     arm.writeUInt16LE(183, 18) // ELF e_machine: AArch64.
     fs.writeFileSync(file, arm)
   }
-  const envKeys = ['KIN_KERNEL_BIN', 'KIN_WORKER_BIN', 'KIN_EGRESS_BIN', 'KIN_CODEX_KERNEL_BIN',
-    'KIN_WRAP_CLI_ROOT', 'KIN_CLUSTER_WORKER_BIN', 'KIN_CLUSTER_EGRESS_BIN']
+  const envKeys = [
+    'KIN_KERNEL_BIN',
+    'KIN_WORKER_BIN',
+    'KIN_EGRESS_BIN',
+    'KIN_CODEX_KERNEL_BIN',
+    'KIN_WRAP_CLI_ROOT',
+    'KIN_CLUSTER_WORKER_BIN',
+    'KIN_CLUSTER_EGRESS_BIN',
+  ]
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]))
   t.after(() => {
     for (const [key, value] of Object.entries(saved)) {

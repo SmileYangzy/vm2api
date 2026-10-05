@@ -2,7 +2,7 @@
 # Control plane is ARM64; dynamically created slot guests stay amd64.
 services:
   vm2api:
-    image: vm2api-arm64-control:v1.3.104
+    image: vm2api-arm64-control:v1.3.106
     platform: linux/arm64
     build:
       context: .

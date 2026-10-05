@@ -247,8 +247,11 @@ test('iptables plan redirects tcp and dns, returns subnet, drops the rest', () =
 
 test('host INPUT allows only bridge subnet helper ports and removes the same rules', () => {
   const plan = iptablesPlan({
-    chain: 'KEGa1b2c3d4', bridge: 'kega1b2c3d4', subnet: '172.31.0.0/24',
-    tcpPort: 20010, dnsPort: 20011,
+    chain: 'KEGa1b2c3d4',
+    bridge: 'kega1b2c3d4',
+    subnet: '172.31.0.0/24',
+    tcpPort: 20010,
+    dnsPort: 20011,
   })
   const allows = plan.add.filter((row) => row.includes('-I') && row.includes('INPUT'))
   assert.equal(allows.length, 2)
