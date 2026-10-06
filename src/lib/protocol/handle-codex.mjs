@@ -347,7 +347,7 @@ export async function handleCodexProtocol({
   stickyRouter = null,
   sessions = null,
   body = null,
-  logMode = 'normal',
+  captureOutbound = false,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -531,7 +531,7 @@ export async function handleCodexProtocol({
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
         const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
-        if (logMode === 'debug') logBag.outbound_body = outboundBody
+        if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         const result = await runCodexKernelHop({
           hop,
@@ -676,8 +676,10 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
     picked.error === 'session_window_full' ||
     picked.error === 'pool_wait_queue_full'
   ) {
+    // Queue-full has no retryAt. Every Codex pool_overloaded 429 still advertises >= 1s.
     const waitMs = Number(picked.retryAt) - Date.now()
-    if (waitMs > 0) res.setHeader?.('retry-after', String(Math.ceil(waitMs / 1000)))
+    const retryAfterSec = Math.max(1, waitMs > 0 ? Math.ceil(waitMs / 1000) : 0)
+    res.setHeader?.('retry-after', String(retryAfterSec))
     return json(res, 429, {
       error: {
         type: 'rate_limit_error',
