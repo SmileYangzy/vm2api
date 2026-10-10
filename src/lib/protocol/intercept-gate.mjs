@@ -15,7 +15,15 @@ import {
   refusalPromptSignature,
 } from '../core/refusal-guard.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { HARD_POLICY_RULES, classifyJev, jevDocument, matchHardPolicy, policyBlockError } from './jev-intercept.mjs'
+import {
+  HARD_POLICY_RULES,
+  classifyJev,
+  isPolicyBlockMemory,
+  jevDocument,
+  jevModelDocument,
+  matchHardPolicy,
+  policyBlockError,
+} from './jev-intercept.mjs'
 import { gateVerdict } from './intercept-stats.mjs'
 import { prepareInterceptText } from './jev-prepare.mjs'
 
@@ -140,6 +148,10 @@ export async function evaluateProtocolIntercept({
     stripReminders: jev?.strip_reminders !== false,
     expandBase64: jev?.expand_base64 !== false,
   })
+  const modelDocument = prepareInterceptText(jevModelDocument(inbound, body), {
+    stripReminders: jev?.strip_reminders !== false,
+    expandBase64: jev?.expand_base64 !== false,
+  })
   const distillOn = distillRules?.enabled !== false
   const hardOn = jev?.hard_regex_enabled !== false
   const rules = hardRulesFor(inbound, body, jev, distillOn)
@@ -193,7 +205,7 @@ export async function evaluateProtocolIntercept({
   }
 
   if (policy?.enabled && repo && typeof repo.get === 'function') {
-    const match = matchStoredRefusal({
+    let match = matchStoredRefusal({
       inbound,
       body,
       headers,
@@ -203,6 +215,8 @@ export async function evaluateProtocolIntercept({
       similarity: similarityRatio(policy.similarity),
       deviceBlockEnabled: policy.device_block_enabled,
     })
+    // Our own Jev/regex block used to be stored here and then blocked every retry.
+    if (match && match.kind !== 'device' && isPolicyBlockMemory(match.row?.error_message)) match = null
     if (match) {
       const error = refusalGuardError(requestId)
       return block({
@@ -223,7 +237,7 @@ export async function evaluateProtocolIntercept({
   }
 
   if (jev?.enabled) {
-    const verdict = await classifyJev(document, jev, fetchImpl)
+    const verdict = await classifyJev(modelDocument, jev, fetchImpl)
     if (verdict.action === 'block') {
       const error = policyBlockError(requestId)
       return block({
@@ -240,7 +254,7 @@ export async function evaluateProtocolIntercept({
         model: body?.model || inbound?.model || '',
         preview: refusalPreview(body, inbound),
         banDevice: true,
-        remember: true,
+        remember: false,
         reason: `jev:${verdict.category}`,
       })
     }
