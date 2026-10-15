@@ -15,6 +15,7 @@ export const BETA_PROMPT_CACHING_SCOPE = 'prompt-caching-scope-2026-01-05'
 export const BETA_MID_CONVERSATION_SYSTEM = 'mid-conversation-system-2026-04-07'
 export const BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT = 'mid-conversation-system-clear-at-2026-08-21'
 export const BETA_MID_CONVERSATION_TOOL_CHANGES = 'mid-conversation-tool-changes-2026-07-01'
+export const BETA_MID_CONVERSATION_OUTPUT_CONFIG = 'mid-conversation-output-config-2026-07-01'
 export const BETA_ADVANCED_TOOL_USE = 'advanced-tool-use-2025-11-20'
 export const BETA_THINKING_BINDING_CONTROLS = 'thinking-binding-controls-2026-08-01'
 export const BETA_EFFORT = 'effort-2025-11-24'
@@ -85,12 +86,41 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (body.thinking?.block_binding) add(BETA_THINKING_BINDING_CONTROLS)
   if (body.thread != null) add('message-threads-2026-08-12')
   if (body.diagnostics != null) add(BETA_CACHE_DIAGNOSIS)
+  if (body.fallbacks === 'default') add('server-side-fallback-2026-07-01')
+  else if (Array.isArray(body.fallbacks) && body.fallbacks.length > 0) add('server-side-fallback-2026-06-01')
+  if (
+    typeof body.fallback_credit_token === 'string' &&
+    body.fallback_credit_token.length > 0 &&
+    body.fallback_credit_token.length <= 2048
+  )
+    add(BETA_FALLBACK_CREDIT)
   if (body.cache_control?.evict_on_complete) add('prompt-caching-evict-2026-05-12')
   if (hasHourCache(body) || hasHourCache(body.system) || hasHourCache(body.tools) || hasHourCache(body.messages))
     add(BETA_EXTENDED_CACHE_TTL)
   if (Array.isArray(body.messages)) {
-    if (body.messages.some((message) => message?.role === 'system')) add(BETA_MID_CONVERSATION_SYSTEM)
-    if (body.messages.some((message) => message?.clear_at != null)) add(BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
+    let hasSystem = false
+    let hasClearAt = false
+    let hasMessageOutputConfig = false
+    let hasMessageEffort = false
+    let hasMessageFormat = false
+    let hasMessageTaskBudget = false
+    for (const message of body.messages) {
+      if (!message || typeof message !== 'object') continue
+      if (message.role === 'system') hasSystem = true
+      if (message.clear_at != null) hasClearAt = true
+      const config = message.output_config
+      if (!config || typeof config !== 'object') continue
+      hasMessageOutputConfig = true
+      if (config.effort != null) hasMessageEffort = true
+      if (config.format) hasMessageFormat = true
+      if (config.task_budget) hasMessageTaskBudget = true
+    }
+    if (hasSystem) add(BETA_MID_CONVERSATION_SYSTEM)
+    if (hasClearAt) add(BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
+    if (hasMessageOutputConfig) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
+    if (hasMessageEffort) add(BETA_EFFORT)
+    if (hasMessageFormat) add('structured-outputs-2025-12-15')
+    if (hasMessageTaskBudget) add('task-budgets-2026-03-13')
   }
   return betas
 }

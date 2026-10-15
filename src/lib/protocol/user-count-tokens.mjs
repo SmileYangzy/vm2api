@@ -7,14 +7,20 @@ import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { readJevConfig } from './jev-intercept.mjs'
+import { findAccount } from '../admin/panel-api.mjs'
+import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
-import { readRoutingConfigFile } from '../core/config.mjs'
+import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
 import {
   detectProxiedOfficialCcFromRouting,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
 } from '../identity/crs-persona.mjs'
+import {
+  claudeCodeOnlyError,
+  claudeCodeOnlyFromRouting,
+  isClaudeCodeFamilyRequest,
+} from '../identity/claude-code-only.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
@@ -151,8 +157,8 @@ function sendPoolFail(res, json, peeked) {
     return json(res, mapped.status, mapped.body)
   }
   const mapped = rewritePoolErrorForClient(makeError({ type: ErrorType.OVERLOADED, code, message: code, status: 503 }))
-  if (mapped.retryAfterSec) {
-    const retryMs = Number(peeked?.retry_after_ms)
+  const retryMs = Number(peeked?.retry_after_ms)
+  if (mapped.retryAfterSec || retryMs > 0) {
     const secs = retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : mapped.retryAfterSec
     res.setHeader?.('retry-after', String(secs))
   }
@@ -205,7 +211,7 @@ function deviceRepo(deps) {
   }
 }
 
-/** Distill, hard regex, refusal cache, and jev all return before peek or worker hop. */
+/** Distill, hard regex, refusal cache, and jev. `wait` means the slot is required before a verdict. */
 export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
   let jev
   try {
@@ -224,8 +230,17 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     jev,
     repo: refusalRepo(deps),
     devices: deviceRepo(deps),
+    account: deps.account || null,
   })
-  return decision?.error || null
+  let wait = false
+  if (decision?.action !== 'block' && decision?.intercept) {
+    try {
+      wait = JSON.parse(decision.intercept).by === 'scope-wait'
+    } catch {
+      wait = false
+    }
+  }
+  return { error: decision?.action === 'block' ? decision.error : null, wait }
 }
 
 export async function handleUserCountTokens(req, res, deps) {
@@ -233,7 +248,7 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!deps.requireAuth(req, res)) return
   let inbound
   try {
-    inbound = await deps.readBody(req, deps.cfg.limits.max_body_bytes)
+    inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
   } catch (error) {
     if (error?.body?.error) return json(res, error.status || 400, error.body)
     return json(
@@ -249,8 +264,17 @@ export async function handleUserCountTokens(req, res, deps) {
   }
   const parsed = parseCountTokensBody(inbound)
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
-  const blocked = await blockCountTokensBeforeHop(req, parsed.body, deps)
-  if (blocked) return json(res, blocked.status, blocked.body)
+  const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
+  if (
+    claudeCodeOnlyFromRouting(routing) &&
+    detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
+    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
+  ) {
+    const err = claudeCodeOnlyError()
+    return json(res, err.status, err.body)
+  }
+  const gate = await blockCountTokensBeforeHop(req, parsed.body, deps)
+  if (gate?.error) return json(res, gate.error.status, gate.error.body)
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
     stickyRouter: deps.stickyRouter,
@@ -260,6 +284,13 @@ export async function handleUserCountTokens(req, res, deps) {
     usersRepo: deps.apiKeyStore?.users || null,
   })
   if (!peeked.ok) return sendPoolFail(res, json, peeked)
+  if (gate.wait) {
+    const again = await blockCountTokensBeforeHop(req, parsed.body, {
+      ...deps,
+      account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
+    })
+    if (again?.error) return json(res, again.error.status, again.error.body)
+  }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canCountTokens(mode)) {
     const { listed, source } = await resolveUsageWindows({

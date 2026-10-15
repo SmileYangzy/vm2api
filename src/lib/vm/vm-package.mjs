@@ -12,23 +12,25 @@ import { persistOauthToVm, readWorkerCredentialFile, writeWorkerCredentialFile }
 import { oauthToSub2apiExport, sub2apiAccountToOauth } from '../oauth/sub2api-account.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
+import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
 import { defaultSeedPolicy, standardSeedPolicy } from '../protocol/seed-policy.mjs'
 import {
   applyGeneratedFingerprint,
-  generateWorkstationFingerprint,
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
+import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
 import { VM_ORIGIN, canBindProxyToVm, normalizeOwnerId } from '../admin/resource-owner.mjs'
 import { readCodexAccounts, writeCodexAccounts } from './codex-slot.mjs'
-import { isLocalEgressProxy } from './egress.mjs'
+import { hasBoundExit, isLocalEgressProxy } from './egress.mjs'
 import { OS_CATALOG, STANDARD_LOCALE, nextNumericIndex, padVm, parseVmIndex } from './vm-runtime.mjs'
 import { parseSocks5Fields } from './proxy-pool.mjs'
 import { seedFreshCliHome } from './vm-recreate.mjs'
 import { atomicWriteJson, isValidVmId } from './vm-file.mjs'
 import { bindVmProxy, getVm, listVms } from './vm-registry.mjs'
 import { isCodexVm, stampVmKind } from './vm-kind.mjs'
+import { normalizeVmConfig, resolveMachineSpec } from './machine-spec.mjs'
 import {
   SESSION_SLOT_MAX,
   SESSION_SLOT_MIN,
@@ -104,6 +106,8 @@ function policyFromVm(vm, codex) {
   if (policy.priority != null) out.priority = policy.priority
   if (policy.quota && typeof policy.quota === 'object') out.quota = policy.quota
   if (Array.isArray(policy.allowed_models)) out.allowed_models = policy.allowed_models
+  // Explicit null: writing the package back restores a 24h slot instead of keeping a later window.
+  out.active_hours = activeHoursOf({ policy })
   return out
 }
 
@@ -170,7 +174,7 @@ export function buildVmPackage({
       inference_engine: engineOf(vm.inference_engine) || '',
       dataplane: normalizeKernelDataplane(vm.dataplane, { inherit: true }) || '',
       auth_scheme: codex ? '' : normalizeAuthScheme(vm.claude?.auth_scheme || vm.auth_scheme),
-      proxy_cli_enabled: vm.proxy_cli_enabled === true,
+      proxy_cli_enabled: hasBoundExit(proxy || vm.proxy),
       schedulable: operatorSchedulable(vm),
       schedule_manual: vm.schedule_manual === true,
       policy: policyFromVm(vm, codex),
@@ -247,6 +251,11 @@ function parsePolicy(raw, codex) {
     const parsed = parseAllowedModelsPatch(raw.allowed_models, { platform: codex ? 'openai' : 'anthropic' })
     if (!parsed.ok) return fail('invalid_package', parsed.error || '允许模型无效')
     value.allowed_models = parsed.value
+  }
+  if (has(raw, 'active_hours')) {
+    const parsed = parseActiveHoursInput(raw.active_hours)
+    if (!parsed.ok) return fail('invalid_package', parsed.error || '工作时段配置无效')
+    value.active_hours = parsed.value
   }
   return { ok: true, value }
 }
@@ -408,6 +417,10 @@ function applyPolicy(vm, policy, codex) {
       vm.policy.allowed_models = policy.allowed_models
     } else delete vm.policy.allowed_models
   }
+  if (has(policy, 'active_hours')) {
+    if (policy.active_hours) vm.policy.active_hours = policy.active_hours
+    else delete vm.policy.active_hours
+  }
 }
 
 function applyTraits(vm, spec) {
@@ -435,7 +448,7 @@ function applyTraits(vm, spec) {
     vm.claude = vm.claude && typeof vm.claude === 'object' ? vm.claude : {}
     if (traits.auth_scheme) vm.claude.auth_scheme = traits.auth_scheme
   }
-  vm.proxy_cli_enabled = traits.proxy_cli_enabled === true
+  // proxy_cli_enabled follows bindVmProxy, not the package trait.
   applyPolicy(vm, traits.policy, spec.codex)
   if (traits.seed_policy) vm.seed_policy = traits.seed_policy
   vm.updated_at = new Date().toISOString()
@@ -526,7 +539,8 @@ async function attachProxy(projectRoot, id, spec, proxyPool, ownerUserId) {
     if (!proxyId) return fail('proxy_import_failed', '本机直连出口不可用')
     const bound = proxyPool.bind(proxyId, id)
     if (!bound.ok) return fail(bound.error || 'proxy_bind_failed', '绑定直连出口失败')
-    bindVmProxy(projectRoot, id, proxyPool.getProxyByIdWithAuth(proxyId))
+    // bind() lands a node slot on its own VPS's local row, not the control plane's.
+    bindVmProxy(projectRoot, id, proxyPool.getProxyByIdWithAuth(bound.proxy?.id || proxyId))
     return { ok: true }
   }
   const ensured = proxyPool.ensureSocks(spec.proxy, { ownerUserId, label: spec.proxy.label })
@@ -546,7 +560,7 @@ function finishControl(projectRoot, id, spec, status) {
   applyTraits(vm, spec)
   applySchedule(vm, spec, credentialPresent(spec, vm))
   vm.status = status
-  if (spec.vm.proxy_cli_enabled !== true) vm.proxy_cli_enabled = false
+  // Do not reset proxy_cli_enabled: attachProxy/bindVmProxy owns it.
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
@@ -605,8 +619,9 @@ export async function commitVmPackage({
   let vm
   if (create) {
     const existing = listVms(projectRoot)
-    const generated = generateWorkstationFingerprint(
-      { id, kernel: spec.vm.kernel, timezone: spec.vm.timezone, locale: spec.vm.locale },
+    const generated = assignComputerFingerprint(
+      projectRoot,
+      { id, kernel: spec.vm.kernel, timezone: spec.vm.timezone, locale: spec.vm.locale, runtime: { type: 'docker' } },
       { taken: takenFingerprintKeys(existing) },
     )
     vm = {
@@ -631,6 +646,7 @@ export async function commitVmPackage({
       proxy_required: false,
       seed_policy: standardSeedPolicy(),
       runtime: { type: 'docker' },
+      machine: resolveMachineSpec({ config: normalizeVmConfig(), runtime: 'docker' }),
       owner_user_id: owner.role === 'user' ? normalizeOwnerId(owner.userId) : null,
       origin: owner.role === 'user' ? VM_ORIGIN.userCreated : VM_ORIGIN.platform,
     }
@@ -680,7 +696,7 @@ export async function commitVmPackage({
   if (!attached.ok) return { ok: false, status: 400, error: attached.error }
   saved = finishControl(projectRoot, id, spec, status)
   if (written.account) mirrorCodex(saved, written.account)
-  if (spec.proxy && spec.vm.proxy_cli_enabled === true) saved.proxy_cli_enabled = true
+  // Flag already follows the bound exit from attachProxy.
   saved.updated_at = new Date().toISOString()
   atomicWriteJson(file, saved, { mode: 0o600 })
   return { ok: true, status: create ? 201 : 200, vm: saved, renamed_from: renamedFrom }

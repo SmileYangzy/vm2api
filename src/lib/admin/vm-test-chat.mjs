@@ -27,6 +27,7 @@ import { claudeCodeInboundBody, claudeCodeInboundHeaders } from '../protocol/cla
 import { credentialModeFromOauth, credentialModeOfVm } from '../oauth/credential-mode.mjs'
 import { isModelEnabled, getModelParams, getCapabilities, listPolicyModels } from '../protocol/model-policy.mjs'
 import { listGptPolicyModels, isGptModelEnabled, syncGptIdsIntoPolicy } from '../protocol/gpt-model-policy.mjs'
+import { modelsDevMeta } from './price-catalog.mjs'
 import { listOfficialModels, validateOfficialModel } from '../protocol/models.mjs'
 import {
   fetchChatgptModelCatalog,
@@ -272,12 +273,13 @@ export async function syncCodexCatalog({
     }
   }
   const models = [...merged.values()]
-  syncGptIdsIntoPolicy(models)
+  const { added } = syncGptIdsIntoPolicy(models, { displayNameOf: (id) => modelsDevMeta('openai', id)?.name })
   return {
     ok: true,
     vm_id: usedVm,
     catalog_version: catalogVersion.version,
     ids: models.map((row) => row.id),
+    added,
     synced: models.length,
     source: 'chatgpt',
   }
@@ -492,11 +494,12 @@ export function slotTestIdentity(projectRoot, vm) {
   if (vm.fingerprint?.session_id !== sessionId && sessionId) {
     try {
       const vmPath = path.join(projectRoot, 'vms', `${vm.id}.json`)
+      const disk = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
       atomicWriteJson(
         vmPath,
         {
-          ...vm,
-          fingerprint: { ...(vm.fingerprint || {}), session_id: sessionId },
+          ...disk,
+          fingerprint: { ...(disk.fingerprint || {}), session_id: sessionId },
           updated_at: new Date().toISOString(),
         },
         { mode: 0o600 },

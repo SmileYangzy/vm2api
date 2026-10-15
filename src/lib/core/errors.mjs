@@ -16,6 +16,7 @@
 export const ErrorType = {
   AUTH: 'authentication_error',
   PERMISSION: 'permission_error',
+  POLICY: 'policy_blocked',
   INVALID_REQUEST: 'invalid_request_error',
   NOT_FOUND: 'not_found_error',
   RATE_LIMIT: 'rate_limit_error',
@@ -46,6 +47,7 @@ export const ErrorCode = {
   GATEWAY_RATE_LIMIT: 'gateway_rate_limit',
   QUOTA_5H_SAFETY: 'quota_5h_safety',
   QUOTA_7D_SAFETY: 'quota_7d_safety',
+  QUOTA_GUARD_REQUEST_TOO_LARGE: 'quota_guard_request_too_large',
   CONCURRENCY_LIMIT: 'concurrency_limit',
   API_KEY_DISABLED: 'api_key_disabled',
   API_KEY_EXPIRED: 'api_key_expired',
@@ -54,6 +56,7 @@ export const ErrorCode = {
   API_KEY_CONCURRENCY_LIMIT: 'api_key_concurrency_limit',
   KEY_GROUP_MISMATCH: 'key_group_mismatch',
   VM_POOL_UNAVAILABLE: 'vm_pool_unavailable',
+  CLAUDE_CODE_ONLY: 'claude_code_only',
   // upstream
   UPSTREAM_AUTH: 'upstream_auth_error',
   UPSTREAM_RATE_LIMIT: 'upstream_rate_limit',
@@ -146,6 +149,39 @@ export function isUsagePolicyErrorMessage(message = '') {
 
 export const REFUSAL_GUARD_MESSAGE =
   "Request blocked by the refusal guard. Anthropic's API previously refused this pattern."
+
+const REFUSAL_GUARD_MESSAGES = Object.freeze({
+  exact: REFUSAL_GUARD_MESSAGE,
+  similar: `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似。`,
+  device: `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁。`,
+  upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
+})
+
+/** Policy refusals are request rejections, not login failures or transient service failures. */
+export function makeRefusalGuardError({
+  requestId,
+  blockedBy = 'upstream',
+  sourceRequestId,
+  details = {},
+  message,
+} = {}) {
+  const kind = Object.hasOwn(REFUSAL_GUARD_MESSAGES, blockedBy) ? blockedBy : 'upstream'
+  const safeDetails = { ...details, blocked_by: kind, retryable: false }
+  delete safeDetails.source_request_id
+  const sourceId = typeof sourceRequestId === 'string' ? sourceRequestId.trim() : ''
+  if (kind === 'device' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceId)) {
+    safeDetails.source_request_id = sourceId
+  }
+  return makeError({
+    // Claude Code treats 403 as login failure; use a non-retryable policy contract instead.
+    type: ErrorType.POLICY,
+    code: ErrorCode.REFUSAL_GUARD,
+    message: message || REFUSAL_GUARD_MESSAGES[kind],
+    status: 400,
+    request_id: requestId,
+    details: safeDetails,
+  })
+}
 
 /**
  * `overloaded` (real capacity, 529), `rate_limited` (every account in an
@@ -395,6 +431,17 @@ export function mapUpstreamError(status, body, headers = {}) {
       status: 429,
     })
   }
+  if (inboundCode === ErrorCode.QUOTA_GUARD_REQUEST_TOO_LARGE) {
+    return makeError({
+      type: ErrorType.RATE_LIMIT,
+      code: ErrorCode.QUOTA_GUARD_REQUEST_TOO_LARGE,
+      message: String(
+        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。',
+      ),
+      status: 429,
+      details: body?.error?.details,
+    })
+  }
 
   const poolKind = poolErrorKind(inboundCode, msg)
   if (poolKind) return poolClientError(poolKind)
@@ -439,17 +486,40 @@ export function mapUpstreamError(status, body, headers = {}) {
   }
   const request_id =
     body?.error?.request_id || body?.request_id || headers['request-id'] || headers['x-request-id'] || null
-  if (isUsagePolicyErrorMessage(msg)) {
+  if (inboundCode === ErrorCode.REFUSAL_GUARD) {
+    const prior = body?.error?.details || {}
+    return makeRefusalGuardError({
+      requestId: request_id,
+      blockedBy: prior.blocked_by,
+      sourceRequestId: prior.source_request_id,
+      details: Object.fromEntries(
+        ['reason', 'score', 'ban_reason'].filter((key) => Object.hasOwn(prior, key)).map((key) => [key, prior[key]]),
+      ),
+    })
+  }
+  // Authentication failures must remain credential errors even if an upstream
+  // body happens to quote the Usage Policy wording.
+  if (status === 401 || upType === 'authentication_error') {
     return makeError({
-      type: ErrorType.PERMISSION,
-      code: ErrorCode.REFUSAL_GUARD,
-      message: REFUSAL_GUARD_MESSAGE,
-      status: 503,
+      type: ErrorType.UPSTREAM,
+      code: ErrorCode.UPSTREAM_AUTH,
+      message: String(msg),
+      status: status === 403 ? 403 : 401,
+      details: {
+        upstream_type: upType,
+        upstream_status: status,
+        ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
+      },
+      request_id,
+    })
+  }
+  if (isUsagePolicyErrorMessage(msg)) {
+    return makeRefusalGuardError({
+      requestId: request_id,
       details: {
         upstream_type: upType,
         upstream_status: status,
       },
-      request_id,
     })
   }
   if (inboundCode === ErrorCode.CONTENT_FILTER_REFUSAL) {

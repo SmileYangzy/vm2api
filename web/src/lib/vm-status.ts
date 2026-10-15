@@ -289,14 +289,16 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
 
   if (vm?.availability?.key && !probeTaintedAvailability(vm)) {
     const a = vm.availability
-    // 6 个 key 的完整映射，对齐 index.html 的 accountStatus。
+    // 8 个 key 的完整映射，对齐 index.html 的 accountStatus。
     const fallback: Record<typeof a.key, string> = {
       none: '无凭证',
       ok: '可用',
       off: '调度关',
       cool: '冷却中',
       quota: '额度限制',
+      drain: '临近闸线',
       bad: '无效凭证',
+      rest: '休息时段',
     }
     // 与 poolStatus 同口径：off 只表达调度意图，凭证死活先于它判。
     if (a.key === 'off') {
@@ -310,7 +312,7 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
         ? 'ok'
         : a.key === 'quota'
           ? 'warn'
-          : a.key === 'cool'
+          : a.key === 'cool' || a.key === 'drain' || a.key === 'rest'
             ? 'caution'
             : a.key === 'off'
               ? 'off'
@@ -406,7 +408,8 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
  */
 export function credentialStatus(vm: Vm | undefined): StatusTone {
   const base = accountStatus(vm)
-  if (base.key !== 'off') return base
+  // 休息时段同理是调度意图（排班），不是凭证状态。
+  if (base.key !== 'off' && base.key !== 'rest') return base
   if (!vm?.has_token) return { cls: 'none', key: 'none', text: '无凭证' }
   const exp = credExpiry(vm)
   if (exp.cls === 'bad') return { cls: 'bad', key: 'bad', text: '已过期' }
@@ -471,6 +474,14 @@ function restrictionTone(vm: Vm | undefined): StatusTone | null {
     const reason = String(
       vm.restriction_reason || vm.availability?.reason || ''
     )
+    // 休息时段是操作员排班，不是上游冷却：单独成态，别引人去点「清冷却」。
+    if (vm.availability?.key === 'rest' || /rest_period/.test(reason)) {
+      return {
+        key: 'rest',
+        text: restrictionLabel(vm, '休息时段'),
+        cls: 'caution',
+      }
+    }
     if (
       vm.availability?.key === 'cool' ||
       /cool|rate_limited|account_quota/i.test(reason)
@@ -490,17 +501,30 @@ function restrictionTone(vm: Vm | undefined): StatusTone | null {
   return null
 }
 
+/** 席位全占：新设备会排队，但这台 VM 照常在调度，不是受限。 */
+function seatsFullTone(vm: Vm | undefined): StatusTone | null {
+  if (!vm || vm.seats_max == null) return null
+  const max = Number(vm.seats_max) || 0
+  if (max <= 0 || (Number(vm.seats_used) || 0) < max) return null
+  return { key: 'seats', text: '席位满', cls: 'caution' }
+}
+
+/**
+ * 状态优先级：吊销/废票 → 额度上限 / 门禁（受限）→ 503 熔断 → 调度关 →
+ * 临近闸线 → 席位满 → 其余。受限与调度关互斥（后端 triad 先判调度关）。
+ * 临近闸线仍在接单，所以排在熔断之后：熔断中的槽确实不接单，要让人看见。
+ */
 export function poolStatus(vm: Vm | undefined): StatusTone {
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  const restricted = restrictionTone(vm)
+  if (restricted) return restricted
   // 调度关优先于熔断：操作员关掉的槽不显示熔断。
   if (vm?.schedule_state !== 'off') {
     const circuit = circuitTone(vm)
     if (circuit) return circuit
   }
-  const restricted = restrictionTone(vm)
-  if (restricted) return restricted
   if (vm?.schedule_state === 'off') {
     if (!vm.has_token) return { key: 'none', text: '无凭证', cls: 'none' }
     if (ticketExpiredDead(vm)) return { key: 'bad', text: '已过期', cls: 'bad' }
@@ -525,10 +549,16 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
     if (a.key === 'quota') {
       return { key: 'quota', text: a.text || '额度限制', cls: 'warn' }
     }
+    if (a.key === 'rest')
+      return { key: 'rest', text: a.text || '休息时段', cls: 'caution' }
     if (a.key === 'cool' || vmCooldown(vm))
       return { key: 'cool', text: a.text || '冷却中', cls: 'caution' }
+    if (a.key === 'drain')
+      return { key: 'drain', text: a.text || '临近闸线', cls: 'caution' }
     if (!a.usable) return { key: 'bad', text: a.text || '无效凭证', cls: 'bad' }
-    return { key: 'pool', text: a.text || '可用', cls: 'ok' }
+    return (
+      seatsFullTone(vm) || { key: 'pool', text: a.text || '可用', cls: 'ok' }
+    )
   }
   if (!vm?.has_token) return { key: 'none', text: '无凭证', cls: 'none' }
   const fb = vm.fable || {}
@@ -562,7 +592,7 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
   if (windowWarn(vm.status_7d, u7))
     return { key: 'quota', text: '7d 警告', cls: 'caution' }
   if (isTransportProbe(vm) && !isUsageProbeOk(vm)) return transportFailTone()
-  return { key: 'pool', text: '在池', cls: 'ok' }
+  return seatsFullTone(vm) || { key: 'pool', text: '在池', cls: 'ok' }
 }
 
 /**
@@ -674,7 +704,8 @@ export function fleetGroup(vm: Vm): FleetGroup {
   if (k === 'bad') return 'bad'
   if (k === 'none') return 'none'
   if (k === 'off') return 'off'
-  if (isRestrictedSchedule(vm) || k === 'cool') return 'restricted'
+  if (isRestrictedSchedule(vm) || k === 'cool' || k === 'rest')
+    return 'restricted'
   if (k === 'quota' && !/警告/.test(String(status.text || '')))
     return 'restricted'
   return 'pool'
@@ -752,29 +783,79 @@ type ProxyRef = {
   scheme?: string
   kind?: string
   label?: string | null
+  node_id?: string | null
+  node_name?: string | null
 }
 
-/** 本地代理 = 槽位所在 VPS 自身出口，按那台 VPS 标 `local:<IP>`；不知道是哪台写「当前VPS」。 */
-export function localProxyText(vpsIp?: string | null): string {
-  return `local:${vpsIp?.trim() || '当前VPS'}`
+export type LocalProxyLabelOpts = {
+  /** Cluster node display name. Empty + reveal = control plane. */
+  nodeName?: string | null
+  /** Fallback when the node record is gone but we still know the id. */
+  nodeId?: string | null
+  /** Admin/super may see node names; tenants get the generic label. */
+  revealNode?: boolean
+}
+
+function isLocalProxyLabelOpts(value: unknown): value is LocalProxyLabelOpts {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    ('nodeName' in value || 'nodeId' in value || 'revealNode' in value)
+  )
+}
+
+/**
+ * Shared local-proxy display label.
+ * Tenant: `local代理`. Control plane (admin): `当前VPS local代理`.
+ * Extension node (admin): `${nodeName}local代理`.
+ */
+export function localProxyText(
+  opts?: LocalProxyLabelOpts | string | null
+): string {
+  if (!isLocalProxyLabelOpts(opts) || !opts.revealNode) return 'local代理'
+  const name =
+    String(opts.nodeName || '').trim() || String(opts.nodeId || '').trim()
+  return name ? `${name}local代理` : '当前VPS local代理'
+}
+
+/** Prefer the API's `node_name` field (present only for admin). */
+export function localProxyOptsFromProxy(
+  proxy?: ProxyRef | null,
+  fallback?: LocalProxyLabelOpts
+): LocalProxyLabelOpts {
+  if (proxy && Object.prototype.hasOwnProperty.call(proxy, 'node_name')) {
+    return {
+      nodeName: proxy.node_name ?? null,
+      nodeId: proxy.node_id ?? null,
+      revealNode: true,
+    }
+  }
+  return fallback ?? { revealNode: false }
 }
 
 function isLocalProxyRef(proxy: ProxyRef): boolean {
   return (
-    proxy.id === 'px-local' ||
+    String(proxy.id || '').startsWith('px-local') ||
     proxy.scheme === 'local' ||
     proxy.kind === 'local' ||
     proxy.host === 'local'
   )
 }
 
-/** `vpsIp` 只作用于本地代理：它的出口随槽位所在 VPS 变。 */
+/** Local labels come from placement, not the control-plane probe IP. */
 export function proxyHostLabel(
   proxy: ProxyRef | undefined,
-  vpsIp?: string | null
+  opts?: LocalProxyLabelOpts | string | null
 ): string {
   if (!proxy) return '—'
-  if (isLocalProxyRef(proxy)) return localProxyText(vpsIp)
+  if (isLocalProxyRef(proxy)) {
+    return localProxyText(
+      localProxyOptsFromProxy(
+        proxy,
+        isLocalProxyLabelOpts(opts) ? opts : undefined
+      )
+    )
+  }
   if (proxy.host) {
     const host =
       proxy.host.includes(':') && !proxy.host.startsWith('[')
@@ -788,9 +869,9 @@ export function proxyHostLabel(
 /** 带代理名称的地址：`名称 · host:port`；没起名就退回 proxyHostLabel()。 */
 export function proxyNamedLabel(
   proxy: ProxyRef | undefined,
-  vpsIp?: string | null
+  opts?: LocalProxyLabelOpts | string | null
 ): string {
-  const host = proxyHostLabel(proxy, vpsIp)
+  const host = proxyHostLabel(proxy, opts)
   const name = proxy?.label?.trim()
   return name && host !== '—' ? `${name} · ${host}` : host
 }

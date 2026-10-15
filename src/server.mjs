@@ -31,7 +31,9 @@ import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 
+import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
+import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
@@ -42,6 +44,7 @@ import { setManualScheduleWins } from './lib/pool/schedule-policy.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
+import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
@@ -55,6 +58,7 @@ import {
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
 import {
+  bindVmProxy,
   listVms,
   getVm,
   getActiveVmId,
@@ -77,7 +81,7 @@ import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
 import { bindPlacement } from './lib/cluster/placement.mjs'
-import { startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
+import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 
 import {
@@ -88,8 +92,8 @@ import {
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
-import { createRespond } from './lib/http/respond.mjs'
-import { tryServeWebDist } from './lib/http/web-dist.mjs'
+import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
+import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
@@ -151,6 +155,9 @@ const vmSync = initVmDbSync(cfg.paths.project)
 if (vmSync.upserted || vmSync.rebuilt) {
   console.log(`[db] vm mirror reconciled: upserted=${vmSync.upserted} rebuilt=${vmSync.rebuilt}`)
 }
+if (vmSync.proxy_cli_repaired) {
+  console.log(`[vm] repaired proxy_cli_enabled on ${vmSync.proxy_cli_repaired} slot(s)`)
+}
 
 // --- P3 sticky + quota ---
 
@@ -160,6 +167,7 @@ let credentialRefreshMonitor = null
 let kernelWatchdog = null
 let cliNodeGuard = null
 let usageProbeMonitor = null
+let catalogMonitor = null
 let notifyMonitor = null
 
 let routingConfig = {}
@@ -325,8 +333,26 @@ try {
 } catch {}
 requestLog.startCleanupScheduler()
 
+// Set once the cluster manager exists; node local rows probe through it.
+let localEgressCluster = null
 proxyPool = new ProxyPool({
   dataDir,
+  // null = control plane; undefined = no such slot.
+  vmNodeOf: (vmId) => {
+    const vm = getVm(cfg.paths.project, vmId)
+    return vm ? vm.node_id || null : undefined
+  },
+  localExitUrl: (nodeId) => nodeEgressProxyUrl(nodeId),
+  localExitHealth: (nodeId) => {
+    // Boot order: the first probe may run before the cluster is up. Unknown, not down.
+    if (!localEgressCluster) return { ok: true, latency_ms: null }
+    const node = localEgressCluster.get(nodeId)
+    const state = node.link?.state || 'idle'
+    if (state === 'ready') return { ok: true, latency_ms: node.health?.latency_ms ?? null }
+    // Still dialling (boot, reconnect): no verdict; the link-state hook re-probes once it settles.
+    if (state === 'idle' || state === 'connecting') return { pending: true, error: `node_link_${state}` }
+    return { ok: false, error: `node_link_${state}` }
+  },
   onDisableVm: (vmId, reason, proxyId) => {
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
   },
@@ -446,11 +472,17 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       force: false,
     }),
 })
+function bootSlot(id) {
+  return powerOnSlot({ projectRoot: cfg.paths.project, id, proxyPool, routing: routingConfig })
+}
 kernelWatchdog = createKernelWatchdog({
   config: routingConfig.kernel_watchdog,
   listTargets: () => listVms(cfg.paths.project),
+  getRouting: () => routingConfig,
   homeDirFor: (vm) => path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
   ensureTelemetry: (vm) => ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
+  revive: (vm) => bootSlot(vm.id),
+  healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
   onFault: (vm, reason) => {
     const title = `槽内核故障 ${vm.id}`
     dispatchNotify(routingConfig.notify, {
@@ -484,6 +516,11 @@ usageProbeMonitor = createUsageProbeMonitor({
     } catch {}
   },
   probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
+})
+catalogMonitor = createCatalogMonitor({
+  projectRoot: cfg.paths.project,
+  codexCatalogVersion: () => routingConfig.codex?.catalog_client_version || 'auto',
+  log: (event) => console.log(JSON.stringify(event)),
 })
 notifyMonitor = createNotifyMonitor({
   config: routingConfig.notify,
@@ -748,8 +785,8 @@ function requireAuth(req, res) {
   return true
 }
 
-function fetchWorkerModels() {
-  return gatewayModelCatalog()
+function fetchWorkerModels(opts) {
+  return gatewayModelCatalog(opts)
 }
 
 const importCommit = createImportCommit({
@@ -808,16 +845,42 @@ const { handleProtocol, handleSearch } = createHandleProtocol({
   },
 })
 
+/**
+ * One local egress row per VPS: rows for current nodes, and slots still on
+ * another machine's row (the shared px-local before per-node rows) move onto
+ * their own node's row, with the slot's recorded proxy rewritten to match.
+ */
+function syncNodeLocalEgress() {
+  try {
+    proxyPool.syncLocalNodes(clusterManager.list().map((node) => node.id))
+    for (const move of proxyPool.adoptNodeLocalBindings()) {
+      bindVmProxy(cfg.paths.project, move.vm_id, proxyPool.getProxyByIdWithAuth(move.to))
+      console.log(`[local-egress] ${move.vm_id}: ${move.from} -> ${move.to}`)
+    }
+  } catch (e) {
+    console.warn('[local-egress] node sync failed', e?.message || e)
+  }
+}
+
 const clusterManager = new ClusterManager({
   repo: new ClusterNodesRepo(),
   dataDir,
   listen: { host: cfg.host, port: cfg.port },
   vmsOnNode: (nodeId) => listVms(cfg.paths.project).filter((vm) => vm.node_id === nodeId),
+  onNodesChanged: () => syncNodeLocalEgress(),
+  // A node's local row follows its link: re-probe as soon as the link settles.
+  onLinkState: (nodeId, state) => {
+    if (state === 'ready' || state === 'error' || state === 'backoff') {
+      proxyPool.probeLocalNode(nodeId).catch(() => {})
+    }
+  },
 })
+localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 clusterManager.start()
 clusterManager.restoreSlotRelays()
+syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
   for (const exit of exits.filter((item) => !item.ok)) {
@@ -867,6 +930,9 @@ const handlePanel = createPanelHandler({
   get notifyMonitor() {
     return notifyMonitor
   },
+  get kernelWatchdog() {
+    return kernelWatchdog
+  },
   get runtimeRepo() {
     return runtimeRepo
   },
@@ -902,6 +968,7 @@ const handlePanel = createPanelHandler({
   refreshWorkerCredentialForVm,
   fetchWorkerModels,
   clusterRoutes,
+  clusterManager,
   slotShell,
 })
 
@@ -917,7 +984,10 @@ const server = http.createServer(async (req, res) => {
       return res.end()
     }
 
-    const url = new URL(req.url || '/', `http://${req.headers.host}`)
+    const url = parseRequestUrl(req)
+    if (!url) {
+      return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
+    }
     const p = url.pathname
 
     if (isTelemetryPath(p)) {
@@ -946,7 +1016,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && tryServeWebDist(res, cfg.paths.project, p)) return
-    if (req.method === 'GET' && (p === '/console' || p === '/console/')) {
+    if (req.method === 'GET' && isConsoleEntry(p)) {
       return json(res, 404, { error: { message: 'console not found; run pnpm -C web build' } })
     }
 
@@ -1004,7 +1074,7 @@ const server = http.createServer(async (req, res) => {
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, apiScheduler.catalog())
       }
-      const result = await fetchWorkerModels()
+      const result = await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type })
       return json(res, 200, result)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
@@ -1030,6 +1100,7 @@ const server = http.createServer(async (req, res) => {
         stickyRouter,
         accountQuota,
         getPoolScheduler: () => poolScheduler,
+        getRoutingConfig: () => routingConfig,
       })
     }
 
@@ -1141,6 +1212,9 @@ function shutdown(signal) {
   try {
     usageProbeMonitor?.stop?.()
   } catch {}
+  try {
+    catalogMonitor?.stop?.()
+  } catch {}
 
   try {
     notifyMonitor?.stop?.()
@@ -1181,6 +1255,12 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[kernel-watchdog] start failed', e?.message || e)
   }
+  // Boot fills what Docker's restart policy missed (removed or exited slot containers); off with the watchdog.
+  if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
+    reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
+      console.warn('[slot-revive] boot pass failed', e?.message || e),
+    )
+  }
   try {
     cliNodeGuard?.start?.({ immediate: true })
   } catch (e) {
@@ -1190,6 +1270,14 @@ server.listen(cfg.port, cfg.host, () => {
     usageProbeMonitor?.start?.({ immediate: true })
   } catch (e) {
     console.warn('[usage-probe] start failed', e?.message || e)
+  }
+  // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
+  if (process.env.KIN_CRS_MOCK !== '1') {
+    try {
+      catalogMonitor?.start?.()
+    } catch (e) {
+      console.warn('[catalog-sync] start failed', e?.message || e)
+    }
   }
   try {
     notifyMonitor?.start?.({ immediate: true })

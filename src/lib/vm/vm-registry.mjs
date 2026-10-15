@@ -5,7 +5,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { atomicWriteJson, listVmRecordFiles } from './vm-file.mjs'
+import { atomicWriteJson, invalidateReadCache, listVmRecordFiles, readJsonCached } from './vm-file.mjs'
 import {
   hasAccessPresence,
   hasCredentialPresence,
@@ -17,8 +17,9 @@ import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
 import { isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
+import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
-import { normalizeVmKind } from './vm-kind.mjs'
+import { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import {
@@ -31,6 +32,9 @@ import {
 import { summarizeCodexSlot } from './codex-slot.mjs'
 import { evaluateCodexQuotaSchedule } from '../pool/codex-slot-pool.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
+import { runtimeKind } from './runtime-kind.mjs'
+import { hasBoundExit } from './egress.mjs'
+import { ensureSlotSmbios } from './machine-spec.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
@@ -41,7 +45,7 @@ export function listVms(projectRoot, routing = null) {
   return files
     .map((f) => {
       try {
-        const raw = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))
+        const raw = readJsonCached(path.join(dir, f))
         if (!raw?.id) return null
         return summarizeVm(raw, projectRoot, routing)
       } catch {
@@ -52,9 +56,7 @@ export function listVms(projectRoot, routing = null) {
 }
 
 export function getVm(projectRoot, id) {
-  const file = path.join(projectRoot, 'vms', `${id}.json`)
-  if (!fs.existsSync(file)) return null
-  return JSON.parse(fs.readFileSync(file, 'utf8'))
+  return readJsonCached(path.join(projectRoot, 'vms', `${id}.json`))
 }
 
 export function summarizeVm(vm, projectRoot = null, routing = null) {
@@ -69,6 +71,8 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     name: vm.name,
     status: vm.status || 'unknown',
     kernel: vm.kernel || null,
+    runtime_type: runtimeKind(vm),
+    machine: vm.machine || null,
     inference_engine: vm.inference_engine || null,
     persona_preset: vm.persona_preset || null,
     seed_policy: vm.seed_policy || null,
@@ -121,6 +125,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
         : null,
     weight: vm.policy?.weight ?? 1,
     schedule_level_manual: manualScheduleLevelOf(vm),
+    active_hours: activeHoursOf(vm),
     timezone: vm.timezone || null,
     timezone_source: vm.timezone_source || 'auto',
     locale: vm.locale || null,
@@ -166,8 +171,8 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
 
 export function getActiveVmId(projectRoot) {
   try {
-    const a = JSON.parse(fs.readFileSync(path.join(projectRoot, 'vms', 'active.json'), 'utf8'))
-    return a.active_vm
+    const a = readJsonCached(path.join(projectRoot, 'vms', 'active.json'))
+    return a?.active_vm ?? null
   } catch {
     return null
   }
@@ -338,6 +343,21 @@ export function persistVmQuotaOverride(projectRoot, vmId, override) {
   return vm
 }
 
+/** `value` is a parsed `active_hours` window (null clears it: the slot runs 24h). */
+export function persistVmActiveHours(projectRoot, vmId, value) {
+  const parsed = parseActiveHoursInput(value)
+  if (!parsed.ok) throw new TypeError(parsed.error)
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy = { ...(vm.policy || {}) }
+  if (parsed.value == null) delete vm.policy.active_hours
+  else vm.policy.active_hours = parsed.value
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
 export function persistVmScheduleLevel(projectRoot, vmId, value) {
   const parsed = parseScheduleLevelInput(value)
   if (!parsed.ok) throw new TypeError(parsed.error)
@@ -396,11 +416,36 @@ export function setActiveVm(projectRoot, id) {
   atomicWriteJson(file, { active_vm: id, updated_at: new Date().toISOString() })
 }
 
+/** Drop the active pointer. Used when the last slot is deleted. */
+export function clearActiveVm(projectRoot) {
+  const file = path.join(projectRoot, 'vms', 'active.json')
+  try {
+    fs.rmSync(file, { force: true })
+  } catch {}
+  invalidateReadCache(file)
+}
+
 /** Statuses that mean the slot is actually down — not a soft UI pause. */
 const HARD_UNAVAILABLE = new Set(['stopped', 'dead', 'error', 'disabled'])
 
 export function vmHasClaudeCredential(vm) {
   return hasCredentialPresence(vm?.claude)
+}
+
+/**
+ * Credential presence for whichever platform the slot actually runs.
+ *
+ * A GPT/Codex slot keeps its OAuth in `codex-credentials.json`; `vm.claude` only
+ * holds a stub (`refresh_error: 'credential_required'`). Probing the Claude bag
+ * therefore reports "no credential" for a perfectly healthy GPT seat, so every
+ * caller that parks what looks credential-less (slot start, proxy reload, proxy
+ * re-enable) silently drops the whole GPT pool as `no_credential`.
+ */
+export function vmHasSchedulableCredential(vm, projectRoot = null) {
+  if (!vm) return false
+  if (!isCodexVm(vm)) return vmHasClaudeCredential(vm)
+  const codex = summarizeCodexSlot(projectRoot, vm)
+  return !!(codex?.has_token || codex?.has_refresh)
 }
 
 /**
@@ -459,9 +504,91 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
         password: proxyInfo.password == null ? null : proxyInfo.password,
       }
     : null
-  if (proxyInfo) vm.proxy_cli_enabled = true
+  // Eligibility (`slotHasBoundProxy`) and CLI egress both require this flag.
+  // It is not an operator toggle — it follows whether an exit is bound.
+  vm.proxy_cli_enabled = hasBoundExit(vm.proxy)
+  vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
   return summarizeVm(vm)
+}
+
+/**
+ * Copy the bound-exit pair onto an in-memory snapshot. Callers that keep a VM
+ * object across `bindVmProxy` (or any other writer) must pull both fields —
+ * `proxy` without `proxy_cli_enabled` is how a bound slot became ineligible.
+ */
+export function adoptVmProxyBinding(target, source) {
+  if (!target) return target
+  target.proxy = source ? (source.proxy ?? null) : null
+  target.proxy_cli_enabled = hasBoundExit(target.proxy)
+  return target
+}
+
+/**
+ * Re-read vm.json, apply a patch of owned fields, write. Use this after another
+ * writer (bind, timezone, start) so a stale snapshot cannot clobber their fields.
+ */
+export function patchVmRecord(projectRoot, id, patch) {
+  const file = path.join(projectRoot, 'vms', `${id}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (typeof patch === 'function') {
+    const next = patch(vm)
+    if (next && typeof next === 'object' && next !== vm) Object.assign(vm, next)
+  } else if (patch && typeof patch === 'object') {
+    Object.assign(vm, patch)
+  }
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
+/**
+ * Heal slots whose bound exit and `proxy_cli_enabled` drifted (the #332 stale
+ * write). False was never an operator switch — panel/API have no such toggle.
+ */
+export function repairVmProxyCliEnabled(projectRoot) {
+  const repaired = []
+  const dir = path.join(projectRoot, 'vms')
+  if (!fs.existsSync(dir)) return repaired
+  for (const name of listVmRecordFiles(dir)) {
+    const file = path.join(dir, name)
+    let vm
+    try {
+      vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!vm?.id) continue
+    const enabled = hasBoundExit(vm.proxy)
+    if (vm.proxy_cli_enabled === enabled) continue
+    vm.proxy_cli_enabled = enabled
+    vm.updated_at = new Date().toISOString()
+    atomicWriteJson(file, vm, { mode: 0o600 })
+    repaired.push(vm.id)
+  }
+  return repaired
+}
+
+/** Attach a rotated SMBIOS identity to slots that were created without one. */
+export function repairSlotSmbios(projectRoot) {
+  const repaired = []
+  const dir = path.join(projectRoot, 'vms')
+  if (!fs.existsSync(dir)) return repaired
+  for (const name of listVmRecordFiles(dir)) {
+    const file = path.join(dir, name)
+    let vm
+    try {
+      vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!vm?.id || !ensureSlotSmbios(vm)) continue
+    vm.updated_at = new Date().toISOString()
+    atomicWriteJson(file, vm, { mode: 0o600 })
+    repaired.push(vm.id)
+  }
+  return repaired
 }
 
 /**

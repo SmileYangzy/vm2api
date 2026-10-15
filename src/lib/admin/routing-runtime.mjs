@@ -17,7 +17,7 @@ import {
 } from '../vm/vm-registry.mjs'
 import { normalizeInferenceConfig, normalizeSessionSlots, resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
-import { streamIdleTimeoutMs } from '../core/config.mjs'
+import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
@@ -46,6 +46,7 @@ import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transpo
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
+import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -403,6 +404,7 @@ export function createRoutingRuntime(ctx) {
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
+    const prevRequestBytes = maxRequestBytes(routingConfig)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
@@ -427,6 +429,14 @@ export function createRoutingRuntime(ctx) {
         nextCodex.quota = mergeOpenAIQuotaPolicy(routingConfig.codex?.quota, body.codex.quota)
       }
       routingConfig.codex = normalizeCodexRouting(nextCodex)
+    }
+    if (body.vm) {
+      const prev = routingConfig.vm && typeof routingConfig.vm === 'object' ? routingConfig.vm : {}
+      const next = { ...prev, ...body.vm }
+      if (body.vm.smbios && typeof body.vm.smbios === 'object') {
+        next.smbios = { ...(prev.smbios || {}), ...body.vm.smbios }
+      }
+      routingConfig.vm = normalizeVmConfig(next)
     }
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
@@ -454,9 +464,13 @@ export function createRoutingRuntime(ctx) {
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
     const idleChanged = streamIdleTimeoutMs(routingConfig) !== prevIdleMs
+    const requestBytesChanged = maxRequestBytes(routingConfig) !== prevRequestBytes
+    // Body limit is applied once, when axum builds DefaultBodyLimit.
     const kernelPersona =
-      compatibilityTouchesKernel(body.compatibility) || idleChanged ? syncKernelPanelConfig(routingConfig) : null
-    const kernelReload = idleChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
+      compatibilityTouchesKernel(body.compatibility) || idleChanged || requestBytesChanged
+        ? syncKernelPanelConfig(routingConfig)
+        : null
+    const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).
@@ -508,6 +522,7 @@ export function createRoutingRuntime(ctx) {
       const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.codex = normalizeCodexRouting(doc.codex)
       doc.pool = normalizePoolRouting(doc.pool)
+      doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
       return doc
     } catch (error) {

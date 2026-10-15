@@ -149,6 +149,31 @@ function fableRequiresMaxError(details = {}) {
   }
 }
 
+const QUOTA_GUARD_TOO_LARGE_MESSAGE =
+  '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。'
+
+function quotaGuardTooLargeError(details = {}) {
+  return {
+    ok: false,
+    status: 429,
+    via: 'pool-failover',
+    terminalState: 'exhausted',
+    body: {
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        code: 'quota_guard_request_too_large',
+        message: QUOTA_GUARD_TOO_LARGE_MESSAGE,
+        details: {
+          ...details,
+          message_en:
+            'Near the quota safety line, this request looks like a large uncached prompt and was not sent upstream.',
+        },
+      },
+    },
+  }
+}
+
 function selectedHasRefresh(selected) {
   if (selected?.hasRefresh === true || selected?.hasRefresh === false) return selected.hasRefresh
   const cred = selected?.workerStatus?.credential || selected?.state?.worker_status?.credential || {}
@@ -354,7 +379,12 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   }
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
   if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
-  return poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
+  if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
+  const failed = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
+  // An all-rest pool knows when the first working window opens.
+  const retryMs = Number(details.retry_after_ms)
+  if (retryMs > 0) failed.retryAfterSec = Math.max(1, Math.ceil(retryMs / 1000))
+  return failed
 }
 
 function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false } = {}) {
@@ -524,6 +554,7 @@ export class FailoverRunner {
     ownerScope = null,
     keyScope = null,
     countUsage = true,
+    quotaRequest = null,
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
@@ -652,6 +683,10 @@ export class FailoverRunner {
           skipSessionSlot: skipSessionSeat,
           ownerScope,
           keyScope,
+          quotaRequest: {
+            body: requestBody,
+            sessionId: outboundSessionId || quotaRequest?.sessionId || stickyKey,
+          },
         }
         if (avoid) {
           const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
@@ -704,6 +739,7 @@ export class FailoverRunner {
       }
       repairPending = false
       snapshotPins()
+      const attemptStickyBound = pinBaseline.get(stickyKey) || null
       lastSelected = selected
       pinnedSlot = selected.slotIndex ?? null
       if (selected.seatMoved) seatMovedTo = selected.vmId
@@ -736,6 +772,7 @@ export class FailoverRunner {
                 repaired,
                 attemptStartedAt: attemptStarted,
                 freshSlot,
+                stickyBound: attemptStickyBound,
               })
             : clone(requestBody)
         const wrappedAttempt =
@@ -750,7 +787,11 @@ export class FailoverRunner {
           outboundSessionAccountId = selected.accountId
           bindAll(
             { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            { countHit: false },
+            {
+              countHit: false,
+              // Prebinding moved the VM already; replace the previous VM's session.
+              replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
+            },
           )
         }
         result = await callAttempt({
@@ -879,6 +920,26 @@ export class FailoverRunner {
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
         noteHop(null)
+        if (error?.code === 'response_sent') {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: 403,
+            errorScope: 'request',
+            action: 'stop',
+            downstreamCommitted: true,
+            terminalState: 'policy_block',
+            latencyMs: Date.now() - attemptStarted,
+          })
+          return {
+            ok: false,
+            responseSent: true,
+            status: 403,
+            via: 'account-scope',
+            vmId: selected.vmId,
+            accountId: selected.accountId,
+            attemptCount: attemptNo,
+            finalState: 'policy_block',
+          }
+        }
         if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,

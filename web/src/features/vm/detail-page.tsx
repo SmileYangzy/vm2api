@@ -60,11 +60,13 @@ import { VmTestTab } from '@/features/vm/detail-test-tab'
 import { NodeChip } from '@/features/vm/node-chip'
 import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
 import { vmQueryOptions, vmSeedQueryOptions } from '@/features/vm/queries'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
 } from '@/features/vm/schedulable-switch'
 import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
+import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
 
 function postVm<T = unknown>(id: string, path: string, body?: unknown) {
@@ -83,6 +85,7 @@ export function VmDetailPage() {
   const detail = useQuery(vmQueryOptions(id))
   const seed = useQuery(vmSeedQueryOptions(id))
   const routing = useQuery(routingQueryOptions())
+  usePoolSeatStream()
 
   const [tab, setTab] = useState('overview')
 
@@ -177,7 +180,7 @@ export function VmDetailPage() {
   const pool = proxies.data?.proxies || []
   const boundId = String(proxy.id || vm.proxy_id || '')
   // 本地代理固定第一。已绑到本槽的留在下拉里，否则正在用它时列表里没有。
-  const free = proxiesForVmBind(pool, id, 5)
+  const free = proxiesForVmBind(pool, id, 5, vm.node_id ?? null)
   const pol =
     (seed.data?.seed_policy as Record<string, unknown> | undefined) || {}
   const syncTelemetry =
@@ -211,12 +214,7 @@ export function VmDetailPage() {
       vm.tokens_in ??
       0
   )
-  const todayHit = cacheHitPct(
-    todayInput,
-    todayReadCache,
-    todayWriteCache,
-    isCodexVm(vm) ? 'openai' : 'anthropic'
-  )
+  const todayHit = cacheHitPct(todayInput, todayReadCache, todayWriteCache)
   const credType = credTypeOf(vm)
   const officialCc = supportsOfficialCc(vm)
   const canRefresh = canRefreshCredential(vm)
@@ -263,6 +261,7 @@ export function VmDetailPage() {
             </Select>
           ) : null}
           <PlatformChip vm={vm} />
+          <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           {claudeTier(vm).key !== 'none' ? (
@@ -407,6 +406,7 @@ export function VmDetailPage() {
           />
           <VmTestTab
             {...test}
+            vm={vm}
             credType={credType}
             isCodex={isCodexVm(vm)}
             dataplane={vm.resolved_dataplane}
