@@ -203,6 +203,7 @@ unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   process.env.KIN_KERNEL_BIN = '/bin/true'
   const fx = await kernelFixture((req, res) => {
     assert.equal(req.headers['x-internal-token'], 'internal-test')
+    assert.equal(req.headers['x-kin-internal-token'], 'internal-test')
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       trailer: 'x-usage, x-stop-reason',
@@ -659,6 +660,22 @@ test('writeKernelConfig idle timeout follows the panel stream idle timeout', () 
   } finally {
     if (prev === undefined) delete process.env.KIN_STREAM_IDLE_TIMEOUT
     else process.env.KIN_STREAM_IDLE_TIMEOUT = prev
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('writeKernelConfig request bytes follow the panel body limit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-body-cfg-'))
+  const bytesOf = (opts) =>
+    JSON.parse(fs.readFileSync(writeKernelConfig(root, { id: 'vm-09' }, { token: 'tok', ...opts }).configPath, 'utf8'))
+      .max_request_bytes
+  try {
+    assert.equal(bytesOf({ routing: {} }), 32 * 1024 * 1024)
+    assert.equal(bytesOf({ routing: { failover: { max_request_mib: 64 } } }), 64 * 1024 * 1024)
+    assert.equal(bytesOf({ routing: { failover: { max_request_mib: 1 } } }), 8 * 1024 * 1024)
+    bytesOf({ routing: { failover: { max_request_mib: 64 } } })
+    assert.equal(bytesOf({}), 64 * 1024 * 1024)
+  } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })

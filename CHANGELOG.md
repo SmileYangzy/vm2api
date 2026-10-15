@@ -1,5 +1,338 @@
 # Changelog
 
+## 未发布
+
+- 新槽位由私有 `kin-computer` 生成主机名和 machine-id；新建本机容器发布对应身份，已有容器启动时不改写主机名。控制面需单独安装该二进制并可用 `KIN_COMPUTER_BIN` 指定路径；公开镜像不包含它，缺失时建槽返回 `computer_service_missing`。（#452）
+- 集群槽镜像已存在时跳过传输；缺少云端基础系统时才拉取，母机只上传程序层。（#452）
+- 蒸馏检测器只扫描最新用户正文并跳过工具回传；移除误伤学术知识蒸馏讨论的内置硬规则，保留套取思维链等收割规则。（#453、#456，同一 head）
+- Codex 诊断仅在 socket 不存在或无人监听、且没有本进程跟踪的存活子进程时显示空闲警告；超时、HTTP 错误、权限错误及已跟踪子进程不响应仍报故障。（#459）
+
+## 1.3.175 — 2026-10-15
+
+- 新增槽位「恢复服务」：VM 列表行「更多操作」与模型测试失败结果里都能打开。弹窗先只读诊断（槽位状态、凭证、节点 SSH 链路与集群中继、出口代理与本机出口桥 kin-egress、容器、推理内核、自动恢复、调度），逐项给出状态、错误码和原因；「恢复服务」执行关机→开机，开机与 `POST /start` 同一路径，期间内核看门狗不插手，结束后清除内核故障标记与重启计数，并重新诊断。接口 `GET /api/panel/vms/:id/diagnose`、`POST /api/panel/vms/:id/recover`（同槽并发 409 `recover_in_progress`），租户可对自己的槽调用。
+- 模型测试失败时突出错误码与 HTTP 状态，toast 带错误码；5xx 时自动诊断并显示第一个失败项，例如「容器反复崩溃重启：退出码 1，已重启 9 次」。诊断区分容器不存在 / 已退出 / 崩溃循环。管理员额外看到 Docker 错误原文、内核放弃原因和最后几行容器日志（常见令牌、密钥、代理账号已尽量遮盖）；租户只看到错误码、退出码、重启次数等结构化信息，不含原始日志、路径和主机。
+- 自动恢复补缺：看门狗遇到容器已删除或已退出（`container_unavailable`）时走完整开机，仍占同一重启预算；每个 tick 检查本机 kin-egress 出口桥与集群节点的 docker 桥 / 槽位中继，挂了就拉起（每个出口或槽位 60 秒内最多一次）；控制面启动后对记录为运行中、容器不存在或未运行的槽位补开机一次（看门狗关闭时不做）。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`，不必重建槽位容器。Node 启动后会对记录为运行中、但容器不存在或未运行的槽位各补开机一次（`kernel_watchdog.enabled=false` 时不做）；运行中的容器不受影响。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.174 — 2026-10-15
+
+- 修复同一入站 session / device 的连续请求排队时，出站 Session ID 在同一 VM 上跳变：使用出队后、预绑定前的粘性快照，后续轮次复用前一轮已建立的出站会话，日志与 Node 出站请求保持一致。
+- 同账号换 VM 时，新出站 session 会正确持久化；换机后只重建一次，后续轮次继续复用。保留取消、空响应和临时借位的既有规则。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`，不必重建或重启槽位容器。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.173 — 2026-10-15
+
+- Sonnet 5、Haiku 4.5 以及其他不支持对话中途 `role=system` 的型号，会把每一轮的 `<total_tokens>` 提醒抬进缓存断点后面的 system 尾块。尾块每轮变长，`cache_read` 停在工具和官方前缀（这次约 80.5K），后面的对话每轮整段重写。现在整段只留一条预算提醒，官方前缀里的那条不动。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.172 — 2026-10-15
+
+- 面板恢复 admin 虚拟机「分配给租户 / 收回」：虚拟机列表与机架「更多操作」、详情卡与完整详情页运维 Tab 调用 `PATCH /api/panel/vms/:id/owner`；列表与详情展示租户属主读数。1.3.167–1.3.168 列表/网格改版后前端未再接线，群友反馈找不到分配按钮。
+- 通知新增「企业微信群机器人」通道：`notify.wecom` 支持 `enabled` / `webhook` / `mention_all`，Webhook 可填完整地址或只填 key。账号池事件、定时汇报、内核故障告警与邮件、Telegram 共用同一套事件规则。Webhook 按密钥对待，面板与 GET 接口不回显，留空保存不覆盖已有值；设置 → 通知 新增对应卡片与「发送测试」。
+- 健康探测可选「全号轮询」：`routing.health_probe.probe_all_slots` 默认关闭，行为与原先一致（首个可用槽成功后停止）。开启后每个间隔对所有可调度槽各探一次，受 `concurrency`、工作时段、冷却与凭证排除约束；列表顺序中首个成功仍写入健康缓存。设置页「探测 → 健康缓存」可开关；`interval_sec` 仍支持 3600 等值。（#399）
+
+已部署机升级：更新 Node 控制面与 `web/dist`（镜像构建会重新编前端），重启一次 Node。无数据库迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。全号轮询与企业微信都默认关闭；企业微信要在设置里填写 webhook 后才发送。
+
+## 1.3.171 — 2026-10-15
+
+- 本地 429（例如 `fable_requires_max`，`exhausted: false` 且没有上游额度头）不再把 5h 标成 rejected。带 rejected 额度头或调用方明确 `exhausted: true` 的真实上游 429 仍拒绝。（#439）
+- 流式请求在首字之前就装填保活心跳。等待超过心跳间隔会先写出 200 和 ping，并就此提交，避免 Cloudflare 120s 524；间隔内失败仍可换槽。（#429）
+- 未向下游提交的 Codex 上游 503 `server_error` 会排除当前槽并换下一个，已提交或写过响应的不换。（#435）
+- 设置 → 账号池 → 重试与切号增加「请求体上限」（8–128 MiB，常用 32 / 64 / 128）。它同时限制网关入站和槽内 kernel / Codex kernel 的 `max_request_bytes`。未设置时 kernel 仍是 32 MiB。保存后 Claude kernel 在空闲时重启。Codex kernel 只在该槽没有其他在途请求时重启，并等旧进程退出后再拉起，避免健康检查复用还在退出的进程。（#436）
+
+已部署机升级：更新 Node 控制面与 `web/dist`（镜像构建会重新编前端），重启一次 Node。无数据库迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。请求体上限的默认仍是 32 MiB，要放到 64 需在设置里保存；保存后各槽 kernel 在没有请求时才会按新上限重启。
+
+## 1.3.170 — 2026-10-15
+
+- 本地代理拆成每台 VPS 一条：控制面 `px-local`，每个集群节点 `px-local-<节点 id>`，接入节点时自动建立。绑定额度、测通、测地理都按各自机器算，不再「所有节点共用」，节点行的探测看该节点的 SSH 链路，地理经节点本机出网查询。槽位只能绑它所在机器的本地代理，传通用的 `px-local` 会自动落到槽位自己机器的那一行，绑到别的机器返回 `local_proxy_node_mismatch`。升级后首次启动会把挂在 `px-local` 上的节点槽迁到各自节点的行，docker 网络不变，运行中的槽不用重建。（#329，#428）
+- 虚拟机列表的出口芯片点击即测这个槽的真实出口 IP 与地理（`POST /api/panel/vms/:id/exit-probe`，仅 admin）。本地代理槽测它所在 VPS 那条本地代理，结果同步到代理池页；未绑定或被策略封禁的槽不可点。（#428）
+- 新增管理员接口 `POST /api/panel/vms/:id/credential/clear`：清空槽位凭证与账号字段并关闭调度（`no_credential`），保留槽位本身及其代理、时区、指纹等配置。（#438）
+- 修复 GPT 槽邮箱显示：导入按「显式邮箱 → ID Token → Access Token」补全身份，账号 ID 不再被当成邮箱，重新导入不再继承旧账号凭证，有凭证但邮箱未知的槽显示「已导入账号 · 邮箱未知」而不是空槽。（#432）
+- 修复 Claude 省略 thinking 时首字时间（TTFT）记得过晚、导致输出速度虚高：带 `estimated_tokens` 的 thinking 增量即计为首次输出。（#431）
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无数据库迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。接了集群节点且用本地代理的部署，首次启动会把节点槽迁到各节点自己的本地代理行，并改写 `vms/<id>.json` 里的 `proxy.id`（日志 `[local-egress] vm: px-local -> px-local-<节点>`）；要回滚到旧版本，先备份 `vms/` 和 `data/`。
+
+## 1.3.169 — 2026-10-14
+
+- 修正 #411 改坏的 0 注入契约测试。空的常驻约束仍保留零宽 agent 槽；用量遮罩继续盖住计费头、该槽和 Environment，不盖调用方剩余 system。没有运行时行为变化。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.168 — 2026-10-14
+
+- 计费改为三层价格：手动覆盖 > models.dev > 内置官方快照。models.dev 每 24 小时同步，缺的模型和档位（Mythos、gpt-6、Claude fast、OpenAI flex / priority、长上下文、1h 写入）由内置快照补。修正 Sonnet 5.5 缓存读 $0.10、Fable 5.1 / Mythos 5.1 缓存读 $0.25；去掉 Sonnet 4 / 4.5 超 200k 的加价。Anthropic web search 按 $10 / 1000 次计入费用。缓存写没有 5m / 1h 拆分且未声明 1h 时按 5m 计。
+- token 口径统一：`usage_logs.input_tokens` 一律不含缓存，OpenAI / Codex 在写入时扣掉缓存读写。「总 Token」= 输入 + 输出 + 缓存读 + 缓存写，每类只算一次；GPT 不再重复算缓存。虚拟机窗口、`total_tokens`、`today_tokens` 现在都含缓存。`/billing` 的 `tokens_in` 改为输入 + 缓存。
+- 托管 key 扣额度与写入日志用同一份计价结果，每个请求只计价一次。
+- 模型页拆成「模型」「计费」两个 Tab。计费 Tab 显示每个模型的有效价、来源和与内置价的差异，可编辑覆盖、手动同步 models.dev、按时间段「按当前价重算」（只改官方价 `total_cost`，不动 `actual_cost` 和 key 已扣额度），并列出未定价模型。
+- 模型目录自动同步：启动 5 秒后和每 6 小时经 OAuth 槽拉 Claude `/v1/models` 和 ChatGPT Codex 目录。新模型只在 `worker_only` 下直接对外，其他情况先加入并关闭。
+- 虚拟机列表拆清三列职责：「今日 / 7D 请求」只显示次数；「用量窗口」只显示额度占比和重置时间；「成本」统一显示 5H / 7D / 总计的官方费用与含缓存 token。网格、展开详情及「查看统计」共用同一份窗口与成本组件，移除列表和弹窗里的估算总量／剩余金额、顶部全池剩余估算及重复累计指标；完整详情页与 API 的估算能力保留。
+- 网格卡片底栏将逐格 session slot 改为按设置上限显示的席位容量条（已用 / 上限，保留宽限和排队提示），修复 20 席位挤出调度开关与菜单的问题；限额操作移到用量区，中／大卡片按实际宽度叠放或并排，金额与 token 完整对齐。
+- 新接口 `GET /api/panel/pricing`、`PUT /api/panel/pricing/overrides`、`POST /api/panel/pricing/sync`、`POST /api/panel/pricing/reprice`；`/vms`、`/vms/:id`、`/usage` 新增 `estimate_5h` / `estimate_7d` / `estimate_fable` / `window_fable_cost`。见 `docs/PANEL_API.md`。
+- API 后端空 system 也会套已配置的官方提示词。`rewrite` 的计费头放在 cache 断点之后。
+- 拒答守卫改为不可重试的 400 `policy_blocked`（`code` 仍是 `refusal_guard`），不再返回 503，避免 Claude Code 误提示登录。
+- 远程节点的 egress 容器改用配置文件属主的 uid:gid 运行；崩溃循环或旧规格会重建。
+- `POST /api/panel/vms/pool-policy` 批量改权重、调度等级和并发上限。单槽 `PATCH` 也可以改 Codex `weight`。
+- 修复 GPT OAuth 授权成功后虚拟机面板仍显示「未绑定账号」：换票后从 `id_token` / `access_token` 解析邮箱与 ChatGPT 账号 id。（#409）
+- 默认环境变量管理员写入用户列表，可在面板改密码。引导是否完成看数据库密码，不再只看 `.env`。
+
+已部署机升级：**升级前先备份数据库**。迁移 037 会就地把历史 OpenAI / Codex 行的 `input_tokens` 改成不含缓存（判据与原缓存命中率完全一致，命中率分母不变），无法自动撤销，回滚只能恢复备份。已经跑过 037 的机器不会再改这些行。更新 Node 控制面与 `web/dist`，重启一次 Node。无新依赖，不必 `wrap-cli/sync`。控制面需能访问 `https://models.dev`，访问不了时按内置快照计价。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.167 — 2026-10-14
+
+- 官方档在调用方没有 system 时也出站四段：计费头、身份句、官方 prompt、Environment。顺序跟 cli-node 一致，计费头在 prompt 前面。调用方自己的 system 仍放在第 5 段。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.166 — 2026-10-14
+
+- 计费头改放到最后一个 `cache_control` 之后。`cch` 仍按整份 body 变化，但不再打进 1h 前缀，`cache_read` 可以越过工具尾断点。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.165 — 2026-10-14
+
+- 虚拟机页的网格视图改成机架地图：按服务器分机架，机架内按状态分区（在池 / 受限 / 关闭调用 / 未使用 / 无效凭证）分段。机架头显示本机状态构成、席位占用和 5h / 7d 费用与 token 合计，只统计当前筛选下可见的槽位。
+- 每台槽位按「费用 / token」两行显示 5h、7d、Fable（仅 Max）和累计四列，竖柱带 70% 刻线和重置倒计时，并显示近 7d 占累计的比例。无效凭证、空槽、额度未探测的槽位直接给出重新授权、绑定凭证或刷新探测。
+- 卡片分小 / 中 / 大三档，默认打开网格·大；视图和尺寸会记住。顶部状态分区条同时用于网格和列表的筛选，吊销并入无效凭证。排序新增 7d 费用和累计费用。
+- `GET /api/panel/vms` 与用量账号行新增 `total_tokens`（累计输入 + 输出，不含缓存），和 `total_cost` 同源。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.164 — 2026-10-14
+
+- 官方提示词把调用方的官方长提示词放回 agent 槽，并在该块打 1h 断点。不再只留身份句。
+- 计费头的 `cc_prompt_index` / `cc_turn_index` 固定在首轮，避免每轮改写 system 前缀、把缓存打穿到工具断点。
+- `role=system` 留在消息列表。第 5 段只放顶层 system，对话前缀可以随轮次增长。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。已保存的官方档模板即使没有 `{{caller_agent}}`，出站仍会把官方长提示词插回 agent 槽。
+
+## 1.3.163 — 2026-10-14
+
+- 官方请求也套用协议里设置的 system 档，包括 custom。分类器请求仍不改。
+- 协议页「入站准入」新增「官方 Claude Code 家族透传」，默认关。打开后，直连和被识别为中转的官方家族保留入站 system（billing、身份句、system 上的 cache_control），不套当前提示词档。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。开关默认关，升级后官方家族会套用当前 system 档；要恢复透传，在协议页打开该开关。
+
+## 1.3.162 — 2026-10-14
+
+- 风险审计的蒸馏关不再写死收割包装、赛题正则和思考预算下限。这些值只来自面板保存的 `distill-rules.json`：`hard_needles` 是收割包装（官方客户端和 0 注入也拦），删掉即停，不会补回；结构收割的 `max_tokens` 和思考预算都用 `structure.min_max_tokens`；`contest_pattern` 留空则不做赛题结构判断。返回文案也只用该文件里的 `error.message`。出厂 `patterns` 为空，知识蒸馏 / 提取思维链仍由硬正则的 distill 类别拦截，避免两份名单。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。旧的 `distill-rules.json` 若没有 `hard_needles`，加载时把仍写在 `needles` 里的出厂收割句归到收割包装；已经从 `needles` 删掉的不会补回。整份替换该文件则会用仓库里的新出厂配置。
+
+## 1.3.161 — 2026-10-14
+
+加强和优化时区。加强针对 omp、pi 的单独优化。
+
+## 1.3.160 — 2026-10-13
+
+- 系统提示词按五段注入。官方完整是标准：billing、identity、agent、env，调用方 system 在可选第 5 段。官方提示词和 0 注入用同一槽位；第 3 段只放常驻约束，空则去掉。顶层 system 和消息里的 `role=system` 都进第 5 段，不再抬成中途 `role=system`。
+- cli-hop 先剥掉入站 billing、identity 和 `# Environment`，再按槽位档覆写。cli-node 只有在出站已经带 billing 和 identity 时才原样放行，否则仍由 CLI 补回计费头和身份句。
+- OMP / oh-my-pi 仍是非官方流量：正文进第 5 段，自带的 billing 和 `local-agent` 前缀不转发。旧的 `rewrite` 模式仍把中途 `role=system` 留在消息列表里。
+
+已部署机升级：更新 Node 控制面，并把 `share/wrap-cli/cli-node` 同步进 Anthropic 槽（`wrap-cli/sync`，`restart: true`）。Codex 槽不用这枚 CLI。重启一次 Node。无迁移、无新依赖。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.159 — 2026-10-13
+
+- 风险审计的账号范围改为按「平台 · 套餐」筛选（Claude Max/Pro 跟虚拟机列表同一套判断，GPT 按套餐）。不再按凭证形式。范围条在页面顶部，可收起。只选 GPT 套餐时 Claude 照旧全进关卡；选了 Claude 套餐或指定账号后，没命中的 Claude 才放行。GPT 在设了范围后只检查命中的套餐。没设范围时行为与 1.3.158 相同。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。没设账号范围的关卡，行为与 1.3.158 一致。
+
+## 1.3.158 — 2026-10-13
+
+- 伪造健康探测头（`x-health-real` 一类）不能再绕过密钥配额。内部已认证的健康探测仍不计配额。
+- 风险关卡可按已有槽位字段收窄：凭证形式、`plan_type`、槽位 id / 邮箱 / 名称。三个名单取并集，全空时所有账号照旧进关卡。不新增账号属性。Claude 不受这个范围影响。
+- 新增单槽「工作时段」（`policy.active_hours`：开工 / 收工、可选星期与钉住时区，开工晚于收工为跨夜班次）。窗口外该槽不参与调度：Claude 在模型与额度门禁之后判，Codex 直接跳过；整池都在休息时两侧都 503 `pool_unavailable` 并带 `Retry-After`（最近开窗时间）；Codex 续接 `previous_response_id` 时绑定槽在休息返回 409 `response_not_portable`。健康探测不挑休息中的槽，pin 诊断不受影响。时区取窗口自带值 → 槽位时区 → UTC，夏令时切换日按实际时刻判定。面板「调度」编辑器可设置，列表显示「休息时段」（受限），新增 `active_hours_timezone` / `active_hours_active` 字段；导出包、写回与重建保留窗口，无窗口导出为 `null`。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。没设工作时段的槽、没设账号范围的关卡，行为与升级前一致。
+
+## 1.3.157 — 2026-10-13
+
+- 增加 Fable 多轮 system 前缀的回归测试，防止历史 system 提醒被抬进顶层 system、冲掉缓存前缀。不改运行时行为。
+
+已部署机不必为这一版升级。没有协议、配额或出口变化，无迁移，不必 `wrap-cli/sync`。
+
+## 1.3.156 — 2026-10-13
+
+- kin-egress 的 DNS-over-TCP 在同一连接上连续回答查询。解析失败回 SERVFAIL 后继续读下一笔，不再在首个应答后关闭连接。解析期间不占用客户端的 10 秒读写超时。
+- 面板会话 `panel-sessions.json` 改为同目录临时文件原子替换，权限 `0600`。已经过宽的文件在加载时收紧。写入或加载失败会记一条日志，不再静默丢掉。
+- 决策模型不可用且关闭失败放行时，只拦截当前请求，不再把客户端 device 永久封禁。503 拒答缓存在原句后说明是设备封禁、精确一致还是相似正文。
+
+已部署机升级：更新 Node 控制面镜像（内含本次 `kin-egress`）并重启一次 Node。已经在跑的出口要换成这次发布的 `kin-egress`，DNS TCP 复用才会生效。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.155 — 2026-10-13
+
+- 虚拟机详情 → 代理 tab 的出口下拉改为可输入筛选：输入名称、地址、国家、城市、时区或 ISP，只列匹配的可用节点，选中后点「绑定」。
+- 「代理」页的搜索框改为筛选可用节点：有关键词时只显示可绑（未禁用、非 dead、无 IPv6 拦截）且有空位的代理，已满或失效的不参与匹配；清空关键词恢复全部列表。
+- 「代理」页重排，找节点更快：席位图改成整页宽的横条放在顶部，健康图例仍可点击筛选；下方新增地区栏（本地出口、各国家，城市多于一个时可再细分），每档显示当前筛选下的条数和可绑空位，点一下就筛到该地区。地区栏在超宽屏（≥1536px）是表格左侧的竖栏，更窄时是表格上方的一排，笔记本宽度下表格不被挤成卡片。列表在宽屏下对齐成表格（节点、地区、状态、延迟、席位、已绑槽位、操作），点表头排序、再点翻转。「添加代理」「池设置」收进页头按钮打开的右侧抽屉，「全部测通 / 全部测地理」移到页头。窄屏时表格退回卡片排布。
+- 代理列表每条压成一行（约 40px，1366 宽一屏约 13 条）：名称后跟地址，地区只显示国家 · 城市，席位改成「n/上限」+ 小格，已绑槽位行内最多显示 2 台、其余折成「+N」，行尾只留测通和「更多」菜单。点名称展开详情：完整地址、出口地理与 ISP、最近错误、全部已绑槽位与绑定、测地理 / 复制 / 编辑 / 启停 / 删除。顶部席位图变矮，待接代理收成一行。
+- 顶部席位图改为按地区成簇的点阵：一个点一个绑定位，实心为已绑（按代理健康着色），空心为可绑空位，淡点为失效 / 禁用代理上用不了的位；一条代理一列，上限高的（如本地代理）折成相邻几列而不是拉高整图。每簇标出地区名和空位数，点地区名即筛到该地区，悬停 / 点列仍与表格行联动。地区栏可收起：竖栏收成只显示地区代码和空位数的窄条（60px），横排收成只剩当前选中的一档；收起状态记在浏览器里，不清除筛选。
+
+已部署机升级：更新 `web/dist` 与 `VERSION`，重启一次 Node 让面板显示新版本号。Node 控制面代码、二进制、kernel / CLI payload 与 1.3.154 相同，无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.154 — 2026-10-13
+
+- 欢迎页首配增加用法选择。个人自用关闭 5h/7d 闸，三档闸线拉到 100%，执行并发拉到 256，RPM 保持不限；蒸馏、硬正则、拒答缓存关掉，决策模型维持关闭且阈值降到 0。中转站把这些项写回出厂值：闸开着，default/Pro 并发 2、Max 并发 4，闸线 85%/80%（Max 95%），蒸馏、硬正则和拒答缓存开着。两种模式都不改提示词、探测、健康缓存和其余开关。`PUT /api/panel/onboarding` 增加 `{ action: "profile", mode: "personal" | "relay" }`，选择记在该用户的引导状态里，完成或跳过引导后仍保留。
+- 欢迎页补了各主要页面的一句话说明。配额、风险审计、密钥、虚拟机用量、内核重装多一句：配额闸在设置「配额」；风险审计是出站前的四道关；密钥用 `sk-vm-`，不要把主控密钥写进环境变量；5h/7d 用量在虚拟机列表；内核重装不改凭证、代理和容器。
+- system 提示词在没有 `persona_preset`、也没有 `persona_inject` 时默认完整官方提示词（`official_full`）。已写明的档位和旧的 `persona_inject` 不变。仓库里的 `routing.json` 本来就是这一档。
+- 自动额度探测和健康缓存改为默认关闭。预热拦截、`max_tokens` 下限和其余探测项不变。已在 live `routing.json` 里写成开的开关保持开。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 live `routing.json`、`vms/`、`data/`、`.env`。要让已部署的探测和健康缓存跟着新默认关掉，在设置 → 探测里关，或删掉 `usage_probe.enabled` / `health_probe.enabled` 后重启。
+
+## 1.3.153 — 2026-10-13
+
+- 设置 → 协议 重排为两块：「入站准入」（Claude / GPT 两侧客户端放行，「识别中转来的官方 Claude Code」也移到这里）与「GPT 链路」（总开关在标题栏）。「仅允许 Claude Code 家族请求」原来是页面最底下第六张卡片，容易漏看，现在放在第一块入站准入里，并列出放行条件。
+- 协议页不再提供 Claude 链路的修改：去掉数据面、缓存 TTL、缓存断点。数据面在「内核」页切换；`cache_ttl`、`cache_breakpoints` 只能直接改 `routing.json`，保存协议页时原值保留。
+- 去掉「用量」页：侧栏不再显示，`#/usage` 路由删除，`super` 角色的可见页不再含 `usage`。账号 5h / 7d 限额看「虚拟机」列表的用量窗口；总览的「警告 / 限制」提示改为跳到虚拟机页。`GET /api/panel/usage` 仍保留，总览、集群和虚拟机列表在用。
+- 「仅允许 Claude Code 家族请求」改严：只认 UA 已不够，直连须同时带 Claude Code 的整组请求头（`x-app: cli`、`anthropic-beta` 含 `claude-code-20250219`、Stainless SDK 头、`x-claude-code-session-id`），Messages 还要官方 system + user_id、会话头与 user_id 会话一致、计费块版本与 UA 一致。count_tokens 只验请求头。CLI 自身的 quota 探测只放行固定原样（`max_tokens: 1`、无 system/tools、单条 user 文本 `quota`、会话头与 user_id 一致）；其他 `max_tokens: 1` 的请求按普通请求判，因为输出下限会把它抬成真实补全。健康探测形状（含 sub2api 账号测试）一律 403，不再由探测缓存回答。中转流量跟随「识别中转来的官方 Claude Code」。面板测试对话和内部健康探测（master key 钉槽）不受影响。
+- 蒸馏默认规则不再把 `Respond in the following format: <think>` 当模板。NewAPI 等中转用 `Go-http-client` 转发时带这句正常系统提示，`skip_official` 对不上，之前整段 403 `不允许蒸馏`。已保存的规则加载时也会丢掉这句，和裸 `<think>` 一样。收割针、指纹和「提取思维链」这类规则不变。
+- 「识别中转来的官方 Claude Code」加强：系统里有官方计费块（`x-anthropic-billing-header` 和 `cc_entrypoint`，且不是 oh-my-pi）就按官方处理，不再同时要求 `user_id`。NewAPI 用 `Go-http-client` 转发时留着计费块、丢掉 metadata，之前不算官方，蒸馏和其他官方绕过都没走。没有计费块的中转仍要客户端 beta、官方 system 和合法 user_id。`local-agent` 仍不算官方。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。开着该开关、又依赖第三方健康检查或只带 UA 的客户端的部署，升级后这些请求会变成 403。
+
+## 1.3.152 — 2026-10-12
+
+- 用量聚合按每行 prompt 分母计算缓存命中率：Claude 为 input + 读 + 写，Codex / OpenAI 的 input 已含缓存；混用提供商按 token 加权，账号窗口二次汇总保留该分母。首页和用量页复用已算出的 `billing.total`。数据库页 `PromptCacheMetricsPanel` 仍用 input+read+creation 自行重算，不在本次范围内。（#363）
+- 内核流 `streamGoWorker`（Claude / Codex 共用）的 TTFT 从首次生成内容起算：文本、推理、已生成的工具名（无参工具可能没有参数 delta）计时；`message_start` / `response.created` / 空完成等元数据不计。日志 `first_token_ms` 用 `firstTokenAt - 入口 t0`，取消和失败保留已观测时间。API 传输路径仍按首条 `data:` 行计时，未改。（#363）
+- 槽位 JSON 读缓存保留调度热路径：只缓存文件文本，按 mtime/size/inode 签名命中，每次单独解析，调用者改返回对象不影响下次读取。`getVm` 只把缺文件（ENOENT）当成不存在；坏 JSON、目录和其它读错误继续抛出。`listVms` / `readCodexAccounts` 仍在各自边界跳过坏文件。删除槽位、重建擦除 home、备份恢复会立刻丢掉对应记录和 Codex 凭证缓存；缓存有固定 LRU 上限。`KIN_VM_READ_CACHE_MS=0` 关闭缓存，该变量只是开关不是 TTL。（#384）
+- 临界区大额冷请求只按缓存未命中的输入判断，不再把 `max_tokens` 算进未缓存量。Claude Code 的 Opus 把输出上限固定成 128000，之前账号一进临界区，短提示词的新会话会被直接拦下，热会话结算一笔后也全部本地 429，直到下一次官方用量探测。现在短的新会话和已确认热前缀的小请求继续放行；真正的大额冷写入（默认 ≥10 万未命中输入）以及滞后读数下的下一笔大额未命中仍拒绝。8 万左右、低于阈值的冷提示词不再因为输出上限被抬过线；要拦这种写入，调低 `routing.quota.large_cold_uncached_tokens`，不要把输出上限加回去。（#385）
+- GPT/Codex 槽不再因 Claude 凭证为空被停成 `no_credential`。新增 `vmHasSchedulableCredential(vm, projectRoot)`：Claude 槽沿用 Claude 凭证判断，GPT 槽读 `codex-credentials.json`（无项目根时回退槽位记录）。槽位启动、代理绑定/重绑/编辑/包更新后的恢复调度、代理重新启用三处改用它；之前预热或重绑会把整池 GPT 槽停掉，请求全部 `503 no_codex_vm`。已被停掉的槽需手动重新启用一次或再走一次上述路径。（#386）
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，kernel / CLI payload 不变，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.151 — 2026-10-12
+
+- 修复消息级 effort 切换：支持该 beta 的模型保留空 `system` 控制轮及其原位置、历史控制和多次切换，不再删除或提升到顶层；顶层 `output_config.effort` 保持入站值。出站携带 `mid-conversation-output-config-2026-07-01`，kernel 序列化保留消息级控制字段。不支持该能力的模型维持原来的末尾提升处理。（#383）
+- 本地实际 Node → 新 kernel ELF → 现有 CLI → SSE fixture 验证了新 user 前/后、历史控制和多次切换的出站消息、顶层 effort 与 beta；不等同于真实上游缓存命中验证。
+
+部署该修复需更新 Node 与 kernel payload，并执行 `wrap-cli/sync`；CLI 本身无需重编。没有数据库迁移或新依赖。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.150 — 2026-10-12
+
+- 遥测对齐 Claude Code 2.1.293。`device_id` 使用官方 64 位 user id，发送前去掉 `node_version`、`is_running_with_bun` 和 `betas`，补上 shell 等官方环境字段。
+- 新建槽从手写 SMBIOS 品牌库随机抽一条机器画像，写入 `vm.machine.smbios` 后固定使用。已有厂商、型号和系列的槽不重抽。库里是 Dell、联想、惠普、华硕、宏碁、Framework、微星、技嘉的台式机和笔记本。Docker 槽只保存这份身份；KVM 启动读取槽位记录，不再回退全局 OptiPlex 7090。
+
+已部署机升级：更新 Node 控制面与 `kin-worker`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。已有槽的 SMBIOS 不会被这次升级改写。
+
+## 1.3.149 — 2026-10-12
+
+- 控制台入口（`/cc`、`/console`）改为公开欢迎页 `#/welcome`：介绍、能力、三步快速开始和 Claude Code / Codex / curl 接入片段，版式参照 new-api 新版首页，配色只作用于欢迎页和登录页，控制台主题不变。登录改为独立页面 `#/login`，右上角「登录」进入；`/cc#/login`、`/console/#/login` 旧地址照常可用，未登录打开受保护页面会带 `redirect` 到登录页，登录后回原页面。
+- 登录后欢迎页显示首配清单：修改默认密码、出口代理、槽位账号、可调度槽位、`sk-vm-` 密钥、首个成功请求，完成态全部来自网关真实数据，按角色裁剪（租户只算自己的槽和密钥）。首次登录且未完成时落在欢迎页；「跳过引导」或「完成引导」后登录直接进总览，用户菜单「欢迎与引导」可重新打开。
+- 新增 `GET/PUT /api/panel/onboarding`：返回各步完成态、`needs_welcome` 和 `base_url`（仅 `PUBLIC_BASE_URL` 设置时），`PUT { action: complete | dismiss | reset }` 按用户写 SQLite `settings.onboarding_state`。admin / super / user 都可调用。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.148 — 2026-10-12
+
+- 硬正则和决策模型的用户文本不再包含工具回传。omp 把 issue、命令输出放在 user 轮的 `tool_result`（以及 `*_tool_result`、`function_call_output`）里，正文引用 `ignore all previous instructions` 会被 jailbreak 规则拦截。用户自己写下的同一句仍然拦截；system 提示词硬正则本来就不扫，决策模型仍看 system。拒答相似度仍把工具回传算进文档。
+- pi 插在消息序列里的空 `system` 控制轮（`content` 为空，只带 `output_config.effort` 或 `clear_at`）重新丢掉，不再原样转发出站。v1.3.138（#328）留下这些空轮之后，长会话里每轮一枚空 system，上游无法处理。末尾那条（后面没有 user/assistant）的 effort 仍提升到顶层 `output_config.effort`，当前轮不会退回旧的 `high`；夹在历史轮里的空控制只删除，不覆盖当前顶层 effort。带正文的对话中途 `role=system` 不变。（#374）
+- 硬正则规则列表存成空数组（`rules: []`）时回落内置规则，与 `rules: null` 一致；之前内置规则被整体换成空集，`hard_regex_enabled` 仍显示开启，请求日志记 `by: unchecked`。要关掉这一层用 `hard_regex_enabled`。（#370，#371，@jxb412）
+- 导入的槽位 OAuth 凭证在文档顶层和 `claudeAiOauth` 里都写 `kinGeneration`，与 Go 刷新器一致；文件仍是 `0444`，槽内 Claude 不能改写共享 refresh token 而丢掉代数。（#373）
+- 换票结束于 Claude Code bootstrap（`entrypoint=claude-code&model=claude-opus-5-5`），不再 PATCH 账号 Grove / Help improve Claude。bootstrap 去掉 vscode 字段。`kin-oauth-auth` 随 payload `payload-2026.10.12` 更新。
+- `server-side-fallback-*` 与 fallback credit beta 只在请求体显式带 `fallbacks` / `fallback_credit_token` 时附加。
+- `GET /v1/models` 只列出该 key 的 `group_type` 能调度的模型：`openai` 只列 GPT，`anthropic` 只列 Claude，`all` 两者都列。（#364，@xjblszyy）
+- 虚拟机列表开关调度成功后不再回跳到旧状态、等 5 秒轮询才纠正。（#367，@OneB1ank）
+- KVM 槽位降权启动 QEMU 时保留 `/dev/kvm` 的设备组，`/dev/kvm` 属组与槽位主组不同时不再 `Permission denied` 循环重启；TCG 和 UID 0 路径不变。修复在 `kin-kvm-*` runner 镜像里，镜像已重新发布。（#365，#366，@OneB1ank）
+- 槽内 `cli-node` 对齐 Claude Code 2.1.293 的请求组装与 CLI 兼容性（随 payload `payload-2026.10.12` 更新）。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖。`cli-node` 与 1.3.147 不同，槽位要 `wrap-cli/sync` 才用上新 CLI；KVM 槽位要拉取新的 `kin-kvm-*` 镜像并重建一次。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.147 — 2026-10-12
+
+- GPT / Codex（OpenAI 平台模型）请求默认不过拦截关卡，日志记 `intercept.by = platform`（风控页「OpenAI 平台未接入」）。风控 → 硬正则新增「OpenAI 平台」开关（`jev_intercept.openai_platform_enabled`，默认关）；开启后与 Claude 走同一套硬正则、拒答缓存与决策模型，蒸馏规则仍不扫 OpenAI 平台。之前 Responses 形态的 `input` 取不到用户文本（#368），GPT 请求事实上从未被检查；修好取文本后若直接生效，Codex 放在 user 轮次的 AGENTS.md 会被硬正则误拦并封设备，所以改为显式开启。非布尔值 PUT 400。
+- Responses / Codex 形态的 `input`（`message → content → input_text`）与 `instructions` 现在进入硬正则、决策模型和蒸馏的取文本（#369，@jxb412）。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.146 — 2026-10-11
+
+- GPT 槽的容器不再循环重启。GPT 槽的 Codex 内核跑在宿主机上，但容器的主进程一直是 Claude 的 `kin-kernel`：它没有 Claude 凭证，等不到 20 个 CLI 槽就在约 4 分钟后退出，`--restart unless-stopped` 再拉起，线上两个 GPT 槽已各重启 1376 次（每次都起一遍 cli-node）。现在 GPT 槽容器的主进程是 `sleep infinity`，带 `kin.vm.role=codex` 标签；没有 `kernel.sock` 也算存活，重载不会再把它删掉重建。没有这个标签的旧 GPT 容器在下一次重载 / 启动时重建一次。Claude 槽不受影响。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。已有的 GPT 槽要各重载一次（面板「重载」或 `POST /api/panel/vms/<id>/reload`），容器会重建一次、容器 ID 改变；宿主机上的 Codex 内核和凭证不受影响。
+
+## 1.3.145 — 2026-10-11
+
+- 5h/7d 闸改成三段，调度和控制台用同一套判断：闸线下 `critical_band`（默认 5%）到闸线上 `gate_overshoot`（新，默认 5%，0–10%，设置 → 配额可改）为「临近闸线」；达到闸线 + 超出量才算闸上、让出席位换 VM。之前临近闸线时同一会话的第二个并发会被拒，预调度随即释放席位、把会话挪到别的 VM（余量还在却切 VM）；现在第二个并发在原 VM 排队，一次只跑一个，不换 VM。新会话优先开到正常 VM，没有时才开在临近闸线的 VM 上，用量过了闸线就不再开新席位。大额冷请求保护（#350）不变，作用范围随临近闸线区一起延伸到超出量。
+- 控制台不再把临近闸线的账号显示成「可用」：新状态「5h/7d 临近闸线」（`availability.key = drain`，橙色，仍算在池）。状态优先级改为额度上限 / 门禁 → 503 熔断 → 调度关 → 临近闸线 → 席位满；之前熔断会盖住额度限制。席位满单独显示，不计入「受限」。
+- 实时性：席位流加上每台 VM 的在飞请求数，每个请求开始、结束都推一帧；新增 `event: proxy`，SOCKS5 探测结果和代理状态变化即时推到 VM 列表、总览和详情页（详情页之前不接实时流）。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`；部署机 `routing.json` 没有 `gate_overshoot` 时按默认 0.05 生效，即升级后账号可越过原闸线最多 5 个百分点才切走；要到闸线即切，在设置 → 配额把超出量设为 0。
+
+## 1.3.144 — 2026-10-11
+
+- 决策模型 key 从 8 把放到 999 把。一行可以写成 `https://host/v1/systemone <key>`，和裸 key 放在同一池里轮换，所以 typesafe 和别的 systemone 可以一起用。
+- `401` / `429` / `529` 退役这把 key，之后的请求不再调度它。再次保存密钥列表会把还在列表里的 key 重新启用。网络错误和其它 HTTP 状态只跳过这一跳的同一主机，不退役 key。模型故障放行的 keyword 写成 `网络异常` 或 `上游 <status>`。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移。不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.143 — 2026-10-11
+
+- 首次部署不再种下一个删不掉的 `vm-01`。之前入口会写成活跃槽，而删除接口拒绝删除活跃槽；只有这一个槽时无法先切换，所以首个槽删不掉。重启还会把文件种回来。现在空环境可以直接启动。只剩一个活跃槽时可以删除，并清掉活跃指针；还有其他槽时仍要先切换活跃再删。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。已有的 `vm-01` 不会被删掉；它若是唯一槽位，升级后可以直接删除。
+
+## 1.3.142 — 2026-10-11
+
+- 日志列表默认隐藏「认证」类时，不再把无槽位的 403 策略拒绝一起藏掉：`claude_code_only`、`key_group_mismatch`、`vm_pool_unavailable`、`distill_blocked` 等已有明确分类的错误码照常显示。之前只按「无槽位 401/403」判定，这些拦截在默认视图里看不到，要勾「显示静音」才出现。入站来源统计口径不变。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.141 — 2026-10-11
+
+- 「仅允许 Claude Code 家族请求」开启时，拦截提前到健康探测之前。此前像健康探测的第三方短请求（如 `hi`）会被探测缓存答出 200，或在探测 fail-closed 时得到 503 `health_unavailable`，而不是 403 `claude_code_only`。官方 Claude Code 的探测请求不受影响。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.140 — 2026-10-11
+
+- 设置 → 协议新增「仅允许 Claude Code 家族请求」（`routing.compatibility.claude_code_only`，默认关）。开启后，Claude 模型的请求只放行官方 Claude Code：识别与人设/拦截路径共用 `isOfficialClaudeCodeTraffic`，「识别中转来的官方 Claude Code」开启时也放行被中转的官方流量；官方 `claude-cli` UA 的 `max_tokens=1` 探测与 `count_tokens` 同 sub2api 放行。其余（第三方客户端、`/v1/chat/completions` 等 OpenAI 格式入口调 Claude）在选号前返回 403 `claude_code_only`，`count_tokens` 同样拦截。GPT 模型与 Codex 搜索不受影响。该错误归「请求格式」，不计 SLA 失败；非布尔值 PUT 400。
+- 仓库只保留源码：`web/dist`、`bin/kin-*`、`share/wrap-cli` 的 ELF / glibc、`share/crag` 不再进 git，并已从全部历史中清除（所有 tag 的提交号随之改变）。控制台与 `kin-worker` / `kin-egress` 在镜像构建与 CI 中由源码编译；闭源 kernel、`kin-oauth-auth`、`cli-node`、`cc-node`、crag kernel 与 glibc shim 放在独立的 payload Release，由 `deploy/payload.json` 按 sha256 钉住，`npm run fetch:payload` 下载并校验。镜像额外带上 crag kernel，入口写进 `share/crag`。版本 Release 附件名不变。
+- amd64 源码安装（`install.sh --from-source` / 目录有 `.git`）此前只按 `docker-compose.yml` 拉 ghcr 镜像，并没有构建本机 checkout。现在安装 / 升级会在 `.env` 写 `COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml`（已有值不覆盖），按 checkout 构建；面板一键更新不再重复叠加同一个构建文件。
+
+已部署机升级：镜像安装照常（一键脚本或面板更新），无迁移。源码安装（`--from-source` / 目录有 `.git`）这一次用新版 `curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash -s -- upgrade`：新脚本 `git fetch --force --tags` 接受重写后的 tag，旧面板的一键更新会因 tag 冲突失败。源码构建需要能访问 GitHub Release 下载 payload。重启一次 Node，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.139 — 2026-10-11
+
+- 租户日志按属主隔离：`GET /api/panel/request-logs/stats` 的错误集合、入站鉴权失败（含客户端 IP）与粘性命中只统计租户自己的请求，租户侧不再返回全站 `totals` / `config`。日志属主改为写入时快照槽位当时的属主（`usage_logs.vm_owner_user_id`），平台槽分配给租户后，分配前的历史日志不再对新属主可见。升级前的历史日志不回填，租户只能按自己的用户 / 密钥看到；此前租户在自己槽上用面板 test-chat 产生的旧日志将不可见（#353，@XiangZheng2283）。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。启动时执行迁移 `036_usage_logs_vm_owner.sql`（加列 + 索引，大表建索引期间短暂阻塞写入）。不必 `wrap-cli/sync`，二进制不变。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.138 — 2026-10-11
+
+- 修复继承全局 rust 引擎（槽配置未写 `inference_engine`）的槽不进内核看门狗的问题：CLI 重启预算用尽后按 60s/300s/900s 重启容器，用尽后标 fault 并通知，不再一直 `healthy:false`（#343）。
+- 已停止 / 已失效的槽位不再每 15 秒被 cli-node 守护进程 `docker exec` 一次，日志里不再刷 `[cli-node-guard] vm-xx No such container`。
+- 修复运行中槽位改绑另一条 SOCKS5 后仍挂在旧 `kin-eg-*` 网络、透明出口 IP 不变的问题：重载时若容器网络与当前绑定出口不一致则重建容器（cli-home / run / 磁盘 / machine-id 挂载保留），不再仅 `docker restart`。同一条代理改上游时也会重启 `kin-egress`，避免面板显示新出口、流量仍走旧出口（#325）。
+- pi 在消息序列里插入的空 `system` 控制项（`output_config.effort`，例如当前轮 `max`）不再被空内容清理丢掉，也不会和相邻 system 轮次合并。当前轮有效 effort 记入日志；不支持对话中途 `role=system` 的模型把最后一条消息级 effort 提升到顶层 `output_config.effort`。出站补 `mid-conversation-output-config-2026-07-01`（#328）。
+- 工具参数流式下发 `failover.eager_tool_streaming` 改为默认开启：未配置时给自定义工具加 `eager_input_streaming`，避免 Claude Code 经中转写大文件时静默触发 180 秒空闲超时。显式 `false` 仍关闭。已部署且 `routing.json` 里写了 `eager_tool_streaming: false` 的机器保持关闭，请到面板「重试与切号」打开（#339）。
+- 请求日志列表把 HTTP 200 但 `final_state=incomplete` 的条目从绿色成功改成橙色未完成样式，悬停显示 `error_code`，避免把已提交却未写完的流当成成功（#339）。
+- 绑定 SOCKS5 / 本机出口后槽位 `proxy_cli_enabled` 不再被后续写入打回 `false`。OAuth 提交、创建后启动、重置、包导入和重绑都会把该标志与已绑定出口一起保存；调度不再把已绑出口的槽当成 `no_eligible_accounts`。启动时会修好已被这个 bug 写成 `false` 的现有槽位（#332）。
+- 5h/7d 闸线临近时（默认闸线下 5 个百分点）会按本请求规模准入：小请求或已确认缓存热请求仍可走；预估大额冷缓存（默认 10 万未命中 token，含 `max_tokens`）不再打到只剩约 1 个百分点余量的账号，先改选其他有余量账号，全池都在临界区则本地 429 `quota_guard_request_too_large`，不打上游。已达闸线仍拦截普通请求。粘性/占席请求同样过闸。临界区内成功结算后，读数未刷新前下一笔大请求也会被挡住；失败或取消释放预留。闸是尽力保护，不把美元换成官方百分比，也不截短上下文。设置「配额」可改临界带宽与阈值，默认开启（#342）。
+- 集群节点上的本地代理在管理台显示为「节点名local代理」（例如 `东京-01local代理`），控制面槽为「当前VPS local代理」。代理池仍共用一条 `px-local` 与绑定额度，绑定计数标明「所有节点共用」；节点分组写「出口为该节点本机」，控制面探测不再当成节点出口。租户只看到「local代理」，不暴露节点名或其他租户槽位。本次不改配额语义（#329）。
+- 面板一键更新会识别当前 Compose 项目，用独立助手重建并 `--force-recreate` 控制面，轮询健康、启动时版本和此前健康槽位的内核鉴权后再报告成功；不再只改磁盘 `VERSION` 就显示「已是最新」。无法识别实际服务时返回 `409` 并给出宿主机命令。升级到本版本这一次仍由旧版助手执行，新流程从下一次更新起生效；验收失败不会自动回滚，会保留失败状态与助手日志（#331）。
+- 控制面调用内核同时发送 `X-Kin-Internal-Token` 和 `x-internal-token`，兼容 1.3.120 前后的槽内核、源码内核和 api-kernel（#331）。
+- Codex Responses Lite（`gpt-6-astra` + `reasoning.context=all_turns`）累计加密推理历史超过 128 KiB 时，上游会在出字前返回结构化 `server_error`；网关原先只读 `error.status`，把外层 `status: 500` 落成 502。同一槽保留最新连续推理历史（上限 120 KiB）再试一次，并把上游 500 如实报成 500（#334，基于 @OneB1ank 的 #335）。`KIN_CODEX_REASONING_HISTORY_FALLBACK=0` 可关闭该恢复。
+- 租户（`user`）在自己的槽位上点「查询额度」「使用重置券」「Claude 限额查询 / 重置」，以及对自己的密钥「清零」「轮换」不再返回 403。之前前端按钮已对租户开放，但权限白名单漏了这些接口；归属校验不变，访问他人的槽位或密钥仍返回 404（#351）。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。启动时自动把「已绑定出口但 `proxy_cli_enabled=false`」的槽位修好。不要覆盖 `routing.json`：若其中明确写了 `eager_tool_streaming: false`，升级后仍关闭，需在面板「重试与切号」打开；新配置项 `routing.quota.guard_large_cold` / `critical_band` / `large_cold_uncached_tokens` 缺省即生效。无迁移、无新依赖，不必 `wrap-cli/sync`，二进制不变。不要覆盖 `vms/`、`data/`、`.env`。
+
+## 1.3.137 — 2026-10-11
+
+- 首次安装后按脚本打开 `http://<ip>:8787/cc#/login` 不再 404。`/cc` 与 `/cc/` 和控制台 `index.html` 一样下发，且 `no-store`。Host 是未加括号的 IPv6 或非 ASCII 名字时不再在进路由前 500，路径照常路由；路径里的非法 `%` 不再冒泡成 500。
+
+已部署机升级：更新 Node 控制面并重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`，二进制不变。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.136 — 2026-10-10
+
+- 槽位可创建为 KVM 虚拟机（与 Docker 子容器并存）。新增 `routing.vm`（默认形态、内存、vCPU、磁盘、CPU 型号、SMBIOS、MAC 前缀、`allow_tcg`）；创建时可覆盖内存 / vCPU / 磁盘并固化到 `vm.machine`。槽内存改为读 `vm.machine.memory` → `routing.vm.memory`（默认 `512m`），移除 `KIN_VM_MEMORY`。`GET /api/panel/cluster/local` 返回 `kvm: { ok, accel, error }`；节点 preflight 在 `runtime_type=kvm` 时含 `kvm` 检查。租户创建表单读 `GET /api/panel/vms/create-options`（与 `POST /vms/create` 同 ACL），因为 user 不能读 cluster/local 与 routing。
+- KVM 槽 runner 镜像 `ghcr.io/dofastted/kin-kvm-{ubuntu,debian,arch,fedora}`，`os-catalog` 每项有 `kvm.image` / `kvm.cloud_image`。Release 由 `.github/workflows/guest-images.yml` 构建，离线构建上下文 `docker/kin-kvm/`，本机构建 `node docker/kin-kvm/build.mjs`。
+- 控制台「导入」重做为一条上线流程：槽位（新建或选已有空槽）→ 出口 → 账号 → 上线，右栏随步骤显示进度与这台槽的规格；新建时按平台、形态、系统、规格顺序选择，KVM 不可用时选项禁用并写明原因。区域与语言单独成「环境」区：区域只写入槽位标签，语言写入槽位与指纹（`en_US` / `zh_CN` / `ja_JP` / `C`，非法值 400 `invalid_locale`）。创建不再单独指定并发与权重，跟随设置里的全局默认（并发创建后可在槽位详情钉住）。
+- 新增「规格」页（资源组，仅管理员）：默认形态、内存、vCPU、磁盘、CPU 型号、SMBIOS、MAC 前缀与 TCG 开关，右栏显示本机 KVM 状态与客户机将读到的硬件。各组默认收成一行当前值，点开再改。设置里的「虚拟机」分页移除。槽位页的快捷创建与导入流程共用同一套表单；创建时的「规格」同样默认收起。内存可选 `256m` / `512m` / `1g` / `2g` / `4g` / `8g` / `16g`；低于 1G 时表单提示 OOM 风险。
+- 修复槽位列表与总览接口缺少 `runtime_type` / `machine`，KVM 槽在列表中被标成容器。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。原先用 `KIN_VM_MEMORY` 的部署，先在 `routing.json` 写 `vm.memory`（可选 256m / 512m / 1g / 2g / 4g / 8g / 16g），否则新槽回落 `512m`。不要覆盖 `vms/`、`data/`、`.env`。
+
 ## 1.3.135 — 2026-10-09
 
 - 对话中途 `role=system` 的模型白名单按官方文档补齐：Fable 5 / 5.1、Mythos 5 / 5.1、Opus 4.8 的这类轮次按原位发出，不再拼进顶层 `system`。之前这些模型的 `system` 每轮变长，提示缓存从 `system` 处断开，后面整段对话每轮重写 1h 缓存。文档列明 Sonnet 5 不支持，它的这类轮次改为挪进顶层 `system`（#324）。

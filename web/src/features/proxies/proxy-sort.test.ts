@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  localProxyFitsNode,
   proxiesForVmBind,
+  proxyIsControlLocal,
+  proxyIsLocal,
   proxyLabel,
   proxyMatchesQuery,
+  proxyOptionLabel,
   sortedProxies,
   sortedProxiesByAvailability,
 } from './proxy-sort'
@@ -48,11 +52,26 @@ describe('local proxy', () => {
     },
   ]
 
-  it('is labelled with the VPS it exits from', () => {
-    expect(proxyLabel(local, '203.0.113.7')).toBe(
-      'local:203.0.113.7 · 当前VPS的本地代理'
+  it('is labelled by placement, not the control-plane IP', () => {
+    expect(proxyLabel(local)).toBe('local代理')
+    expect(proxyLabel(local, { revealNode: true, nodeName: '东京-01' })).toBe(
+      '东京-01local代理'
     )
-    expect(proxyLabel(local)).toBe('local:当前VPS · 当前VPS的本地代理')
+    expect(proxyLabel({ ...local, node_name: null })).toBe('当前VPS local代理')
+    expect(proxyLabel({ ...local, node_name: '东京-01' })).toBe(
+      '东京-01local代理'
+    )
+    expect(
+      proxyOptionLabel(local, 5, { revealNode: true, nodeName: '东京-01' })
+    ).toContain('出口为该节点本机')
+    // Per-VPS rows: no shared-quota suffix; a node row names its own exit.
+    expect(proxyOptionLabel(local, 5)).not.toContain('所有节点共用')
+    expect(
+      proxyOptionLabel(
+        { ...local, id: 'px-local-node-a', node_id: 'node-a' },
+        5
+      )
+    ).toContain('出口为该节点本机')
   })
 
   it('stays first in every ordering', () => {
@@ -101,6 +120,25 @@ describe('proxiesForVmBind', () => {
     const list = proxiesForVmBind([full, local], 'vm-03', 5)
     expect(list.map((p) => p.id)).toEqual(['px-local'])
   })
+
+  it('offers only the local proxy of the slot’s own VPS', () => {
+    const nodeA = {
+      ...local,
+      id: 'px-local-node-a',
+      node_id: 'node-a',
+      bound_vm_ids: [] as string[],
+    }
+    const list = [socks, local, nodeA]
+    expect(
+      proxiesForVmBind(list, 'vm-a', 5, 'node-a').map((p) => p.id)
+    ).toEqual(['px-local-node-a', 'px-1'])
+    expect(proxiesForVmBind(list, 'vm-c', 5, null).map((p) => p.id)).toEqual([
+      'px-local',
+      'px-1',
+    ])
+    expect(localProxyFitsNode(nodeA, undefined)).toBe(true)
+    expect(localProxyFitsNode(socks, 'node-a')).toBe(true)
+  })
 })
 
 describe('proxyMatchesQuery', () => {
@@ -108,5 +146,23 @@ describe('proxyMatchesQuery', () => {
     const prx = { ...base, label: 'Tokyo Box' }
     expect(proxyMatchesQuery(prx, 'tokyo', () => '')).toBe(true)
     expect(proxyMatchesQuery(prx, 'osaka', () => '')).toBe(false)
+  })
+})
+
+describe('local proxy per VPS', () => {
+  it('finds a node row by its node name', () => {
+    const proxy = {
+      id: 'px-local-node-a',
+      kind: 'local' as const,
+      node_id: 'node-a',
+      node_name: '东京-01',
+      bound_vm_ids: ['vm-tokyo'],
+    }
+    expect(proxyMatchesQuery(proxy, '东京-01', () => '')).toBe(true)
+    expect(proxyIsControlLocal(proxy)).toBe(false)
+    expect(
+      proxyIsControlLocal({ ...proxy, id: 'px-local', node_id: null })
+    ).toBe(true)
+    expect(proxyIsLocal({ id: 'px-localish' })).toBe(false)
   })
 })

@@ -11,6 +11,7 @@ import {
   WINDOW_5H_MS,
   WINDOW_7D_MS,
 } from './quota-window.mjs'
+import { GATE_DRAINING, GATE_GATED, gateZone, quotaGateOf } from './quota-gate.mjs'
 import { DEFAULT_TIER_POLICIES } from './quota-tiers.mjs'
 import { isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
 import { expiresAtToMs } from '../oauth/oauth-credentials.mjs'
@@ -176,6 +177,7 @@ function policyOf(input = {}) {
   return {
     limit_5h: Number(p.limit_5h ?? p.safety_ratio ?? fallback.limit_5h),
     limit_7d: Number(p.limit_7d ?? p.weekly_safety_ratio ?? fallback.limit_7d),
+    gate: quotaGateOf(p),
   }
 }
 
@@ -374,7 +376,9 @@ export function evaluateAccount({
     })
   }
 
-  if (u5 >= pol.limit_5h) {
+  const z5 = gateZone(u5, pol.limit_5h, pol.gate)
+  const z7 = gateZone(u7, pol.limit_7d, pol.gate)
+  if (z5 === GATE_GATED) {
     return finish(base, {
       key: 'quota',
       text: '5h 限制',
@@ -385,7 +389,7 @@ export function evaluateAccount({
       until: resetUntilMs(w5.reset, now),
     })
   }
-  if (u7 >= pol.limit_7d) {
+  if (z7 === GATE_GATED) {
     return finish(base, {
       key: 'quota',
       text: '7d 限制',
@@ -449,6 +453,19 @@ export function evaluateAccount({
       })
     }
   }
+  // Near the gate: still admitted (one call at a time, no new seats while an open
+  // VM exists), but the console must not paint it as plain 可用.
+  const drainWindow = z5 === GATE_DRAINING ? '5h' : z7 === GATE_DRAINING ? '7d' : null
+  if (drainWindow) {
+    return finish(base, {
+      key: 'drain',
+      text: `${drainWindow} 临近闸线`,
+      accept: true,
+      usable: true,
+      reason: `gate_${drainWindow}_draining`,
+      window: drainWindow,
+    })
+  }
 
   return finish(base, {
     key: 'ok',
@@ -502,6 +519,14 @@ export function resolveScheduleState({
   }
   const until = Number(restrictionUntil) || Number(availability.until) || 0
   const liveRestriction = until > now
+  // Rest is a scheduled shift, not a cooldown: stale cooldown fields must not mask it.
+  if (!liveRestriction && availability.key === 'rest') {
+    return {
+      schedule_state: 'restricted',
+      restriction_reason: availability.reason || 'rest_period',
+      restriction_until: Number(availability.until) || null,
+    }
+  }
   const restricted = liveRestriction || availability.key === 'quota' || availability.key === 'cool'
   if (restricted) {
     return {
@@ -549,7 +574,7 @@ export function credStatusFromAvailability(av = {}) {
       ? 'ok'
       : key === 'quota' || key === 'warn'
         ? 'warn'
-        : key === 'cool' || key === 'caution'
+        : key === 'cool' || key === 'caution' || key === 'drain' || key === 'rest'
           ? 'caution'
           : key === 'off'
             ? 'off'
@@ -572,9 +597,11 @@ export function credStatusFromAvailability(av = {}) {
                 ? av.reason === 'auth_cooldown'
                   ? AUTH_COOLDOWN_TEXT
                   : '冷却中'
-                : av.reason === 'oauth_revoked'
-                  ? REVOKE_TEXT
-                  : INVALID_CREDENTIAL_TEXT)
+                : key === 'rest'
+                  ? '休息时段'
+                  : av.reason === 'oauth_revoked'
+                    ? REVOKE_TEXT
+                    : INVALID_CREDENTIAL_TEXT)
   return {
     key,
     text,

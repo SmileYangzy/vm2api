@@ -46,6 +46,8 @@ const PANEL_ROUTE_SAMPLES = [
   ['POST', '/api/panel/vms/vm-01/schedulable'],
   ['POST', '/api/panel/vms/vm-01/cooldown/clear'],
   ['POST', '/api/panel/vms/vm-01/circuit/reset'],
+  ['GET', '/api/panel/vms/vm-01/diagnose'],
+  ['POST', '/api/panel/vms/vm-01/recover'],
   ['POST', '/api/panel/vms/vm-01/reload'],
   ['POST', '/api/panel/vms/vm-01/collect-identity'],
   ['POST', '/api/panel/vms/vm-01/probe'],
@@ -68,6 +70,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['POST', '/api/panel/vms/vm-01/reset-fingerprint'],
   ['POST', '/api/panel/vms/vm-01/allocate-proxy'],
   ['POST', '/api/panel/vms/create'],
+  ['GET', '/api/panel/vms/create-options'],
   ['GET', '/api/panel/vms/vm-01/package'],
   ['PUT', '/api/panel/vms/vm-01/package'],
   ['POST', '/api/panel/vms/package'],
@@ -96,6 +99,10 @@ const PANEL_ROUTE_SAMPLES = [
   ['PUT', '/api/panel/model-policy'],
   ['POST', '/api/panel/model-policy/reset'],
   ['POST', '/api/panel/model-policy/sync-worker'],
+  ['GET', '/api/panel/pricing'],
+  ['PUT', '/api/panel/pricing/overrides'],
+  ['POST', '/api/panel/pricing/sync'],
+  ['POST', '/api/panel/pricing/reprice'],
   ['GET', '/api/panel/notify'],
   ['POST', '/api/panel/notify/check'],
   ['POST', '/api/panel/notify/test'],
@@ -167,4 +174,9 @@ test('settings save imports public routing notify helpers', () => {
     routes,
     /import\s*\{[^}]*publicNotifyConfig[^}]*publicRoutingNotify[^}]*\}\s*from\s*['"]\.\/notify\.mjs['"]/,
   )
+})
+
+test('PUT proxy restarts kin-egress when connection or domain_forward changes', () => {
+  const routes = fs.readFileSync(path.join(root, 'src/lib/admin/panel-routes.mjs'), 'utf8')
+  assert.match(routes, /result\.domain_forward_changed \|\| result\.connection_changed/)
 })

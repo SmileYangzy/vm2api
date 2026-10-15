@@ -19,6 +19,10 @@
     "warn_ratio": 0.75,
     "block_on_5h": true,
     "block_on_7d": true,
+    "critical_band": 0.05,
+    "gate_overshoot": 0.05,
+    "large_cold_uncached_tokens": 100000,
+    "guard_large_cold": true,
     "weekly_split": {
       "enabled": false,
       "fable_share": 0.5
@@ -79,7 +83,7 @@
     "same_account_retry_delay_ms": 500,
     "total_retry_deadline_ms": 120000,
     "stream_idle_timeout_ms": 180000,
-    "eager_tool_streaming": false
+    "eager_tool_streaming": true
   },
   "inference": {
     "engine": "rust",
@@ -88,6 +92,7 @@
   },
   "codex": {
     "enabled": true,
+    "catalog_client_version": "auto",
     "protocols": {
       "openai.responses": { "mode": "native", "enabled": true },
       "openai.chat": { "mode": "convert", "enabled": true },
@@ -135,7 +140,7 @@
   },
 
   "usage_probe": {
-    "enabled": true,
+    "enabled": false,
     "interval_sec": 60,
     "stale_sec": 300,
     "run_on_start": true,
@@ -143,7 +148,7 @@
     "timeout_ms": 60000
   },
   "health_probe": {
-    "enabled": true,
+    "enabled": false,
     "interval_sec": 600,
     "cache_ttl_sec": 900,
     "max_stale_sec": 900,
@@ -204,6 +209,26 @@
       "enabled": false,
       "bot_token": "",
       "chat_id": ""
+    },
+    "wecom": {
+      "enabled": false,
+      "webhook": "",
+      "mention_all": false
     }
+  },
+  "vm": {
+    "default_runtime": "docker",
+    "memory": "512m",
+    "vcpus": 2,
+    "disk_gb": 20,
+    "cpu_model": "host",
+    "smbios": {
+      "manufacturer": "Dell Inc.",
+      "product": "OptiPlex 7090",
+      "version": "1.0",
+      "family": "OptiPlex"
+    },
+    "mac_oui": "52:54:00",
+    "allow_tcg": false
   }
 }

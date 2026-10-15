@@ -1,3 +1,5 @@
+import type { WindowEstimate } from './panel-pricing'
+
 /**
  * 出站认证头方案。gateway 规范化后只有这两个值。
  *
@@ -57,6 +59,13 @@ export type VmProxySnap = {
   geo?: ProxyGeo | null
   /** 公网 IPv6 出口地理位置；从未检测过为 null。 */
   geo_v6?: ProxyGeo | null
+  /** 本地代理所在节点：池行是它那台 VPS（控制面为 null），槽位视图是槽所在节点。 */
+  node_id?: string | null
+  /**
+   * 节点显示名。Admin 本地代理槽位视图：控制面为 null，节点为标签。
+   * 字段出现即允许展示节点名；租户响应省略该字段。
+   */
+  node_name?: string | null
 }
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
@@ -109,12 +118,50 @@ export type VmCircuit = {
   open_ms: number
 }
 
+/** 槽位执行形态。缺省按 docker 展示。 */
+export type RuntimeType = 'docker' | 'kvm'
+
+/** `GET /cluster/local` 与 `GET /vms/create-options` 的 KVM 探测。 */
+export type KvmProbe = {
+  ok: boolean
+  accel: 'kvm' | 'tcg' | null
+  error: string | null
+}
+
+/** `GET /api/panel/vms/create-options` 剥壳后的 payload（`api()` 已拆 `data`）。 */
+export type VmCreateOptions = {
+  vm: unknown
+  kvm: KvmProbe
+}
+
+export type VmSmbios = {
+  manufacturer?: string
+  product?: string
+  version?: string
+  family?: string
+  serial?: string
+  uuid?: string
+}
+
+/** 创建时固化到槽位的机器规格。旧槽可能缺省。 */
+export type VmMachine = {
+  memory?: string
+  vcpus?: number
+  disk_gb?: number
+  cpu_model?: string
+  mac?: string
+  smbios?: VmSmbios
+  disk_serial?: string
+}
+
 export type Vm = {
   id: string
   name?: string
   owner_user_id?: string | null
   /** 所在集群节点；null / 缺省 = 本机。远端槽位不支持官方初装、wrap-cli、换内核等。 */
   node_id?: string | null
+  /** Admin-only cluster node label for `node_id`. Tenants never receive this. */
+  node_name?: string | null
   origin?: string | null
   email?: string
   status?: string
@@ -132,13 +179,14 @@ export type Vm = {
   auth_scheme?: string
   availability?: {
     /**
-     * 后端 `availability.mjs` 实际产出 6 种：
-     * `none` / `bad` / `off` / `quota` / `cool` / `ok`。
-     * 此前只声明了 5 种（含后端根本不返回的 `warn`/`caution`），
-     * 导致 `off` 被误归类、「关闭调用」筛选恒为空。
+     * 后端 `availability.mjs` 实际产出 8 种：
+     * `none` / `bad` / `off` / `quota` / `cool` / `drain` / `rest` / `ok`。
+     * `rest`：`policy.active_hours` 工作时段外，休息中不接单。
+     * `drain`：5h/7d 进入闸线前 `critical_band` 到闸线 + `gate_overshoot` 之间，
+     * 仍接单（一次一个），但不再是单纯的「可用」。
      * 注意 `off` 的 `usable` 为 false，判断顺序上必须先于 `!usable`。
      */
-    key: 'ok' | 'none' | 'bad' | 'off' | 'quota' | 'cool'
+    key: 'ok' | 'none' | 'bad' | 'off' | 'quota' | 'cool' | 'drain' | 'rest'
     usable: boolean
     text?: string
     reason?: string
@@ -220,6 +268,11 @@ export type Vm = {
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
   kernel?: string
+  /** docker | kvm。缺省按 docker 展示。 */
+  runtime_type?: RuntimeType | null
+  /** 创建时固化的机器规格；旧槽可能缺省。 */
+  machine?: VmMachine | null
+
   region?: string
   /** 槽位环境时区（容器 `TZ` + persona `# Environment`）。 */
   timezone?: string | null
@@ -261,6 +314,12 @@ export type Vm = {
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
+  active_hours?: VmActiveHours | null
+  /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */
+  active_hours_timezone?: string | null
+  /** 此刻是否在工作时段内；未设时段为 null。独立于 availability（它可能被冷却/额度盖住）。 */
+  active_hours_active?: boolean | null
   rpm?: number
   /** 同等级权重（只用于 Codex 选槽；Claude 预调度不看），不是调度等级。 */
   weight?: number
@@ -280,6 +339,8 @@ export type Vm = {
   today_cache_read_tokens?: number
   today_cache_creation_tokens?: number
   total_cost?: number
+  /** 累计 token（含缓存），与 total_cost 同源。 */
+  total_tokens?: number
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
@@ -345,6 +406,10 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  window_fable_cost?: number
+  estimate_5h?: WindowEstimate
+  estimate_7d?: WindowEstimate
+  estimate_fable?: WindowEstimate | null
   [key: string]: unknown
 }
 
@@ -370,11 +435,31 @@ export type PoolSeatLive = {
   seats_grace: number
   queue_depth: number
   conc_waiting: number
+  /** 正在这台 VM 上执行的请求数（含无席位探测与 pin）。 */
+  inflight?: number
 }
 
 /** `GET /api/panel/pool/stream` 的 `event: seats` 负载。 */
 export type PoolSeatSnapshot = PoolQueueSummary & {
   seats: Record<string, PoolSeatLive>
+  ts: number
+}
+
+/** 单台 VM 绑定的 SOCKS5 实时健康，随每次探测推送。 */
+export type PoolProxyLive = Pick<
+  VmProxySnap,
+  | 'id'
+  | 'status'
+  | 'enabled'
+  | 'blocked_reason'
+  | 'latency_ms'
+  | 'last_error'
+  | 'last_probe_at'
+>
+
+/** `GET /api/panel/pool/stream` 的 `event: proxy` 负载；键为 VM id。 */
+export type PoolProxySnapshot = {
+  proxies: Record<string, PoolProxyLive>
   ts: number
 }
 
@@ -513,6 +598,18 @@ export type VmQuotaView = {
 }
 
 export type VmQuotaOverride = Partial<VmQuotaView>
+
+/** 单槽工作时段（`vm.policy.active_hours`）。start 晚于 end = 跨夜班次。 */
+export type VmActiveHours = {
+  /** 本地 'HH:MM' 开工时间。 */
+  start: string
+  /** 本地 'HH:MM' 收工时间；与 start 不允许相同。 */
+  end: string
+  /** IANA 时区钉住值；缺省跟随槽位时区（代理出口时区）。 */
+  timezone?: string
+  /** 允许窗口开始的星期，0 = 周日；缺省 = 每天。 */
+  days?: number[]
+}
 
 /** VM 并发 / RPM / 席位上限跟随时的取值：并发与 RPM 来自分档，席位来自 `inference.session_slots`。 */
 export type VmSchedulingInherited = {

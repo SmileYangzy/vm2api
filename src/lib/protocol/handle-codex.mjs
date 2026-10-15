@@ -19,12 +19,13 @@ import {
   toCodexResponses,
 } from './codex-convert.mjs'
 import { extraFromCodexHeaders, codexQuotaPark, CODEX_DEFAULT_PARK_MS } from './codex-usage.mjs'
-import { extractOpenaiUsage } from './openai-usage.mjs'
+import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, disjointOpenaiUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
 import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
   CODEX_CATALOG_ORIGINATOR,
@@ -40,7 +41,7 @@ import {
   waitForOpenAICapacity,
   wakeOpenAIWaiter,
 } from '../pool/openai-account-runtime.mjs'
-import { CLIENT_POOL_BUSY_MESSAGE } from '../core/errors.mjs'
+import { CLIENT_POOL_BUSY_MESSAGE, CLIENT_POOL_UNAVAILABLE_MESSAGE, ErrorCode } from '../core/errors.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { sessionIdForLog } from './log-fields.mjs'
 import { redactHeaders } from '../admin/request-log.mjs'
@@ -199,13 +200,15 @@ export function pickCodexCandidates(
     excluded,
     quotaPolicy: routingPolicy,
   })
-  if (bound?.vmId && sessionKey && ordered.boundState === 'gone') {
+  // A resting home migrates the conversation like a gone one: the next slot rebinds it.
+  const boundLeft = ordered.boundState === 'gone' || ordered.boundState === 'resting'
+  if (bound?.vmId && sessionKey && boundLeft) {
     for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
     try {
       sessions?.drop?.(bound.vmId, sessionKey)
     } catch {}
   }
-  if (continuesResponse && (ordered.boundState === 'gone' || ordered.error === 'candidates_exhausted')) {
+  if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
   }
   return { ...ordered, sessionKey, stickyKeys }
@@ -350,7 +353,49 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent } = {}) {
+// Observed with gpt-6-astra + Responses Lite, not a documented upstream limit.
+// Keep the model gate tight until another Lite model shows the same 128 KiB failure.
+// Retry only a failed full-history attempt, keeping the newest reasoning suffix.
+export function reasoningHistoryFallback(args, result) {
+  if (process.env.KIN_CODEX_REASONING_HISTORY_FALLBACK === '0') return null
+  const body = args.body
+  const error = result?.body?.error || result?.body?.response?.error
+  if (result?.ok || result?.committed || result?.transportError || args.signal?.aborted) return null
+  if (![500, 502].includes(Number(result?.status)) || error?.code !== 'server_error') return null
+  if (body?.model !== 'gpt-6-astra' || body?.reasoning?.context !== 'all_turns' || !Array.isArray(body.input))
+    return null
+  if (String(args.envelope?.headers?.['x-openai-internal-codex-responses-lite']).toLowerCase() !== 'true') return null
+  if (body.previous_response_id || args.envelope?.session?.previous_response_id) return null
+  const encrypted = (item) =>
+    item?.type === 'reasoning' && typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0
+  const history = body.input.filter(encrypted)
+  const originalBytes = Buffer.byteLength(JSON.stringify(history.map((item) => item.encrypted_content)))
+  if (originalBytes <= 128 * 1024) return null
+  let retainedBytes = 2
+  const keep = new Set()
+  for (let i = body.input.length - 1; i >= 0; i--) {
+    const item = body.input[i]
+    if (!encrypted(item)) continue
+    const bytes = Buffer.byteLength(JSON.stringify(item.encrypted_content)) + (keep.size ? 1 : 0)
+    if (retainedBytes + bytes > 120 * 1024) break
+    retainedBytes += bytes
+    keep.add(i)
+  }
+  if (!keep.size || keep.size === history.length) return null
+  const nextBody = { ...body, input: body.input.filter((item, i) => !encrypted(item) || keep.has(i)) }
+  return {
+    args: { ...args, body: nextBody, envelope: { ...args.envelope, body: nextBody } },
+    info: {
+      original_array_bytes: originalBytes,
+      retained_array_bytes: retainedBytes,
+      original_items: history.length,
+      retained_items: keep.size,
+      omitted_items: history.length - keep.size,
+    },
+  }
+}
+
+export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback } = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
@@ -359,6 +404,17 @@ export async function runCodexKernelHop({ hop, args = {}, onEvent } = {}) {
   let result = await hop({ ...args, onEvent: wrapped })
   if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
     result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
+  }
+  const fallback = !emitted && !result?.transport_retried ? reasoningHistoryFallback(args, result) : null
+  if (fallback) {
+    if (onReasoningFallback)
+      await onReasoningFallback({ originalResult: result, body: fallback.args.body, ...fallback.info })
+    if (args.signal?.aborted) return result
+    result = {
+      ...(await hop({ ...fallback.args, onEvent: wrapped })),
+      reasoning_history_retried: true,
+      reasoning_history_fallback: fallback.info,
+    }
   }
   return result
 }
@@ -380,6 +436,8 @@ export async function handleCodexProtocol({
   sessions = null,
   body = null,
   captureOutbound = false,
+  requestStartedAt = Date.now(),
+  accountGate = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -486,6 +544,16 @@ export async function handleCodexProtocol({
         stats.requests++
         stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
       }
+      // The slot is known here, so an account scope can be applied. `true`
+      // means the 403 is already written.
+      if (accountGate) {
+        logBag.vm_id = vm.id
+        const blocked = await accountGate(scopeAccountFromVm(vm))
+        if (blocked) {
+          lease.release()
+          return
+        }
+      }
       const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
       const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
       // The home (or first placement) owns the conversation window; a borrowed
@@ -516,6 +584,7 @@ export async function handleCodexProtocol({
         writeCfg(projectRoot, vm, {
           proxyUrl: boundProxyUrl(vm.proxy),
           proxyRequired: true,
+          routing,
         })
         const ready = await ensure(execFor(projectRoot, vm))
         if (!ready?.ok) {
@@ -577,6 +646,7 @@ export async function handleCodexProtocol({
           hop,
           args: {
             exec: execFor(projectRoot, vm),
+            signal: gone.signal,
             body: outboundBody,
             reqHeaders: req.headers,
             envelope: {
@@ -585,6 +655,9 @@ export async function handleCodexProtocol({
               stream: true,
               session,
             },
+          },
+          onReasoningFallback: ({ body: retryBody }) => {
+            if (captureOutbound) logBag.outbound_body = retryBody
           },
           onEvent: async (line) => {
             if (conversionError) return
@@ -619,6 +692,10 @@ export async function handleCodexProtocol({
             if (named) res.write(named)
           },
         })
+        // The log and total duration share ingress time; pool scoring keeps hop TTFT.
+        logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
+          ? Math.max(0, result.firstTokenAt - requestStartedAt)
+          : (result?.ttftMs ?? null)
         if (conversionError) {
           result.ok = false
           result.status = 502
@@ -627,6 +704,10 @@ export async function handleCodexProtocol({
         }
         ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
         if (result?.transport_retried) logBag.transport_retried = true
+        if (result?.reasoning_history_retried) {
+          logBag.attempt_count += 1
+          logBag.reasoning_history_retried = true
+        }
         last = result
         const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
         const usage = preferUsage(hopUsage, streamedUsage)
@@ -638,17 +719,23 @@ export async function handleCodexProtocol({
           bindSticky(outboundSessionId)
           const extracted = extractOpenaiUsage(usage)
           const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
-          logBag.usage = usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage
-          logBag.input_tokens = extracted?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
-          logBag.output_tokens = extracted?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
+          const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
+          const logged = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
+          logBag.usage = logged
+          logBag.input_tokens = disjoint?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
+          logBag.output_tokens = disjoint?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
           logBag.cache_read_tokens =
-            extracted?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
+            disjoint?.cache_read_input_tokens ??
+            extracted?.cached_tokens ??
+            usage?.input_tokens_details?.cached_tokens ??
+            usage?.cache_read_tokens ??
+            null
           logBag.cache_creation_tokens =
+            disjoint?.cache_creation_input_tokens ??
             extracted?.cache_write_tokens ??
             usage?.input_tokens_details?.cache_write_tokens ??
             usage?.cache_creation_tokens ??
             null
-          logBag.first_token_ms = result.ttftMs ?? null
           reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
           logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
           logBag.upstream_model = converted.body.model
@@ -771,6 +858,19 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
         code: 'pool_overloaded',
         message: CLIENT_POOL_BUSY_MESSAGE,
         details: { reason: picked.error },
+      },
+    })
+  }
+  if (picked.error === 'pool_resting') {
+    // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
+    const waitMs = Number(picked.retryAt) - Date.now()
+    res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
+    return json(res, 503, {
+      error: {
+        type: 'api_error',
+        code: ErrorCode.POOL_UNAVAILABLE,
+        message: CLIENT_POOL_UNAVAILABLE_MESSAGE,
+        details: { reason: 'pool_resting' },
       },
     })
   }

@@ -62,7 +62,8 @@ const FAILOVER_DEFAULTS = {
   same_account_retry_max_hop_ms: 10000,
   signature_repair: false,
   stream_idle_timeout_ms: 180000,
-  eager_tool_streaming: false,
+  max_request_mib: 32,
+  eager_tool_streaming: true,
 }
 
 function numOf(source: Obj, key: string, fallback: number): number {
@@ -527,7 +528,16 @@ export function PoolPane({
         signature_repair: failoverDraft.signature_repair,
         delivery_mode: failoverDraft.delivery_mode,
         stream_idle_timeout_ms: failoverDraft.stream_idle_timeout_ms,
-        eager_tool_streaming: failoverDraft.eager_tool_streaming,
+        ...(Number.isFinite(Number(failoverDraft.max_request_mib))
+          ? {
+              max_request_mib: numOf(
+                failoverDraft,
+                'max_request_mib',
+                FAILOVER_DEFAULTS.max_request_mib
+              ),
+            }
+          : {}),
+        eager_tool_streaming: failoverDraft.eager_tool_streaming !== false,
       })
     } else {
       onPoolChange({
@@ -878,20 +888,40 @@ export function PoolPane({
                     })
                   }
                 />
+                <SliderSetting
+                  id='failover-max-request'
+                  label='请求体上限'
+                  desc='入站请求超过此大小返回 413。未设置时槽内 kernel 仍是 32 MiB；保存后各槽 kernel 会在没有请求时自动重启以应用新值。网关不会放行超过 KIN_MAX_BODY 的请求。'
+                  value={numOf(
+                    failoverDraft,
+                    'max_request_mib',
+                    FAILOVER_DEFAULTS.max_request_mib
+                  )}
+                  min={8}
+                  max={128}
+                  step={8}
+                  format={(value) => `${value} MiB`}
+                  fallback={FAILOVER_DEFAULTS.max_request_mib}
+                  presets={[32, 64, 128]}
+                  onChange={(value) =>
+                    updateDraft('failover', { max_request_mib: value })
+                  }
+                />
                 <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
                   <div>
                     <Label htmlFor='failover-eager-tool-streaming'>
                       工具参数流式下发
                     </Label>
                     <p className='text-xs leading-5 text-muted-foreground'>
-                      给所有自定义工具加 eager_input_streaming（官方 Claude Code
+                      默认开启。给所有自定义工具加 eager_input_streaming（官方
+                      Claude Code
                       直连官方地址并开启细粒度工具流式时的形态），大文件 Write
-                      内容边生成边下发，不再长时间静默。经中转的客户端本身不带此字段；客户端自带的设置优先。
+                      内容边生成边下发，避免经中转时长静默触发空闲超时。显式关闭后恢复整段缓冲；客户端自带的布尔值优先。
                     </p>
                   </div>
                   <Switch
                     id='failover-eager-tool-streaming'
-                    checked={failoverDraft.eager_tool_streaming === true}
+                    checked={failoverDraft.eager_tool_streaming !== false}
                     onCheckedChange={(value) =>
                       updateDraft('failover', { eager_tool_streaming: value })
                     }

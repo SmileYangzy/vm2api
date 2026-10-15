@@ -151,13 +151,12 @@ test('muting follows RequestLogStore: settings default, explicit list, include_m
   assert.deepEqual(classes(settings, { exclude_error_class: 'quota' }), ['auth', 'ok'])
 })
 
-test('summary cache hit rate counts Claude writes and keeps Codex input inclusive on both summary paths', () => {
+test('summary cache hit rate counts Claude writes and Codex disjoint input on both summary paths', () => {
   const db = freshDb()
   seed(db, [
     { input_tokens: 20, cache_read_tokens: 80_000, cache_creation_tokens: 20_000 },
-    { via: 'codex-kernel', model: 'gpt-5.4', input_tokens: 100, cache_read_tokens: 80 },
+    { via: 'codex-kernel', model: 'gpt-5.4', input_tokens: 20, cache_read_tokens: 80 },
   ])
-  // Claude prompt 100020 + Codex prompt 100 (cached already inside input).
   const want = 80_080 / 100_120
   const sqlPath = new UsageLogsView(db).summary({})
   const scanPath = new UsageLogsView(db, { mutedErrorClasses: ['auth', 'quota'] }).summary({})
@@ -376,4 +375,31 @@ test('active sessions never resolve the last row from another tenant sharing the
   assert.equal(s.keyName, 'alice-key')
   assert.equal(s.vmId, 'vm-a')
   assert.equal(s.lastStatus, 200)
+})
+
+test('tenant error collection hides other users and anonymous ingress failures', () => {
+  const db = freshDb()
+  seed(db, [
+    {
+      user_id: 'u2',
+      api_key_id: 'k2',
+      vm_id: null,
+      ip: '198.51.100.7',
+      status: 403,
+      error_code: 'distill_blocked',
+      error_message: '不允许蒸馏: secret prompt',
+    },
+    { vm_id: null, ip: '203.0.113.9', status: 401, error_code: 'invalid_api_key', api_key_presented: 'sk-bad' },
+    { user_id: 'u1', api_key_id: 'k1', status: 500, error_code: 'upstream_error', error_message: 'boom' },
+  ])
+  const repo = new UsageLogsRepo(db)
+  const mine = repo.windowStats({ owner_user_id: 'u1' }).error_collection
+  assert.deepEqual(
+    mine.recent.map((r) => r.error_code),
+    ['upstream_error'],
+  )
+  assert.deepEqual(mine.ingress_hits, [])
+  const all = repo.windowStats().error_collection
+  assert.equal(all.recent.length, 3)
+  assert.deepEqual(all.ingress_hits.map((h) => h.ip).sort(), ['198.51.100.7', '203.0.113.9'])
 })

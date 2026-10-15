@@ -1,3 +1,4 @@
+import '../fixtures/kin-computer-test-env.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -37,6 +38,7 @@ function claudePackage(id, token = 'sk-ant-oat01-PACKAGE') {
         rpmOverride: true,
         weight: 4,
         inflight: 9,
+        active_hours: { start: '20:00', end: '08:00', timezone: 'asia/tokyo', days: [5, 1] },
       },
       claude: { auth_scheme: 'authorization_bearer', mode: 'oauth' },
       stats: { requests: 40 },
@@ -103,7 +105,30 @@ test('package keeps traits, SOCKS password and token, and drops runtime', () => 
   assert.equal(parsed.ok, true, parsed.error?.message)
   assert.equal(parsed.value.proxy.password, 's3cret')
   assert.equal(parsed.value.vm.policy.maxConcurrency, 3)
+  assert.deepEqual(parsed.value.vm.policy.active_hours, {
+    start: '20:00',
+    end: '08:00',
+    timezone: 'Asia/Tokyo',
+    days: [1, 5],
+  })
   assert.equal(parsed.value.vm.persona_preset, 'official')
+})
+
+test('package export keeps a window whose stored fields are partly invalid', () => {
+  const doc = buildVmPackage({
+    vm: {
+      id: 'vm-loose',
+      platform: 'anthropic',
+      family: 'claude',
+      policy: { active_hours: { start: '08:00', end: '22:00', days: [], timezone: 'Bad/Zone' } },
+    },
+  })
+  assert.deepEqual(doc.vm.policy.active_hours, { start: '08:00', end: '22:00' })
+  const plain = buildVmPackage({ vm: { id: 'vm-plain', platform: 'anthropic', family: 'claude', policy: {} } })
+  assert.equal(plain.vm.policy.active_hours, null)
+  const parsed = parseVmPackage(plain)
+  assert.equal(parsed.ok, true, parsed.error?.message)
+  assert.equal(parsed.value.vm.policy.active_hours, null)
 })
 
 test('import creates the slot and rolls a colliding id forward', async (t) => {
@@ -120,11 +145,13 @@ test('import creates the slot and rolls a colliding id forward', async (t) => {
   assert.equal(saved.name, 'finished')
   assert.equal(saved.timezone, 'Asia/Tokyo')
   assert.equal(saved.persona_preset, 'official')
+  assert.equal(saved.runtime.type, 'docker')
+  assert.equal(saved.machine.memory, '512m')
   assert.equal(saved.policy.maxConcurrency, 3)
-  assert.equal(saved.policy.inflight, 0)
   assert.equal(saved.stats.requests, undefined)
   assert.equal(saved.proxy.host, '10.2.2.2')
   assert.equal(saved.proxy.password, 's3cret')
+  assert.equal(saved.proxy_cli_enabled, true)
   assert.equal(saved.claude.access_token, undefined)
   const cred = readWorkerCredentialFile(path.join(root, 'vms', 'vm-pkg', 'cli-home'))
   assert.equal(cred.access_token, 'sk-ant-oat01-PACKAGE')
@@ -185,6 +212,7 @@ test('local egress imports as px-local and codex tokens stay out of vm.json', as
   assert.equal(localRes.response.status, 201, localRes.response.body?.error?.message)
   const localVm = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-local.json'), 'utf8'))
   assert.equal(isLocalEgressProxy(localVm.proxy), true)
+  assert.equal(localVm.proxy_cli_enabled, true)
 
   const codex = {
     type: 'vm2api-vm-package',
