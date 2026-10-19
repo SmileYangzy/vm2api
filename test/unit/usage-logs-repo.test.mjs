@@ -21,6 +21,13 @@ function freshDb() {
   return { dir, db, repo: new UsageLogsRepo(db) }
 }
 
+function storedDebugBytes(db) {
+  return db
+    .prepare('SELECT record_json FROM request_log_debug')
+    .all()
+    .reduce((sum, row) => sum + Buffer.byteLength(row.record_json, 'utf8'), 0)
+}
+
 function seed(repo, rows) {
   for (const r of rows) {
     seq++
@@ -43,6 +50,61 @@ function assertHit(stats, prompt, read, label) {
   assert.equal(Number(stats.cache_read_tokens), read, `${label} cache_read_tokens`)
   assert.equal(stats.cache_hit_rate, prompt > 0 ? read / prompt : null, `${label} cache_hit_rate`)
 }
+
+test('debugBytes counts stored JSON bytes for empty, ASCII, and UTF-8 records', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    assert.equal(storedDebugBytes(db), 0)
+    assert.equal(repo.debugBytes(), 0)
+
+    const records = [{ body: 'ascii' }, { body: '中🙂' }, { body: 'line\nquote"' }]
+    records.forEach((record, i) => {
+      repo.insertDebug(`debug-${i}`, `2026-10-15T21:00:0${i}.000Z`, record)
+    })
+
+    const expected = records.reduce((sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8'), 0)
+    assert.equal(storedDebugBytes(db), expected)
+    assert.equal(repo.debugBytes(), expected)
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('trimDebugToMaxBytes removes oldest UTF-8 records until actual bytes fit', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const record = { body: '中'.repeat(10) }
+    const serialized = JSON.stringify(record)
+    const maxBytes = 164
+    for (let i = 0; i < 5; i++) {
+      repo.insertDebug(`debug-${i}`, `2026-10-15T21:00:0${i}.000Z`, record)
+    }
+
+    const before = db.prepare('SELECT record_json FROM request_log_debug').all()
+    const characterCount = before.reduce((sum, row) => sum + row.record_json.length, 0)
+    assert.equal(characterCount, serialized.length * 5)
+    assert.ok(characterCount < maxBytes)
+    assert.ok(storedDebugBytes(db) > maxBytes)
+
+    const originalIds = db
+      .prepare('SELECT request_id FROM request_log_debug ORDER BY ts ASC')
+      .all()
+      .map((row) => row.request_id)
+    const deleted = repo.trimDebugToMaxBytes(maxBytes)
+    assert.ok(deleted > 0 && deleted < originalIds.length)
+    const remaining = db.prepare('SELECT request_id FROM request_log_debug ORDER BY ts ASC').all()
+    const remainingIds = remaining.map((row) => row.request_id)
+    assert.equal(remainingIds.length, originalIds.length - deleted)
+    assert.deepEqual(remainingIds, originalIds.slice(deleted))
+    assert.equal(remainingIds.at(-1), originalIds.at(-1))
+    assert.ok(storedDebugBytes(db) <= maxBytes)
+    assert.equal(repo.debugBytes(), storedDebugBytes(db))
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('mixed Claude/Codex usage keeps a row-wise prompt denominator on totals and windows', () => {
   const { db, repo } = freshDb()
@@ -92,6 +154,52 @@ test('empty usage windows keep a null cache hit rate', () => {
     const empty = repo.windowStats({ since: '2099-01-01T00:00:00.000Z' })
     assert.equal(empty.requests, 0)
     assertHit(empty, 0, 0, 'empty window')
+  } finally {
+    db.close()
+  }
+})
+
+test('billingStats reuses identical panel snapshots but separates account windows', () => {
+  const { db, repo } = freshDb()
+  try {
+    let computes = 0
+    const compute = repo._computeBillingStats.bind(repo)
+    repo._computeBillingStats = (opts) => {
+      computes++
+      return compute(opts)
+    }
+
+    const winA = [{ account_id: 'acc-1', vm_id: 'vm-a', reset_5h: '2026-10-19T05:00:00.000Z' }]
+    const winAReordered = [{ vm_id: 'vm-a', reset_5h: '2026-10-19T05:00:00.000Z', account_id: 'acc-1' }]
+    const winB = [{ account_id: 'acc-1', vm_id: 'vm-a', reset_5h: '2026-10-19T06:00:00.000Z' }]
+
+    assert.equal(repo.billingStats({ accountWindows: winA }), repo.billingStats({ accountWindows: winAReordered }))
+    assert.equal(computes, 1)
+    repo.billingStats({ accountWindows: winB })
+    assert.equal(computes, 2)
+
+    // Explicit historical snapshots are deterministic test/report calls and must
+    // not be served from the live panel cache.
+    repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
+    repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
+    assert.equal(computes, 4)
+  } finally {
+    db.close()
+  }
+})
+
+test('billingStats rate-limits maintenance backfill independently of cache keys', () => {
+  const { db, repo } = freshDb()
+  try {
+    let backfills = 0
+    repo.backfillMissingCosts = () => {
+      backfills++
+      return 0
+    }
+    repo.billingStats()
+    repo.billingStats({ accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-a' }] })
+    repo.billingStats({ accountWindows: [{ account_id: 'acc-2', vm_id: 'vm-a' }] })
+    assert.equal(backfills, 1)
   } finally {
     db.close()
   }
