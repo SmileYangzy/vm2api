@@ -175,8 +175,11 @@ export function alignSamplingWithThinking(body = {}) {
  * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
  * signed chain, including later valid thinking and redacted_thinking. Turns
  * left with no content are dropped. redacted_thinking stays when it carries
- * data on 5.5, otherwise when its signature is usable. The preserve path is
- * unchanged.
+ * data on 5.5, otherwise when its signature is usable. The preserve path
+ * (cli-hop first hop, default HTTP hop) skips the chain rule and keeps a
+ * signed block as-is, empty text and redacted_thinking included. A thinking
+ * block without a usable signature (missing, empty, shorter than 24, dummy)
+ * is dropped instead of forwarded with an empty signature.
  */
 export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
@@ -194,12 +197,11 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
         if ((keepSigned || preserveThinkingBlocks) && message.role === 'assistant') {
           // Omitted thinking keeps empty text; redacted thinking keeps encrypted data.
           if (preserveThinkingBlocks) {
-            if (type === 'thinking' && !Object.hasOwn(block, 'signature')) {
+            if (type === 'redacted_thinking' || hasUsableThinkingSignature(block.signature)) {
+              content.push(block)
+            } else {
               changed = true
               filteredThis = true
-              content.push({ ...block, signature: '' })
-            } else {
-              content.push(block)
             }
             continue
           }
@@ -243,6 +245,39 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
   return dropEmptySystemControlTurns({ ...body, messages: mergeConsecutiveAnthropicMessages(withoutEmpty) })
 }
 
+/**
+ * Rewrite history thinking / redacted_thinking blocks: `map(block, message)`
+ * returns the block to keep it, a replacement block, or null to drop it;
+ * every other block of the turn stays. A turn left empty goes and its
+ * neighbours merge. Returns the body unchanged when nothing changed.
+ * @returns {{ body: object, changed: number }}
+ */
+export function mapThinkingBlocks(body = {}, map = () => null) {
+  if (!Array.isArray(body?.messages)) return { body, changed: 0 }
+  let changed = 0
+  const messages = body.messages.map((message) => {
+    if (!Array.isArray(message?.content)) return message
+    let touched = false
+    const content = []
+    for (const block of message.content) {
+      const type = block?.type
+      const next = type === 'thinking' || type === 'redacted_thinking' ? map(block, message) : block
+      if (next === block) {
+        content.push(block)
+        continue
+      }
+      touched = true
+      changed += 1
+      if (next) content.push(next)
+    }
+    return touched ? { ...message, content } : message
+  })
+  if (!changed) return { body, changed }
+  const withoutEmpty = messages.filter(
+    (message) => !anthropicContentIsEmpty(message?.content) || messageHasTurnControls(message),
+  )
+  return { body: { ...body, messages: mergeConsecutiveAnthropicMessages(withoutEmpty) }, changed }
+}
 export const CONTEXT_MANAGEMENT_BETA = 'context-management-2025-06-27'
 export const PROMPT_CACHING_SCOPE_BETA = 'prompt-caching-scope-2026-01-05'
 export const MID_CONVERSATION_SYSTEM_BETA = 'mid-conversation-system-2026-04-07'
@@ -427,40 +462,77 @@ export function prepareAnthropicRequest(
   return out
 }
 
-function safeToolName(name, used) {
+function allocateToolName(name, used, { rewrite = true } = {}) {
   const original = String(name || '')
-  if (TOOL_NAME.test(original) && !used.has(original)) {
+  const legal = TOOL_NAME.test(original)
+  if ((!rewrite || legal) && legal && !used.has(original)) {
     used.add(original)
     return original
   }
   const digest = crypto.createHash('sha256').update(original).digest('hex').slice(0, 16)
   let candidate = `kin_tool_${digest}`
   let suffix = 1
-  while (used.has(candidate)) {
+  while (used.has(candidate) || !TOOL_NAME.test(candidate)) {
     candidate = `kin_tool_${digest}_${suffix++}`
   }
   used.add(candidate)
   return candidate
 }
+function rejectToolNames(message) {
+  const error = new Error(message)
+  error.status = 400
+  error.body = { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_tool_name', message } }
+  throw error
+}
+
+function canonicalServerTools(tools) {
+  const seen = new Map()
+  const kept = []
+  for (const tool of tools) {
+    if (!isAnthropicServerTool(tool)) {
+      kept.push(tool)
+      continue
+    }
+    const name = String(tool?.name || '')
+    if (!TOOL_NAME.test(name)) rejectToolNames(`Server tool name '${name}' is not valid.`)
+    const previous = seen.get(name)
+    if (!previous) {
+      seen.set(name, tool)
+      kept.push(tool)
+      continue
+    }
+    if (JSON.stringify(previous) !== JSON.stringify(tool)) {
+      rejectToolNames(`Server tool '${name}' is declared more than once with different options.`)
+    }
+  }
+  return kept
+}
 
 export function rewriteToolNames(body = {}, { enabled = true } = {}) {
-  if (!enabled || !Array.isArray(body.tools) || body.tools.length === 0) {
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
     return { body, reverse: {} }
   }
   const out = clone(body)
   const used = new Set()
-  const forward = {}
+  out.tools = canonicalServerTools(out.tools)
+  for (const tool of out.tools) {
+    if (isAnthropicServerTool(tool)) used.add(String(tool.name))
+  }
   const reverse = {}
+  const declarations = new Map()
   out.tools = out.tools.map((tool) => {
     if (isAnthropicServerTool(tool)) return tool
     const original = String(tool?.name || '')
-    const rewritten = safeToolName(original, used)
-    forward[original] = rewritten
+    const rewritten = allocateToolName(original, used, { rewrite: enabled })
+    const queue = declarations.get(original) || []
+    queue.push(rewritten)
+    declarations.set(original, queue)
     reverse[rewritten] = original
     return { ...tool, name: rewritten }
   })
-  if (out.tool_choice?.name && forward[out.tool_choice.name]) {
-    out.tool_choice = { ...out.tool_choice, name: forward[out.tool_choice.name] }
+  const canonical = new Map([...declarations].map(([original, names]) => [original, names[0]]))
+  if (out.tool_choice?.name && canonical.has(out.tool_choice.name)) {
+    out.tool_choice = { ...out.tool_choice, name: canonical.get(out.tool_choice.name) }
   }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
@@ -468,8 +540,8 @@ export function rewriteToolNames(body = {}, { enabled = true } = {}) {
       return {
         ...message,
         content: message.content.map((block) => {
-          if (block?.type === 'tool_use' && forward[block.name]) {
-            return { ...block, name: forward[block.name] }
+          if (block?.type === 'tool_use' && canonical.has(block.name)) {
+            return { ...block, name: canonical.get(block.name) }
           }
           return block
         }),

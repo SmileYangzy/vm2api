@@ -156,6 +156,9 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
   ]
   return {
     add: [
+      // Fail closed even while the helper starts or the NAT chain is rebuilt.
+      ['-t', 'filter', '-C', 'FORWARD', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
+      ['-t', 'filter', '-I', 'FORWARD', '1', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
       ['-t', 'nat', '-N', chain],
       ['-t', 'nat', '-C', 'PREROUTING', '-i', bridge, '-j', chain],
       ['-t', 'nat', '-A', 'PREROUTING', '-i', bridge, '-j', chain],
@@ -168,8 +171,6 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
         ['-t', 'filter', '-C', 'INPUT', ...rule],
         ['-t', 'filter', '-I', 'INPUT', '1', ...rule],
       ]),
-      ['-t', 'filter', '-C', 'FORWARD', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
-      ['-t', 'filter', '-I', 'FORWARD', '1', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
     ],
     del: [
       ['-t', 'nat', '-D', 'PREROUTING', '-i', bridge, '-j', chain],
@@ -181,9 +182,16 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
   }
 }
 
+function commandPrefix(name) {
+  const raw = String(process.env.KIN_EGRESS_CMD_PREFIX || '').trim()
+  if (!raw || !['ss', 'iptables'].includes(name)) return []
+  return raw.split(/\s+/).filter(Boolean)
+}
+
 function sh(argv, { timeout = 15_000 } = {}) {
+  const command = [...commandPrefix(argv[0]), ...argv]
   try {
-    const out = execFileSync(argv[0], argv.slice(1), {
+    const out = execFileSync(command[0], command.slice(1), {
       encoding: 'utf8',
       timeout,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -216,23 +224,17 @@ export function egressPidActive(pid) {
   return pidAlive(pid)
 }
 
+function pidNamespaceCommand(args) {
+  const prefix = commandPrefix('ss')
+  if (!prefix.length) return args
+  return ['docker', 'run', '--rm', '--network', 'host', '--pid', 'host', '--privileged', 'nicolaka/netshoot', ...args]
+}
+
 function pidAlive(pid) {
   const n = Number(pid)
   if (!Number.isInteger(n) || n <= 0) return false
-  try {
-    process.kill(n, 0)
-  } catch {
-    return false
-  }
-  if (process.platform === 'linux') {
-    try {
-      const state = fs.readFileSync(`/proc/${n}/stat`, 'utf8').split(' ')[2]
-      if (state === 'Z') return false
-    } catch {
-      return false
-    }
-  }
-  return true
+  const probe = pidNamespaceCommand(['sh', '-c', `kill -0 ${n} 2>/dev/null`])
+  return sh(probe).ok
 }
 
 function readPid(file) {
@@ -243,22 +245,68 @@ function readPid(file) {
   }
 }
 
+function processText(pid, file) {
+  const probe = pidNamespaceCommand(['sh', '-c', `cat /proc/${Number(pid)}/${file} 2>/dev/null`])
+  const result = sh(probe)
+  return result.ok ? result.stdout : ''
+}
+
+function listenerPid(port) {
+  const probe = sh(['ss', '-H', '-ltnp', `sport = :${Number(port)}`], { timeout: 2000 })
+  const match = probe.stdout.match(/pid=(\d+)/)
+  return match ? Number(match[1]) : 0
+}
+
 function ownsEgressProcess(pid, configPath) {
   if (!pidAlive(pid)) return false
+  const args = processText(pid, 'cmdline').split('\0').filter(Boolean)
+  const configIndex = args.indexOf('-config')
+  if (configIndex < 0 || !args[configIndex + 1]) return false
+  const command = args.find((arg) => path.basename(String(arg || '')).startsWith('kin-egress'))
+  if (!command) return false
+  const argument = args[configIndex + 1]
+  return (
+    path.basename(argument) === path.basename(configPath) && argument.includes(path.basename(path.dirname(configPath)))
+  )
+}
+
+function egressProcessPids() {
+  const probe = pidNamespaceCommand([
+    'sh',
+    '-c',
+    'for dir in /proc/[1-9]*; do tr "\\0" " " < "$dir/cmdline" 2>/dev/null | grep -q kin-egress && basename "$dir"; done',
+  ])
+  const result = sh(probe)
+  if (!result.ok) return []
+  return result.stdout
+    .split(/\s+/)
+    .map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 0)
+}
+
+function staleEgressPids(configPath, exceptPid = 0) {
+  const wanted = path.resolve(configPath)
+  return egressProcessPids().filter(
+    (pid) => pid !== exceptPid && ownsEgressProcess(pid, wanted, { allowDeleted: true }),
+  )
+}
+
+/** Live kin-egress PIDs bound to one proxy config (stale pidfiles included). */
+export function egressPidsForProxyConfig(projectRoot, proxyId) {
+  const dir = egressRunDir(projectRoot, proxyId)
+  const cfgPath = path.join(dir, 'egress.json')
+  const recorded = readPid(path.join(dir, 'egress.pid'))
+  const pids = new Set(staleEgressPids(cfgPath))
+  if (ownsEgressProcess(recorded, cfgPath, { allowDeleted: true })) pids.add(recorded)
+  return [...pids]
+}
+
+export function readEgressListenTcp(projectRoot, proxyId) {
   try {
-    // PID files survive container restarts; a live PID may belong to another
-    // process or another proxy. Verify both before reusing or signaling it.
-    const exe = fs.readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '')
-    const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
-    const configIndex = args.indexOf('-config')
-    if (path.basename(exe) !== 'kin-egress' || configIndex <= 0 || !args[configIndex + 1]) return false
-    const argument = args[configIndex + 1]
-    const actualConfig = path.isAbsolute(argument)
-      ? path.resolve(argument)
-      : path.resolve(fs.readlinkSync(`/proc/${pid}/cwd`), argument)
-    return actualConfig === path.resolve(configPath)
+    const cfg = JSON.parse(fs.readFileSync(path.join(egressRunDir(projectRoot, proxyId), 'egress.json'), 'utf8'))
+    return String(cfg.listen_tcp || '')
   } catch {
-    return false
+    return ''
   }
 }
 export function inspectEgressNetwork(proxyId, run = docker) {
@@ -421,7 +469,8 @@ export async function startEgressProcess({
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   const existing = readPid(pidFile)
-  if (ownsEgressProcess(existing, cfgPath)) {
+  const configMatches = ownsEgressProcess(existing, cfgPath)
+  if (configMatches) {
     try {
       const old = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
       if (
@@ -430,24 +479,31 @@ export async function startEgressProcess({
         old.proxy_url === proxyUrl &&
         (old.dns_upstream || '') === dnsUpstream &&
         JSON.stringify(old.dns_empty_types || []) === JSON.stringify(dnsEmptyTypes) &&
-        !!old.domain_forward === !!domainForward
+        !!old.domain_forward === !!domainForward &&
+        staleEgressPids(cfgPath, existing).length === 0
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
     } catch {}
-    try {
-      process.kill(existing, 'SIGTERM')
-    } catch {}
-    const stopped = await waitEgressExit(existing)
-    if (!stopped.ok) return { ok: false, error: stopped.error, pid: existing }
-    if (tcpPort > 0) {
-      const portFree = await waitPortReleased(listenHost, tcpPort)
-      if (!portFree.ok) return { ok: false, error: portFree.error, pid: existing }
-    }
-    if (dnsPort > 0) {
-      const dnsFree = await waitPortReleased(listenHost, dnsPort)
-      if (!dnsFree.ok) return { ok: false, error: dnsFree.error, pid: existing }
-    }
+  }
+  const portOwner = listenerPid(tcpPort)
+  if (portOwner && !ownsEgressProcess(portOwner, cfgPath)) {
+    return { ok: false, error: 'egress_port_busy', pid: portOwner }
+  }
+  const superseded = [
+    ...new Set([...(configMatches ? [existing] : []), ...staleEgressPids(cfgPath), portOwner].filter(Boolean)),
+  ]
+  for (const pid of superseded) {
+    const stopped = await stopOwnedEgress(pid)
+    if (!stopped.ok) return { ok: false, error: stopped.error, pid }
+  }
+  if (tcpPort > 0) {
+    const portFree = await waitPortReleased(listenHost, tcpPort)
+    if (!portFree.ok) return { ok: false, error: portFree.error, pid: superseded[0] || existing }
+  }
+  if (dnsPort > 0) {
+    const dnsFree = await waitPortReleased(listenHost, dnsPort)
+    if (!dnsFree.ok) return { ok: false, error: dnsFree.error, pid: superseded[0] || existing }
   }
   if (!fs.existsSync(bin)) {
     return { ok: false, error: `kin-egress binary not found: ${bin}` }
@@ -464,29 +520,36 @@ export async function startEgressProcess({
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
   const spawned = await spawnDetachedEgress(bin, cfgPath)
   if (!spawned.ok) return spawned
-  fs.writeFileSync(pidFile, String(spawned.pid) + '\n', { mode: 0o600 })
-  return { ok: true, pid: spawned.pid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
+  const realPid = await waitForListenerPid(listenHost, tcpPort)
+  if (!realPid) return { ok: false, error: `kin-egress ${listenTcp} did not listen` }
+  fs.writeFileSync(pidFile, String(realPid) + '\n', { mode: 0o600 })
+  return { ok: true, pid: realPid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
 }
 
 export function stopEgressProcess(projectRoot, proxyId) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pidFile = path.join(dir, 'egress.pid')
-  const pid = readPid(pidFile)
-  if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
-    try {
-      process.kill(pid, 'SIGTERM')
-    } catch (error) {
-      if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
-    }
-    // Keep the PID while termination is pending so policy reconciliation can verify/retry it.
-    if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) return { ok: true }
+  const cfgPath = path.join(dir, 'egress.json')
+  const pids = [...new Set(egressPidsForProxyConfig(projectRoot, proxyId))]
+  const pending = []
+  for (const pid of pids) {
+    const signaled = sh(pidNamespaceCommand(['sh', '-c', `kill -TERM ${Number(pid)} 2>/dev/null`]))
+    if (!signaled.ok && pidAlive(pid)) return { ok: false, error: 'egress_stop_failed' }
+    if (ownsEgressProcess(pid, cfgPath)) pending.push(pid)
   }
+  if (pending.length) return { ok: true, pending }
   try {
     fs.rmSync(pidFile, { force: true })
   } catch (error) {
     return { ok: false, error: `egress_pid_cleanup_failed: ${error.code || error.message}` }
   }
-  return { ok: true }
+  return { ok: true, pending }
+}
+
+async function stopOwnedEgress(pid) {
+  const signaled = sh(pidNamespaceCommand(['sh', '-c', `kill -TERM ${Number(pid)} 2>/dev/null`]))
+  if (!signaled.ok && pidAlive(pid)) return { ok: false, error: 'egress_stop_failed' }
+  return waitEgressExit(pid)
 }
 
 export function inspectEgressProcess(projectRoot, proxyId) {
@@ -545,38 +608,74 @@ export function localEgressProxyUrl(env = process.env) {
 const EGRESS_STOP_TIMEOUT_MS = 8000
 const EGRESS_KILL_GRACE_MS = 3000
 
+function egressProcessAbsent(pid) {
+  const n = Number(pid)
+  if (!Number.isInteger(n) || n <= 0) return true
+  if (process.platform === 'linux') {
+    try {
+      return !fs.existsSync(`/proc/${n}`)
+    } catch {
+      return true
+    }
+  }
+  return !pidAlive(n)
+}
+
+async function waitEgressReap(pid, timeoutMs) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (egressProcessAbsent(pid)) return { ok: true }
+    await delay(EGRESS_POLL_MS)
+  }
+  return { ok: false, error: 'egress_reap_timeout', pid }
+}
+
 /** Wait for an egress PID to exit after SIGTERM, then SIGKILL if needed. */
 export async function waitEgressExit(
   pid,
   { termTimeoutMs = EGRESS_STOP_TIMEOUT_MS, killGraceMs = EGRESS_KILL_GRACE_MS } = {},
 ) {
-  if (!pidAlive(pid)) return { ok: true }
+  if (egressProcessAbsent(pid)) return { ok: true }
   const termStart = Date.now()
   while (Date.now() - termStart < termTimeoutMs) {
-    if (!pidAlive(pid)) return { ok: true }
+    if (egressProcessAbsent(pid)) return { ok: true }
+    if (!pidAlive(pid)) break
     await delay(EGRESS_POLL_MS)
   }
-  try {
-    process.kill(pid, 'SIGKILL')
-  } catch (error) {
-    if (error.code === 'ESRCH') return { ok: true }
-    return { ok: false, error: `egress_kill_failed: ${error.code || error.message}`, pid }
+  if (egressProcessAbsent(pid)) return { ok: true }
+  const killed = sh(pidNamespaceCommand(['sh', '-c', `kill -KILL ${Number(pid)} 2>/dev/null`]))
+  if (!killed.ok && pidAlive(pid)) return { ok: false, error: 'egress_kill_failed', pid }
+  const reaped = await waitEgressReap(pid, killGraceMs)
+  if (!reaped.ok) return reaped
+  return { ok: true }
+}
+
+export async function drainEgressForProxyConfig(projectRoot, proxyId) {
+  for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) {
+    const stopped = await stopOwnedEgress(pid)
+    if (!stopped.ok) return stopped
   }
-  const killStart = Date.now()
-  while (Date.now() - killStart < killGraceMs) {
-    if (!pidAlive(pid)) return { ok: true }
-    await delay(EGRESS_POLL_MS)
-  }
-  return { ok: false, error: 'egress_stop_timeout', pid }
+  return { ok: true }
 }
 
 export async function waitPortReleased(host, port, timeoutMs = 3000) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (!waitListen(host, port, 200)) return { ok: true }
+    if (!portListening(host, port)) return { ok: true }
     await delay(EGRESS_POLL_MS)
   }
   return { ok: false, error: 'egress_port_busy', port }
+}
+
+async function waitForListenerPid(host, port, timeoutMs = 8000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const probe = sh(['ss', '-H', '-ltnp', `sport = :${Number(port)}`], { timeout: 2000 })
+    const match = probe.stdout.match(/pid=(\d+)/)
+    if (match) return Number(match[1])
+    await delay(100)
+  }
+  return 0
 }
 
 function spawnDetachedEgress(bin, cfgPath) {
@@ -606,23 +705,32 @@ function spawnDetachedEgress(bin, cfgPath) {
   })
 }
 
-function waitListen(host, port, timeoutMs = 8000) {
-  const start = Date.now()
+function portListening(host, port, ownerPid = 0) {
   const h = host || '127.0.0.1'
+  // A TCP connect is traffic to the transparent forwarder, not a passive
+  // readiness check. Inspect LISTEN sockets without entering its data path.
+  const probe = ownerPid
+    ? ['ss', '-H', '-ltnp', `sport = :${Number(port)}`]
+    : ['ss', '-H', '-ltn', `sport = :${Number(port)}`]
+  const r = sh(probe, { timeout: 2000 })
+  return (
+    r.ok &&
+    r.stdout.split('\n').some((line) => {
+      const fields = line.trim().split(/\s+/)
+      const local = fields[3]
+      const addressMatches =
+        local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
+      if (!addressMatches) return false
+      if (!ownerPid) return true
+      return new RegExp(`pid=${ownerPid}(?:\\D|$)`).test(fields.at(-1) || '')
+    })
+  )
+}
+
+function waitListen(host, port, timeoutMs = 8000, ownerPid = 0) {
+  const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    // A TCP connect is traffic to the transparent forwarder, not a passive
-    // readiness check. Inspect LISTEN sockets without entering its data path.
-    const r = sh(['ss', '-H', '-ltn', `sport = :${Number(port)}`], { timeout: 2000 })
-    if (
-      r.ok &&
-      r.stdout.split('\n').some((line) => {
-        const local = line.trim().split(/\s+/)[3]
-        return (
-          local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
-        )
-      })
-    )
-      return true
+    if (portListening(host, port, ownerPid)) return true
     sleepMsSync(100)
   }
   return false
@@ -655,7 +763,30 @@ export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
   return { ok: true, mode: 'local', ...info, reused: false, proxy_id: proxyId }
 }
 
-export async function ensureProxyEgress(
+const egressStarts = new Map()
+
+/**
+ * One stop/start sequence per proxy at a time. The pid file is written only after
+ * spawn, and fleet refresh stops every helper for the config before starting.
+ */
+export async function runExclusiveProxyEgress(projectRoot, proxyId, fn) {
+  const key = egressRunDir(projectRoot || '', proxyId || '')
+  const run = (egressStarts.get(key) || Promise.resolve()).then(() => fn())
+  const tail = run.catch(() => {})
+  egressStarts.set(key, tail)
+  try {
+    return await run
+  } finally {
+    if (egressStarts.get(key) === tail) egressStarts.delete(key)
+  }
+}
+
+export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
+  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
+  return runExclusiveProxyEgress(projectRoot, proxy?.id, () => startProxyEgress(projectRoot, proxy, opts))
+}
+
+export async function startProxyEgress(
   projectRoot,
   proxy,
   {
@@ -663,9 +794,11 @@ export async function ensureProxyEgress(
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
     dnsEmptyTypes = configuredDnsEmptyTypes(),
+    bin,
+    ports,
+    listenHost: listenHostOverride,
   } = {},
 ) {
-  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker })
   const blocked = proxyBlockedReason(proxy)
   if (blocked) return { ok: false, error: blocked }
   const proxyId = proxy?.id
@@ -673,43 +806,41 @@ export async function ensureProxyEgress(
   if (!proxyId || !proxyUrl) return { ok: false, error: 'bound SOCKS5 id and url required; refusing fallback' }
   const net = ensureEgressNetwork(proxyId, runDocker)
   if (!net.ok) return net
-  const listenHost = net.gateway || gatewayFromSubnet(net.subnet)
+  const listenHost = listenHostOverride || net.gateway || gatewayFromSubnet(net.subnet)
   if (!listenHost) return { ok: false, error: 'egress network gateway missing' }
-  const ports = portsForProxy(proxyId)
+  const selectedPorts = ports || portsForProxy(proxyId)
   const chain = chainName(proxyId)
   const plan = iptablesPlan({
     chain,
     bridge: net.bridge,
     subnet: net.subnet,
-    tcpPort: ports.tcp,
-    dnsPort: ports.dns,
+    tcpPort: selectedPorts.tcp,
+    dnsPort: selectedPorts.dns,
   })
+  const rules = applyIptables(plan, runIptables)
+  if (!rules.ok) return rules
   const started = await startEgressProcess({
     projectRoot,
     proxyId,
     proxyUrl,
-    tcpPort: ports.tcp,
-    dnsPort: ports.dns,
+    tcpPort: selectedPorts.tcp,
+    dnsPort: selectedPorts.dns,
     listenHost,
     dnsUpstream,
     dnsEmptyTypes,
     domainForward: proxy?.domain_forward === true,
+    ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started
-  if (!waitListen(listenHost, ports.tcp))
-    return { ok: false, error: `kin-egress ${listenHost}:${ports.tcp} did not listen` }
-  const rules = applyIptables(plan, runIptables)
-  if (!rules.ok) {
-    stopEgressProcess(projectRoot, proxyId)
-    return rules
-  }
+  if (!waitListen(listenHost, selectedPorts.tcp, 8000, selectedPorts.tcp > 0 ? started.pid : 0))
+    return { ok: false, error: `kin-egress ${listenHost}:${selectedPorts.tcp} did not listen`, pid: started.pid }
   return {
     ok: true,
     network: net.name,
     bridge: net.bridge,
     subnet: net.subnet,
     gateway: listenHost,
-    ports,
+    ports: selectedPorts,
     pid: started.pid,
     proxy_id: proxyId,
   }

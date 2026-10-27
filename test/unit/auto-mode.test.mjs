@@ -1,7 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { classifierFixture } from '../fixtures/auto-mode.mjs'
-import { prepareCliHopBody, prepareOutboundAttempt } from '../../src/lib/protocol/outbound-attempt.mjs'
+import {
+  prepareCliHopBody,
+  prepareOutboundAttempt,
+  prepareOutboundEnvelope,
+} from '../../src/lib/protocol/outbound-attempt.mjs'
+import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 import {
   classifyClaudeRequestPurpose,
   prepareClassifierBody,
@@ -19,7 +24,7 @@ test('classifier assembly retains caller fields across both outbound paths', () 
     prepareOutboundAttempt({ canonicalBody: input, identity: {}, requestContext: context }).body,
   ]) {
     assert.deepEqual(body.thinking, input.thinking)
-    assert.equal(body.temperature, 0)
+    assert.equal(body.temperature, 1)
     assert.equal(body.max_tokens, 64)
     assert.deepEqual(body.system, input.system)
     assert.deepEqual(body.messages, input.messages)
@@ -28,6 +33,33 @@ test('classifier assembly retains caller fields across both outbound paths', () 
     assert.equal(body.context_management, undefined)
     assert.equal(body.request_context, undefined)
   }
+})
+
+test('classifier outbound skips thinking_display rewrite on envelope and worker finalize', () => {
+  const input = {
+    ...classifierFixture({ model: 'claude-sonnet-5-5' }),
+    thinking: { type: 'adaptive', display: 'omitted' },
+  }
+  const prepared = prepareClassifierBody(input)
+  const envelope = prepareOutboundEnvelope({
+    requestContext: context,
+    canonicalBody: input,
+    inbound: input,
+    identity: {},
+    unofficial: true,
+    stream: true,
+  })
+  assert.equal(envelope.body.thinking.display, 'omitted')
+  const exec = { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } }
+  const worker = finalizeWorkerPayload({
+    body: prepared,
+    reqHeaders: {},
+    exec,
+    identity: null,
+    requestContext: context,
+    cliHop: true,
+  })
+  assert.equal(worker.body.thinking.display, 'omitted')
 })
 
 for (const verdict of ['block', 'severity'])
@@ -47,10 +79,10 @@ for (const verdict of ['block', 'severity'])
         format: 'xml',
         stage,
       })
-      for (const max_tokens of [64, 256, 4096, 345]) {
+      for (const max_tokens of [64, 256, 8192, 345]) {
         const body = prepareClassifierBody({ ...input, max_tokens })
         assert.equal(body.max_tokens, max_tokens)
-        assert.equal(body.temperature, 0)
+        assert.equal(body.temperature, 1)
         assert.deepEqual(body.stop_sequences, input.stop_sequences)
       }
     })
@@ -142,7 +174,7 @@ test('phrase, same-name tool, short budget or public context cannot set purpose'
     {
       model: 'claude-sonnet-4-6',
       max_tokens: 64,
-      temperature: 0,
+      temperature: 1,
       request_context: context,
       messages: [{ role: 'user', content: 'search' }],
     },

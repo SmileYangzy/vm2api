@@ -25,6 +25,7 @@ import {
   parseResetMs,
   wipeElapsedHeaderWindows,
 } from './quota-window.mjs'
+import { rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
@@ -117,6 +118,16 @@ export class AccountQuota {
         sessionWindowStatus: w5.status || null,
       })
     } catch {}
+  }
+
+  /** Archive the window that just rolled over; live headers win over the official probe, as in `_writeSessionWindow`. */
+  _rollWindowHistory(acc) {
+    if (!acc?.unified) return
+    const read = (key) => {
+      const extra = headerWindow(acc.unified, key)
+      return extra.utilization != null && extra.reset ? extra : officialWindow(acc.unified, key)
+    }
+    acc.window_history = rollWindowHistory(acc.window_history, { '5h': read('5h'), '7d': read('7d') })
   }
 
   ensure(account) {
@@ -262,6 +273,7 @@ export class AccountQuota {
       })
     }
 
+    this._rollWindowHistory(acc)
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
     if (sampled) {
@@ -434,6 +446,7 @@ export class AccountQuota {
       healOfficialOverwriteExtra(acc, accountId, this.repo)
       clearHeaderExhaustIfOfficialOpen(acc)
     }
+    this._rollWindowHistory(acc)
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
     if (usageOk) {
@@ -503,6 +516,7 @@ export class AccountQuota {
       tokens_out: usageBody?.output_tokens ?? null,
     })
 
+    this._rollWindowHistory(acc)
     return this.repo.save(acc)
   }
 
@@ -731,17 +745,21 @@ export class AccountQuota {
   }
 
   /** sub2api 7d_oi: Fable-only window. Does not unschedulable the account. */
-  fableWindowLimited(accountId) {
-    const acc = this.repo.get(accountId)
-    const status = String(acc?.unified?.['7d_oi']?.status || '').toLowerCase()
-    return status === 'rejected' || status === 'rate_limited'
+  fableWindowLimited(accountId, now = Date.now()) {
+    const oi = this.repo.get(accountId)?.unified?.['7d_oi']
+    if (!oi) return false
+    const status = String(oi.status || '').toLowerCase()
+    if (status !== 'rejected' && status !== 'rate_limited') return false
+    const resetMs = parseResetMs(oi.reset)
+    if (Number.isFinite(resetMs) && resetMs <= now) return false
+    return true
   }
 
   fableWindowResetAt(accountId) {
     const reset = this.repo.get(accountId)?.unified?.['7d_oi']?.reset
     if (!reset) return null
-    const parsed = Date.parse(reset)
-    return Number.isFinite(parsed) ? parsed : null
+    const ms = parseResetMs(reset)
+    return Number.isFinite(ms) ? ms : null
   }
 
   /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled (or the VM override). */
@@ -755,6 +773,7 @@ export class AccountQuota {
       utilization_7d: headerWindowOrEmpty(u, '7d').utilization ?? officialWindow(u, '7d').utilization,
       utilization_7d_oi: u['7d_oi']?.utilization ?? u.fable?.utilization,
       status_7d_oi: u['7d_oi']?.status,
+      reset_7d_oi: u['7d_oi']?.reset,
     })
   }
 
@@ -763,8 +782,8 @@ export class AccountQuota {
     const key = kind === 'fable' ? '7d_oi' : '7d'
     const reset = acc?.unified?.[key]?.reset
     if (!reset) return null
-    const parsed = Date.parse(reset)
-    return Number.isFinite(parsed) ? parsed : null
+    const ms = parseResetMs(reset)
+    return Number.isFinite(ms) ? ms : null
   }
 
   acquire(accountId) {
@@ -893,7 +912,10 @@ export class AccountQuota {
       }
     } else {
       acc.unified = next
-      if (wiped.changed) acc.unified.headers = wiped.headers
+      if (wiped.changed) {
+        if (wiped.headers) acc.unified.headers = wiped.headers
+        if (wiped.oi != null) acc.unified['7d_oi'] = wiped.oi
+      }
       if (changed) {
         writeOfficialWindow(acc, '5h', n5)
         writeOfficialWindow(acc, '7d', n7)
@@ -1004,6 +1026,7 @@ export class AccountQuota {
             '7d': listed.utilization_7d != null || listed.status_7d ? listed['7d'] : official['7d'],
           },
           last_blocked: a.last_blocked,
+          window_history: a.window_history || null,
           recent_allocations: this.repo.recentAllocations(a.account_id, 5),
         }
       }),

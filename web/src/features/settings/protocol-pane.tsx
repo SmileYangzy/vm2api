@@ -3,7 +3,14 @@ import {
   SESSION_IDLE_TTL_SECONDS_MAX,
   SESSION_IDLE_TTL_SECONDS_MIN,
 } from '@/types/panel-routing'
-import { Check, Clock3, Database, Hash, ShieldCheck } from 'lucide-react'
+import {
+  Brain,
+  Check,
+  Clock3,
+  Database,
+  Scaling,
+  ShieldCheck,
+} from 'lucide-react'
 import {
   cacheTtlFromCompat,
   detectProxiedOfficialCcFromCompat,
@@ -12,9 +19,12 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
+import { OutboundReference } from './outbound-reference'
 import {
   cchEnabledFromCompat,
+  ccEntrypointFromCompat,
   sessionIdleTtlFromInference,
+  thinkingDisplayFromCompat,
 } from './protocol-authority'
 import { ChipGroup, PaneSection, StepperSetting } from './scheduler-controls'
 
@@ -30,6 +40,13 @@ const CLAUDE_CODE_FINGERPRINT: [string, string][] = [
   ['system', '官方计费块 / 身份行'],
   ['计费块', 'cc_version = UA 版本'],
 ]
+
+function autoCompactWindowValue(value: unknown) {
+  const tokens = Number(value)
+  if (tokens === 200_000 || tokens === 500_000 || tokens === 1_000_000)
+    return String(tokens)
+  return 'model'
+}
 
 export function ProtocolPane({
   compat,
@@ -162,7 +179,81 @@ export function ProtocolPane({
         </p>
       </PaneSection>
       <PaneSection
-        icon={Hash}
+        icon={Database}
+        title='出站入口'
+        desc='billing 的 cc_entrypoint 和出站 UA 用同一个值。调用方自带的 billing 不改。'
+      >
+        <SettingRow
+          label='cc_entrypoint'
+          desc='保存后写入各 Claude 槽 kernel.json，cli-node 下次请求读取。'
+        >
+          <ChipGroup
+            label='cc_entrypoint'
+            value={ccEntrypointFromCompat(compat)}
+            options={[
+              ['sdk-cli', 'sdk-cli'],
+              ['cli', 'cli'],
+            ]}
+            onChange={(cc_entrypoint) =>
+              onCompatChange({ ...compat, cc_entrypoint })
+            }
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Brain}
+        title='thinking 显示'
+        desc='调用方打开 thinking 却要求隐藏时，出站改成返回摘要。计费不变。'
+      >
+        <SettingRow
+          label='隐藏的 thinking 改为返回摘要'
+          desc={
+            thinkingDisplayFromCompat(compat) === 'summarized'
+              ? '开：omitted、updates，以及默认隐藏的模型上没写 display 的请求，出站改成 summarized。'
+              : '关：保留调用方的 display。updates 仍只在出站 beta 声明时保留，否则降成 omitted。'
+          }
+        >
+          <Switch
+            checked={thinkingDisplayFromCompat(compat) === 'summarized'}
+            onCheckedChange={(on) =>
+              onCompatChange({
+                ...compat,
+                thinking_display: on ? 'summarized' : 'passthrough',
+              })
+            }
+            aria-label='隐藏的 thinking 改为返回摘要'
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Scaling}
+        title='Auto compact 窗口'
+        desc='默认跟随请求模型。显式值替换模型窗口，请求里的 CLAUDE_CODE_AUTO_COMPACT_WINDOW 仍优先。'
+      >
+        <SettingRow
+          label='窗口'
+          desc='跟随模型时，Opus / Sonnet / Haiku 5.x 使用 1M，其余模型使用 200K。'
+        >
+          <ChipGroup
+            label='Auto compact 窗口'
+            value={autoCompactWindowValue(compat.auto_compact_window)}
+            options={[
+              ['model', '跟随模型'],
+              ['200000', '200K'],
+              ['500000', '500K'],
+              ['1000000', '1M'],
+            ]}
+            onChange={(value) =>
+              onCompatChange({
+                ...compat,
+                auto_compact_window: value === 'model' ? null : Number(value),
+              })
+            }
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Clock3}
         title='CCH 统一附加'
         desc='出站 billing 的 cch。开启后缺失也补，不区分试用或订阅。'
       >
@@ -202,6 +293,7 @@ export function ProtocolPane({
           }
         />
       </PaneSection>
+      <OutboundReference />
     </div>
   )
 }
