@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   useMutation,
   useMutationState,
@@ -47,6 +47,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { ChoiceTiles } from '@/components/choice-tiles'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { PlatformChip, SlotIdentity } from '@/components/platform-chip'
@@ -63,11 +64,18 @@ import { VmProxyTab } from '@/features/vm/detail-proxy-tab'
 import { VmDetailSkeleton } from '@/features/vm/detail-skeleton'
 import { VmTestTab } from '@/features/vm/detail-test-tab'
 import { bootOutcome, vmTodayCounts } from '@/features/vm/detail-today'
+import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
+import {
+  planDeleteActiveVm,
+  type DeleteActiveVmPlan,
+} from '@/features/vm/active-vm'
+import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
 import { NodeChip } from '@/features/vm/node-chip'
 import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
 import {
   vmQueryOptions,
   vmSeedQueryOptions,
+  vmSeedUploadLogQueryOptions,
   vmsListQueryOptions,
 } from '@/features/vm/queries'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
@@ -116,6 +124,7 @@ function VmDetailBody({
   onTabChange: (tab: string) => void
 }) {
   const navigate = useNavigate()
+  const [seedDebug, setSeedDebug] = useState(false)
   const qc = useQueryClient()
   const perms = useVmPerms()
   const dash = useQuery({
@@ -128,8 +137,20 @@ function VmDetailBody({
     enabled: perms.known && !perms.dashboard,
   })
   const proxies = useQuery({ ...proxiesQueryOptions(), enabled: perms.admin })
-  const detail = useQuery(vmQueryOptions(id))
-  const seed = useQuery({ ...vmSeedQueryOptions(id), enabled: perms.admin })
+  const detail = useQuery({
+    ...vmQueryOptions(id),
+    refetchInterval: wantedTab === 'seed' ? 2000 : false,
+  })
+  const seed = useQuery({
+    ...vmSeedQueryOptions(id),
+    enabled: perms.admin && wantedTab === 'seed',
+    refetchInterval: wantedTab === 'seed' ? 2000 : false,
+  })
+  const seedUploadLog = useQuery({
+    ...vmSeedUploadLogQueryOptions(id),
+    enabled: perms.admin && wantedTab === 'seed' && seedDebug,
+    refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
+  })
   const routing = useQuery({ ...routingQueryOptions(), enabled: perms.admin })
   usePoolSeatStream()
 
@@ -139,6 +160,7 @@ function VmDetailBody({
   const [bindId, setBindId] = useState('')
   const [confirmDel, setConfirmDel] = useState(false)
   const [confirmReset, setConfirmReset] = useState(false)
+  const [resetMode, setResetMode] = useState<'keep' | 'traits'>('keep')
   const [resetInput, setResetInput] = useState('')
   const data = detail.data || {}
   const slotList: Vm[] =
@@ -150,6 +172,19 @@ function VmDetailBody({
   const proxy = ((data.proxy as VmProxySnap | undefined) ||
     vm.proxy ||
     {}) as VmProxySnap
+  const seedSlot = useMemo(() => {
+    const locale =
+      typeof vm.locale === 'string'
+        ? vm.locale
+        : vm.locale === null
+          ? null
+          : undefined
+    return {
+      timezone: vm.timezone,
+      timezone_source: vm.timezone_source,
+      locale,
+    }
+  }, [vm.timezone, vm.timezone_source, vm.locale])
   const test = useVmTestChat(vm)
   const refreshAll = async () => {
     await Promise.all([
@@ -193,6 +228,8 @@ function VmDetailBody({
           else toast.warning(boot.message)
         } else if (path === '/stop') {
           toast.success('已关机，调度已关闭')
+        } else if (path === '/activate') {
+          toast.success('已设为活跃槽')
         } else {
           toast.success('已执行 ' + path)
         }
@@ -225,26 +262,46 @@ function VmDetailBody({
       }),
     onSuccess: async () => {
       toast.success('已播种')
+      await refreshAll()
       await qc.invalidateQueries({
-        queryKey: vmSeedQueryOptions(id).queryKey,
+        queryKey: ['panel', 'vm', id, 'seed'],
+      })
+      await qc.invalidateQueries({
+        queryKey: ['panel', 'vm', id, 'seed-upload-log'],
       })
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const deletePlan: DeleteActiveVmPlan = planDeleteActiveVm(vm, slotList)
   const remove = useMutation({
-    mutationFn: () =>
-      api(`/api/panel/vms/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    mutationFn: async () => {
+      if (deletePlan.kind === 'switch') {
+        await api(
+          `/api/panel/vms/${encodeURIComponent(deletePlan.replacement.id)}/activate`,
+          { method: 'POST' }
+        )
+      }
+      return api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      })
+    },
     onSuccess: async () => {
-      toast.success('已删除')
+      toast.success(
+        deletePlan.kind === 'switch'
+          ? `已切换活跃到 ${deletePlan.replacement.id} 并删除 ${id}`
+          : '已删除'
+      )
       await qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey })
       navigate({ to: '/vm' })
     },
     onError: (error: Error) => toast.error(error.message),
   })
   const resetVm = useMutation({
-    mutationFn: () => postVm(id, '/reset', {}),
-    onSuccess: async () => {
-      toast.success(`已销毁并重建 ${id}`)
+    mutationFn: (mode: 'keep' | 'traits') => postVm(id, '/reset', { mode }),
+    onSuccess: async (_data, mode) => {
+      toast.success(
+        mode === 'keep' ? `已保留原数据重建 ${id}` : `已按新特征重建 ${id}`
+      )
       setConfirmReset(false)
       setResetInput('')
       await refreshAll()
@@ -256,8 +313,6 @@ function VmDetailBody({
   // 本地代理固定第一。已绑到本槽的留在下拉里，否则正在用它时列表里没有。
   const free = proxiesForVmBind(pool, id, 5, vm.node_id ?? null)
   const bindTarget = pickBindTarget(bindId, free)
-  const pol =
-    (seed.data?.seed_policy as Record<string, unknown> | undefined) || {}
   const syncTelemetry =
     (routing.data?.official_cc as { sync_telemetry?: boolean } | undefined)
       ?.sync_telemetry === true
@@ -337,6 +392,7 @@ function VmDetailBody({
             </Select>
           ) : null}
           <PlatformChip vm={vm} />
+          <ActiveVmBadge vm={vm} className='text-[11px]' />
           <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
@@ -560,15 +616,18 @@ function VmDetailBody({
                 }}
                 onDelete={() => setConfirmDel(true)}
               />
-              <TabsContent value='seed' className='space-y-3 pt-4'>
-                <p className='text-sm text-muted-foreground'>
-                  官方 Claude Code 初装之后的后置覆写。遥测只看这一只开关。
-                </p>
+              <TabsContent value='seed' className='pt-4'>
                 {seed.data ? (
                   <SeedPolicyCard
-                    policy={pol}
+                    seed={seed.data}
+                    slot={seedSlot}
+                    telemetry={kernel?.telemetry}
                     saving={saveSeed.isPending}
                     syncTelemetry={syncTelemetry}
+                    debug={seedDebug}
+                    onDebug={setSeedDebug}
+                    uploadLog={seedUploadLog.data}
+                    proxyTimezone={proxy.geo?.timezone || ''}
                     onSave={(next) => saveSeed.mutate(next)}
                   />
                 ) : (
@@ -584,13 +643,23 @@ function VmDetailBody({
           open={confirmDel}
           onOpenChange={setConfirmDel}
           title={`删除 ${id}`}
-          desc='删除槽位不可恢复。'
-          confirmText='删除'
+          desc={
+            <>
+              <p>删除槽位不可恢复。</p>
+              <DeleteActiveVmHint target={vm} vms={slotList} />
+            </>
+          }
+          confirmText={
+            deletePlan.kind === 'switch' ? '切换活跃并删除' : '删除'
+          }
           cancelBtnText='取消'
           destructive
+          disabled={deletePlan.kind === 'blocked'}
           isLoading={remove.isPending}
           handleConfirm={() => {
-            if (!remove.isPending) remove.mutate()
+            if (!remove.isPending && deletePlan.kind !== 'blocked') {
+              remove.mutate()
+            }
           }}
         />
         <ConfirmDialog
@@ -599,27 +668,43 @@ function VmDetailBody({
             setConfirmReset(open)
             if (!open) setResetInput('')
           }}
-          title='重置'
+          title='重建槽位'
           desc={
             <>
               <p>
                 {vm.name && vm.name !== id ? `${vm.name} · ` : ''}
                 {id}
               </p>
-              <p className='mt-2 text-destructive'>
-                销毁容器与家目录，再按原槽位重新创建。保留
-                ID、名称、内核、时区、代理和种子策略。凭证、指纹、统计和 guest
-                家目录会清空。
+              <p className='mt-2'>
+                本地槽和集群槽都换当前 kernel、cli-node 与 Go 遥测后的容器。
               </p>
             </>
           }
-          confirmText='销毁并重建'
+          confirmText={resetMode === 'keep' ? '保留原数据重建' : '重建新特征'}
           cancelBtnText='取消'
-          destructive
+          destructive={resetMode === 'traits'}
           disabled={resetInput.trim() !== id}
           isLoading={resetVm.isPending}
-          handleConfirm={() => resetVm.mutate()}
+          handleConfirm={() => resetVm.mutate(resetMode)}
         >
+          <ChoiceTiles
+            label='重建方式'
+            value={resetMode}
+            onChange={setResetMode}
+            choices={[
+              {
+                value: 'keep',
+                title: '保留原数据重建',
+                detail: '留下凭证、指纹、主机名和统计，只换容器里的服务。',
+              },
+              {
+                value: 'traits',
+                title: '重建新特征',
+                detail:
+                  '清掉凭证和家目录，重新生成主机名、machine-id 和设备特征。',
+              },
+            ]}
+          />
           <Input
             autoFocus
             autoComplete='off'
@@ -634,7 +719,7 @@ function VmDetailBody({
                 resetInput.trim() === id &&
                 !resetVm.isPending
               ) {
-                resetVm.mutate()
+                resetVm.mutate(resetMode)
               }
             }}
           />

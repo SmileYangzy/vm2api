@@ -11,7 +11,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
-import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
+import { applyClearUnschedulable, applyUnschedulable, migrateScheduleRecord } from '../pool/schedule-state.mjs'
 import {
   credentialModeFromOauth,
   isApiKeyMode,
@@ -119,28 +119,107 @@ export function applyOauthToCfg(cfg, cred) {
   return cfg
 }
 
-/** The Go worker's only credential file. Never the leftover `.credentials.json`. */
+/** The Go worker's only credential file. Official CLI name is `.credentials.json`. */
 export function slotWorkerCredentialPath(homeDir) {
   if (!homeDir) return null
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
+const AUTH_LOGIN_REFRESH_HOLD_MS = 30 * 60 * 1000
+
+/** A live `claude auth login` is about to exchange a new grant. Do not spend the old RT. */
+export function authLoginBlocksRefresh(homeDir, now = Date.now()) {
+  if (!homeDir) return false
+  try {
+    const status = JSON.parse(fs.readFileSync(path.join(homeDir, '..', 'run', 'auth-login', 'status.json'), 'utf8'))
+    const state = String(status.status || '')
+    if (!state || state === 'login_ready' || state === 'error' || state === 'exited') return false
+    const expires = Number(status.expires_at || 0)
+    if (expires > 0) return now < expires
+    const created = Number(status.created_at || 0)
+    return !created || now < created + AUTH_LOGIN_REFRESH_HOLD_MS
+  } catch {
+    return false
+  }
+}
+
+function regularOauthGrant(file) {
+  let st
+  try {
+    st = fs.lstatSync(file)
+  } catch {
+    return null
+  }
+  if (!st.isFile()) return null
+  try {
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const oauth = doc?.claudeAiOauth && typeof doc.claudeAiOauth === 'object' ? doc.claudeAiOauth : doc
+    if (!oauth || typeof oauth !== 'object') return null
+    return {
+      refresh: String(oauth.refreshToken || oauth.refresh_token || '').trim(),
+      expires: Number(oauth.expiresAt || oauth.expires_at || 0) || 0,
+      mtimeMs: Number(st.mtimeMs) || 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** A different refresh token in the official file wins only when it is the later grant. */
+function officialGrantWins(official, worker) {
+  if (!official?.refresh) return false
+  if (!worker?.refresh) return true
+  if (official.refresh === worker.refresh) return false
+  if (official.expires !== worker.expires) {
+    if (!worker.expires) return true
+    if (!official.expires) return false
+    return official.expires > worker.expires
+  }
+  return official.mtimeMs > worker.mtimeMs
+}
+
 /**
  * Official CLI reads ~/.claude/.credentials.json. One store: symlink
- * that name onto host-owned credentials.json so wrap cannot copy RT.
+ * that name onto host-owned credentials.json so the two names cannot
+ * hold two refresh tokens. A regular `.credentials.json` with a later
+ * grant is copied onto the worker file first. Deleting it and refreshing
+ * the older RT is what revokes the new grant.
  */
-export function ensureOfficialCredentialLink(homeDir, { uid, gid } = {}) {
+export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
-  if (!homeDir || !fs.existsSync(workerFile)) return { wrote: false, error: 'worker credentials.json missing' }
+  if (!homeDir) return { wrote: false, error: 'home missing' }
+  const officialGrant = regularOauthGrant(officialFile)
+  const workerGrant = regularOauthGrant(workerFile)
+  const adopt = officialGrantWins(officialGrant, workerGrant)
+  if (!workerGrant && !fs.existsSync(workerFile)) {
+    if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
+    fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
+    if (adopt) fs.copyFileSync(officialFile, workerFile)
+    else fs.writeFileSync(workerFile, '{}\n', { mode: 0o600 })
+    fs.chmodSync(workerFile, 0o600)
+    if (uid != null && gid != null) {
+      try {
+        fs.chownSync(workerFile, uid, gid)
+      } catch {}
+    }
+  } else if (adopt) {
+    fs.copyFileSync(officialFile, workerFile)
+    fs.chmodSync(workerFile, 0o600)
+    if (uid != null && gid != null) {
+      try {
+        fs.chownSync(workerFile, uid, gid)
+      } catch {}
+    }
+  }
   fs.mkdirSync(claudeDir, { recursive: true })
   try {
     const st = fs.lstatSync(officialFile)
     if (st.isSymbolicLink()) {
       const target = fs.readlinkSync(officialFile)
       if (target === 'credentials.json' || path.resolve(claudeDir, target) === path.resolve(workerFile)) {
-        return { wrote: true, path: officialFile, linked: true }
+        return { wrote: true, path: officialFile, linked: true, adopted: adopt }
       }
     }
     fs.rmSync(officialFile, { force: true })
@@ -155,7 +234,7 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid } = {}) {
       fs.lchownSync(officialFile, uid, gid)
     } catch {}
   }
-  return { wrote: true, path: officialFile, linked: true }
+  return { wrote: true, path: officialFile, linked: true, adopted: adopt }
 }
 
 /** Read the slot worker credentials.json without logging secrets. */
@@ -242,10 +321,17 @@ export function slotRuntimeOwner(vm) {
   }
 }
 
+/** Root can hand the file to the slot user. Non-root keeps the control-plane group. */
+export function runtimeFileOwner(vm) {
+  const slot = slotRuntimeOwner(vm)
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return slot
+  return { uid: vm?.id ? slot.uid : -1, gid: process.getgid() }
+}
+
 /** Best-effort. Non-root tests cannot chown; the write must still publish. */
 export function chownSlotRuntimeFile(filePath, vm) {
   if (!filePath || !vm?.id) return false
-  const { uid, gid } = slotRuntimeOwner(vm)
+  const { uid, gid } = runtimeFileOwner(vm)
   try {
     const st = fs.statSync(filePath)
     if (st.uid === uid && st.gid === gid) return false
@@ -258,14 +344,17 @@ export function chownSlotRuntimeFile(filePath, vm) {
 
 /**
  * Temp + rename drops the previous inode. chown the temp first so the
- * published 0600 file is already the slot uid. Otherwise kin-kernel
- * (container PID 1) gets EACCES and docker --restart loops.
+ * published file is already readable by the slot. Root uses the slot
+ * uid:gid; non-root keeps the control-plane gid for --group-add.
  */
 export function replaceSlotOwnedFile(filePath, body, vm) {
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
+  const { uid, gid } = runtimeFileOwner(vm)
   try {
     fs.writeFileSync(tempPath, body, { mode: 0o600 })
-    chownSlotRuntimeFile(tempPath, vm)
+    try {
+      fs.chownSync(tempPath, uid, gid)
+    } catch {}
     fs.renameSync(tempPath, filePath)
   } catch (error) {
     try {
@@ -486,25 +575,23 @@ export function mirrorWorkerCredentialsToVm(vmPath, homeDir, opts = {}) {
 }
 
 /**
- * Reset leftover oauth_cleared / oauth_* / no_credential after a live
- * credential is written. Operator `disabled` and explicit `stopped` stay.
+ * An operator credential import clears 不可调度. A background refresh or
+ * worker mirror only lifts a bare no-ticket park: any other verdict
+ * waits for an operator action, so a misread grant death cannot silently
+ * come back.
  */
-export function restoreScheduleAfterLiveCredential(vm) {
+export function restoreScheduleAfterLiveCredential(vm, { operatorImport = false } = {}) {
   if (!vm || !hasCredentialPresence(vm.claude)) return vm
-  if (isManualScheduleLocked(vm)) return vm
-  const reason = String(vm.schedule_disabled_reason || '')
-  // A live ticket after import/refresh heals leftover oauth_* including revoke.
-  if (reason && !/^oauth_/.test(reason) && reason !== 'no_credential') return vm
-  vm.schedule_disabled_reason = null
-  vm.schedulable = true
+  migrateScheduleRecord(vm)
+  if (!vm.unschedulable) return vm
+  applyClearUnschedulable(vm, { by: operatorImport ? 'credential_import' : 'credential_present' })
+  if (vm.unschedulable) return vm
   const status = String(vm.status || '').toLowerCase()
-  if (status === 'stopped' || status === 'paused' || status === 'disabled') {
-    vm.status = 'running'
-  }
+  if (status === 'stopped' || status === 'paused' || status === 'disabled') vm.status = 'running'
   return vm
 }
 
-export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {}) {
+export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operatorImport = false } = {}) {
   if (!vmPath || !fs.existsSync(vmPath)) return null
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   const prev = vm.claude || {}
@@ -563,7 +650,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   vm.claude.refreshed_at = new Date().toISOString()
   vm.claude._token_version = n._token_version || Date.now()
   clearClaudeAuthCooldown(vm.claude)
-  restoreScheduleAfterLiveCredential(vm)
+  restoreScheduleAfterLiveCredential(vm, { operatorImport })
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(vmPath, vm, { mode: 0o600 })
   return vm
@@ -634,6 +721,10 @@ export function clearRecoverableVmCooldown(vmPath) {
   delete vm.claude.temp_unschedulable_reason
   delete vm.temp_unschedulable_until
   delete vm.temp_unschedulable_reason
+  if (vm.codex?.extra?.codex_limited_until) {
+    vm.codex = { ...vm.codex, extra: { ...vm.codex.extra } }
+    delete vm.codex.extra.codex_limited_until
+  }
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(vmPath, vm)
   return vm
@@ -733,9 +824,9 @@ export function markVmRefreshError(vmPath, result) {
   vm.claude = stripCredentialSecrets({ ...(vm.claude || {}) })
   vm.claude.refresh_error = refreshErrorCodeOf(result)
   if (classifyCredentialRefresh(result) === 'fatal') {
-    vm.schedulable = false
+    migrateScheduleRecord(vm)
     const code = vm.claude.refresh_error
-    vm.schedule_disabled_reason = code === 'oauth_revoked' ? 'oauth_revoked' : 'oauth_invalid_grant'
+    applyUnschedulable(vm, code === 'oauth_revoked' ? 'oauth_revoked' : 'oauth_invalid_grant', { refresh_error: code })
     if (String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
   }
 

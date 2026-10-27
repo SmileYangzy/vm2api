@@ -96,11 +96,18 @@ function stripMaxTokens(text) {
 }
 
 export function projectClaudeCodeCchText(raw) {
-  const source = String(raw ?? '')
-  const billingCch = /(x-anthropic-billing-header:[^"]*?\bcch=)[0-9a-f]{5}(?=;)/i
-  if (!billingCch.test(source)) throw new Error('billing cch not found')
-  const replaced = source.replace(billingCch, (_match, prefix) => `${prefix}00000`)
-  return stripMaxTokens(stripFallbackCreditToken(stripFallbacks(clearModelValues(replaced))))
+  const body = JSON.parse(String(raw ?? ''))
+  let billing = false
+  const normalized = mapSystemText(body, (text) => {
+    billing = true
+    return normalizeBillingCch(text)
+  })
+  if (!billing) throw new Error('billing cch not found')
+  return projectBillingFields(JSON.stringify(normalized))
+}
+
+function projectBillingFields(text) {
+  return stripMaxTokens(stripFallbackCreditToken(stripFallbacks(clearModelValues(text))))
 }
 
 export function computeClaudeCodeCch(bodyBytes) {
@@ -109,7 +116,7 @@ export function computeClaudeCodeCch(bodyBytes) {
 }
 
 function normalizeBillingCch(text) {
-  return text.replace(/(^\s*x-anthropic-billing-header:)([^\r\n]*)/gim, (line) => {
+  return text.replace(/(^\s*x-anthropic-billing-header:)([^\r\n]*)/i, (line) => {
     let found = false
     const normalized = line.replace(/\s*cch=[^;\s]*;?/gi, () => {
       if (found) return ''
@@ -122,26 +129,42 @@ function normalizeBillingCch(text) {
 }
 
 function normalizeSystemCch(body) {
+  return mapSystemText(body, normalizeBillingCch)
+}
+
+function mapSystemText(body, fn) {
+  let found = false
+  const firstBilling = (text) => {
+    // History and later documentation blocks are caller content, not billing.
+    if (found || !/^\s*x-anthropic-billing-header:/i.test(text)) return text
+    found = true
+    return fn(text)
+  }
   if (typeof body.system === 'string') {
-    const system = normalizeBillingCch(body.system)
+    const system = firstBilling(body.system)
     return system === body.system ? body : { ...body, system }
   }
   if (!Array.isArray(body.system)) return body
   let changed = false
   const system = body.system.map((block) => {
     if (typeof block === 'string') {
-      const text = normalizeBillingCch(block)
+      const text = firstBilling(block)
       changed ||= text !== block
       return text
     }
     if (!block || typeof block.text !== 'string') return block
-    const text = normalizeBillingCch(block.text)
+    const text = firstBilling(block.text)
     if (text === block.text) return block
     changed = true
     return { ...block, text }
   })
   return changed ? { ...body, system } : body
 }
+
+const SYSTEM_BILLING_CCH = new RegExp(
+  `(^\\s*x-anthropic-billing-header:[^\\r\\n]*?\\bcch=)${CCH_PLACEHOLDER}(?=;)`,
+  'i',
+)
 
 /** Native hops leave the placeholder for the CLI's final SDK serialization. */
 export function sealClaudeCodeCch(body, { enabled = true, seal = true } = {}) {
@@ -150,8 +173,14 @@ export function sealClaudeCodeCch(body, { enabled = true, seal = true } = {}) {
   const normalized = normalizeSystemCch(stringBody ? JSON.parse(body) : body)
   if (!enabled || !seal) return stringBody ? JSON.stringify(normalized) : normalized
   const raw = JSON.stringify(normalized)
-  if (!/x-anthropic-billing-header:[^"]*cch=00000/i.test(raw)) return stringBody ? raw : normalized
-  const cch = computeClaudeCodeCch(Buffer.from(projectClaudeCodeCchText(raw), 'utf8'))
-  const sealed = raw.replace(/(x-anthropic-billing-header:[^"]*?cch=)00000/gi, `$1${cch}`)
-  return stringBody ? sealed : JSON.parse(sealed)
+  let billing = false
+  mapSystemText(normalized, (text) => {
+    billing ||= new RegExp(SYSTEM_BILLING_CCH.source, 'im').test(text)
+    return text
+  })
+  if (!billing) return stringBody ? raw : normalized
+  // Normalized system billing already holds the placeholder; message literals are hashed verbatim.
+  const cch = computeClaudeCodeCch(Buffer.from(projectBillingFields(raw), 'utf8'))
+  const sealed = mapSystemText(normalized, (text) => text.replace(SYSTEM_BILLING_CCH, `$1${cch}`))
+  return stringBody ? JSON.stringify(sealed) : sealed
 }

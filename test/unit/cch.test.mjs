@@ -15,6 +15,39 @@ import {
 } from '../../src/lib/identity/crs-persona.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 
+test('only the first canonical system billing block is normalized, projected and sealed', () => {
+  const literal = 'x-anthropic-billing-header: cc_version=example; cch=259ed;'
+  for (const system of [
+    [
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.296; cch=fffff;' },
+      { type: 'text', text: literal },
+      { type: 'text', text: `Documentation:\n${literal}` },
+    ],
+    `x-anthropic-billing-header: cc_version=2.1.296; cch=fffff;\nDocumentation:\n${literal}`,
+  ]) {
+    const body = { messages: [{ role: 'user', content: literal }], model: 'm', system }
+    const before = structuredClone(body)
+    const projected = JSON.parse(projectClaudeCodeCchText(JSON.stringify(body)))
+    assert.deepEqual(projected.messages, body.messages)
+    const sealed = sealClaudeCodeCch(body)
+    const deferred = sealClaudeCodeCch(body, { seal: false })
+    assert.deepEqual(sealed.messages, body.messages)
+    for (const result of [projected, sealed, deferred]) {
+      if (Array.isArray(system)) assert.deepEqual(result.system.slice(1), system.slice(1))
+      else assert.equal(result.system.split('\n').slice(1).join('\n'), system.split('\n').slice(1).join('\n'))
+    }
+    assert.deepEqual(sealClaudeCodeCch(sealed), sealed)
+    assert.deepEqual(body, before)
+  }
+})
+
+test('a billing example in messages or an embedded system line is not canonical billing', () => {
+  const literal = 'x-anthropic-billing-header: cc_version=example; cch=259ed;'
+  const body = { messages: [{ role: 'user', content: literal }], system: `Documentation:\n${literal}` }
+  assert.deepEqual(sealClaudeCodeCch(body), body)
+  assert.throws(() => projectClaudeCodeCchText(JSON.stringify(body)), /billing cch not found/)
+})
+
 test('xxh64 matches Python xxhash.xxh64 intdigest vectors', () => {
   const seed = CCH_XXH64_SEED
   assert.equal(xxh64(Buffer.alloc(0), 0n), 0xef46db3751d8e999n)
@@ -119,6 +152,36 @@ test('CCH fills missing values and replaces stale values without changing billin
   }
 })
 
+test('sealing writes the digest into system billing only and never throws on prompt literals', () => {
+  const placeholderLiteral = `x-anthropic-billing-header: cc_version=1; cch=${CCH_PLACEHOLDER};`
+  const body = {
+    model: 'claude-opus-5-5',
+    messages: [
+      { role: 'user', content: placeholderLiteral },
+      { role: 'user', content: 'x-anthropic-billing-header: x; cch=abcde;' },
+    ],
+    system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=sdk-cli;' }],
+  }
+  const sealed = sealClaudeCodeCch(body)
+  assert.equal(sealed.messages[0].content, placeholderLiteral)
+  assert.equal(sealed.messages[1].content, body.messages[1].content)
+  const cch = sealed.system[0].text.match(/cch=([0-9a-f]{5});/)[1]
+  assert.notEqual(cch, CCH_PLACEHOLDER)
+  const unsealed = {
+    ...sealed,
+    system: [{ ...sealed.system[0], text: sealed.system[0].text.replace(cch, CCH_PLACEHOLDER) }],
+  }
+  const projected = JSON.stringify(unsealed).replace(/"model":"[^"]*"/g, '"model":""')
+  assert.equal(cch, computeClaudeCodeCch(Buffer.from(projected, 'utf8')))
+
+  const noBilling = {
+    model: 'm',
+    system: 'plain',
+    messages: [{ role: 'user', content: `literal cch=${CCH_PLACEHOLDER}` }],
+  }
+  assert.deepEqual(sealClaudeCodeCch(noBilling), noBilling)
+})
+
 test('CCH settings apply per hop and native sealing waits for final CLI serialization', () => {
   const body = {
     model: 'claude-opus-5-5',
@@ -174,7 +237,7 @@ test('no inbound system still emits billing, identity, official prompt, and env'
   )
   assert.equal(out.system.length, 4)
   assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
-  assert.equal(out.system[1].text, "You are a Claude agent, built on Anthropic's Claude Agent SDK.")
+  assert.equal(out.system[1].text, "You are Claude Code, Anthropic's official CLI for Claude.")
   assert.equal(out.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
   assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.match(out.system[3].text, /^# Environment\n/)

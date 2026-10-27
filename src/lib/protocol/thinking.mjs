@@ -11,6 +11,16 @@ import { anthropicContentIsEmpty, mergeConsecutiveAnthropicMessages, messageHasT
 
 export { clampEnabledThinkingBudget, MIN_THINKING_BUDGET }
 
+/** `routing.compatibility.thinking_display`：缺省 summarized，显式 passthrough 才保留调用方的值。 */
+export const THINKING_DISPLAY_MODES = ['summarized', 'passthrough']
+
+export function thinkingDisplayMode(routing) {
+  const raw = String(routing?.compatibility?.thinking_display ?? '')
+    .trim()
+    .toLowerCase()
+  return raw === 'passthrough' ? 'passthrough' : 'summarized'
+}
+
 /**
  * OpenAI reasoning <-> Claude thinking mapping + model-aware normalize.
  * Official (Aug 2026):
@@ -154,6 +164,54 @@ export function downgradeUngatedThinkingDisplay(body = {}, anthropicBetaHeader =
   return { ...body, thinking: { ...thinking, display: OFFICIAL_THINKING_DISPLAY } }
 }
 
+const HIDDEN_THINKING_DISPLAYS = new Set(['omitted', 'updates'])
+
+function bareModel(model) {
+  return (
+    String(model || '')
+      .toLowerCase()
+      .split('[')[0]
+      .split('/')
+      .filter(Boolean)
+      .pop() || ''
+  )
+}
+
+/** Opus 4.7+, the 5 series, Haiku 5.5, Fable and Mythos return empty thinking unless asked. */
+export function modelHidesThinkingByDefault(model) {
+  const m = bareModel(model)
+  if (!m) return false
+  if (/^claude-haiku-5(?:[-.]|$)/.test(m)) return true
+  if (/^claude-opus-4[-.][7-9](?:[-.]|$)/.test(m)) return true
+  if (/^claude-(?:opus|sonnet|fable|mythos)-5(?:[-.]|$)/.test(m)) return true
+  return /(?:^|-)(?:fable|mythos)(?:-|$)/.test(m)
+}
+
+/**
+ * `summarized` (the default) asks for a readable summary whenever the caller
+ * turned thinking on but hid it: explicit `omitted` or `updates`, no display
+ * at all, or no display on a model whose default is `omitted`. Other values
+ * and `disabled` stay untouched. `passthrough` sends the caller's choice.
+ * Never mutates the input.
+ */
+export function applyThinkingDisplay(body, mode) {
+  if (mode !== 'summarized' || !body || typeof body !== 'object') return body
+  const thinking = body.thinking
+  if (!thinking || typeof thinking !== 'object') return body
+  const type = String(thinking.type || '')
+    .trim()
+    .toLowerCase()
+  if (type !== 'adaptive' && type !== 'enabled') return body
+  const display = String(thinking.display ?? '')
+    .trim()
+    .toLowerCase()
+  if (display === 'summarized') return body
+  const hidden = HIDDEN_THINKING_DISPLAYS.has(display)
+  const unset = !display
+  if (!hidden && !unset) return body
+  return { ...body, thinking: { ...thinking, display: 'summarized' } }
+}
+
 function thinkingNeedsOfficialDisplay(thinking) {
   if (!thinking || typeof thinking !== 'object') return false
   const type = String(thinking.type || '').toLowerCase()
@@ -171,6 +229,12 @@ export function ensureUnofficialAdaptiveThinking(body = {}) {
   }
   if (!thinkingNeedsOfficialDisplay(body.thinking)) return body
   return { ...body, thinking: { ...body.thinking, display: OFFICIAL_THINKING_DISPLAY } }
+}
+/** Official --print fill: a missing thinking object becomes adaptive/omitted. Caller thinking is left alone. */
+export function ensureOfficialPrintThinking(body = {}) {
+  if (!body || typeof body !== 'object' || body.thinking != null) return body
+  if (!modelSupportsAdaptiveThinking(body.model)) return body
+  return { ...body, thinking: { type: 'adaptive', display: OFFICIAL_THINKING_DISPLAY } }
 }
 
 export function modelSupportsEffort(model = '') {
@@ -229,7 +293,7 @@ export function stripUnsupportedEffort(body = {}) {
   return { ...out, messages: mergeConsecutiveAnthropicMessages(messages) }
 }
 
-/** Official fill: missing output_config.effort. Never overwrite. Opus 5.5 defaults to medium. */
+/** Official fill: missing output_config.effort. `default_effort: off` adds nothing. */
 export function ensureUnofficialEffortHigh(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (!modelSupportsEffort(body.model)) return stripUnsupportedEffort(body)
@@ -239,6 +303,7 @@ export function ensureUnofficialEffortHigh(body = {}) {
   } catch {
     effort = 'high'
   }
+  if (effort === 'off') return body
   if (body.output_config && typeof body.output_config === 'object') {
     if (body.output_config.effort != null && body.output_config.effort !== '') return body
     return { ...body, output_config: { ...body.output_config, effort } }

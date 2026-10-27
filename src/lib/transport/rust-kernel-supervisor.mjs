@@ -14,8 +14,10 @@ import {
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
-import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
+import { profileForPreset } from '../identity/official-profiles.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
+import { getModelPolicy } from '../protocol/model-policy.mjs'
+import { ccEntrypointFromRouting } from '../identity/crs-persona.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
@@ -34,8 +36,27 @@ import {
   slotUidGidFromHomeDir,
   chownSlotRuntimeFile,
   replaceSlotOwnedFile,
+  runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+
+function normalizeAutoCompactWindow(value) {
+  const windowTokens = Number(value)
+  return Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000 ? windowTokens : null
+}
+
+const PANEL_EFFORTS = ['off', 'low', 'medium', 'high', 'xhigh', 'max']
+
+function modelEffortTable(routing, previous) {
+  if (routing == null) return previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}
+  const models = getModelPolicy()?.models || {}
+  const out = {}
+  for (const [id, row] of Object.entries(models)) {
+    const effort = row?.params?.default_effort
+    if (PANEL_EFFORTS.includes(effort)) out[String(id).toLowerCase()] = effort
+  }
+  return out
+}
 
 const starts = new Map()
 const KVM_HEALTH_MS = { kvm: 120_000, tcg: 480_000 }
@@ -51,7 +72,10 @@ function kvmBootBudget(vm, timeoutMs) {
 
 /** Bind the VM's docker daemon into an injectable runner. */
 function slotRunner(exec, run) {
-  const env = slotHost(exec?.vm).dockerEnv()
+  const host = slotHost(exec?.vm)
+  // A macOS node has no container to exec into; its kernel is a launchd job (see startRustKernel).
+  if (host.native) return async () => ({ ok: false, code: null, stdout: '', error: 'native_node_unsupported' })
+  const env = host.dockerEnv()
   if (!env) return run
   return (args, opts = {}) => run(args, { ...opts, env })
 }
@@ -143,6 +167,7 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
 export function stopRustKernel(exec = {}) {
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
+  if (slotHost(exec?.vm).native) return { ok: false, reason: 'native_node' }
   const env = slotHost(exec?.vm).dockerEnv()
   const result = spawnSync(
     process.env.KIN_DOCKER_BIN || 'docker',
@@ -541,6 +566,16 @@ async function startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, fo
   return started
 }
 
+/** launchd keeps the job alive; a restart is a kickstart, or a full load when the node lost the job. */
+async function startNativeKernel(exec, { timeoutMs, control, host }) {
+  const restarted = await host.restartKernel(exec.vm, projectRootFromExec(exec))
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!restarted?.ok) {
+    return { ok: false, reason: 'start_failed', error: String(restarted?.error || 'launchd restart failed') }
+  }
+  return waitForHealth(exec, timeoutMs)
+}
+
 async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force = false }) {
   if (exec?.homeDir) {
     const ids = slotUidGidFromHomeDir(exec.homeDir)
@@ -574,6 +609,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   } catch (error) {
     return { ok: false, reason: 'slot_sync_failed', error: String(error?.message || error) }
   }
+  if (host.native) return startNativeKernel(exec, { timeoutMs, control, host })
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
   if (isKvmRuntime(exec?.vm)) {
@@ -659,10 +695,19 @@ export function writeKernelConfig(
   vm,
   { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing } = {},
 ) {
-  if (!projectRoot || !vm?.id) return null
-  const runDir = path.join(projectRoot, 'vms', vm.id, 'run')
+  const root = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
+  const runDir = root ? path.join(root, vm.id) : path.join(projectRoot, 'vms', vm.id, 'run')
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
-  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
+  const privileged = typeof process.getuid === 'function' && process.getuid() === 0
+  const dirMode = privileged ? 0o700 : 0o2770
+  fs.mkdirSync(runDir, { recursive: true, mode: dirMode })
+  fs.chmodSync(runDir, dirMode)
+  try {
+    // Same owner as the files inside (runtimeFileOwner). Taking every digit of a named id
+    // (account2example -> 10002) disagreed with them, and the 0700 dir locked out the slot kernel (#740).
+    const owner = runtimeFileOwner(vm)
+    fs.chownSync(runDir, privileged ? owner.uid : -1, privileged ? owner.gid : process.getgid())
+  } catch {}
   const socketPath = path.join(runDir, 'kernel.sock')
   const configPath = path.join(runDir, 'kernel.json')
   const tokenPath = path.join(runDir, 'internal.token')
@@ -685,6 +730,15 @@ export function writeKernelConfig(
   // Callers pass partial vm snapshots (summaries, exec contexts); the vm json decides placement.
   const record = getVm(projectRoot, vm.id) || vm
   const host = slotHost(record)
+  // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
+  // Unknown until that node has connected once; the slot's own start writes the config then.
+  let nodePaths = null
+  try {
+    nodePaths = host.slotPaths?.(record) || null
+  } catch (err) {
+    if (host.native) return null
+    throw err
+  }
   const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
@@ -693,16 +747,28 @@ export function writeKernelConfig(
   const previousMax = Number(previous.max_request_bytes)
   const requestBytes = routing == null && previousMax > 0 ? previousMax : maxRequestBytes(routing)
   const cchEnabled = routing == null ? previous.cch_enabled !== false : routing?.compatibility?.cch_enabled !== false
+  const previousWindow = Number(previous.auto_compact_window)
+  const autoCompactWindow =
+    routing == null
+      ? Number.isInteger(previousWindow) && previousWindow >= 100_000 && previousWindow <= 1_000_000
+        ? previousWindow
+        : null
+      : normalizeAutoCompactWindow(routing?.compatibility?.auto_compact_window)
   const sessionIdleTtlSeconds =
     routing == null
       ? normalizeSessionIdleTtlSeconds(previous.session_idle_ttl_seconds)
       : normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds)
 
+  const modelEffort = modelEffortTable(routing, previous.model_effort)
   const kind = runtimeKind(record)
   const config = {
     vm_id: vm.id,
-    socket_path: kind === 'kvm' ? '/run/kin-guest/kernel.sock' : '/run/kin/kernel.sock',
-    credential_path: '/home/kincli/.claude/credentials.json',
+    socket_path: nodePaths
+      ? `${nodePaths.run}/kernel.sock`
+      : kind === 'kvm'
+        ? '/run/kin-guest/kernel.sock'
+        : '/run/kin/kernel.sock',
+    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : '/home/kincli/.claude/credentials.json',
     proxy_url: '',
     proxy_required: false,
     internal_token: secret,
@@ -723,9 +789,14 @@ export function writeKernelConfig(
     slots_per_worker: wrapSlotCount(vm, routing || {}),
     persona_preset: resolveSlotPersonaPreset(vm, routing || {}),
     system_layout: resolveCliSystemLayout(vm, routing || {}),
-    cli_version: OFFICIAL_CLI_VERSION,
+    // cli-node hot-reads this per job: UA, billing cc_version and CCH input follow the slot's profile.
+    cli_version: profileForPreset(resolveSlotPersonaPreset(vm, routing || {})).cliVersion,
     default_cache_ttl: defaultCacheTtl,
+    cc_entrypoint:
+      routing == null ? (previous.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli') : ccEntrypointFromRouting(routing),
     cch_enabled: cchEnabled,
+    auto_compact_window: autoCompactWindow,
+    model_effort: modelEffort,
   }
 
   if (tz) config.timezone = tz
@@ -736,6 +807,9 @@ export function writeKernelConfig(
     if (oauthTokenUrl) config.oauth_token_url = oauthTokenUrl
   }
   const changed = writeKernelJsonAtomically(configPath, config, vm)
+  try {
+    fs.chmodSync(configPath, privileged ? 0o600 : 0o640)
+  } catch {}
   // kin-kernel hot-reloads kernel.json: the change must reach wherever the slot reads it.
   if (changed) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
   return {

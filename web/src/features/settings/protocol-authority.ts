@@ -23,6 +23,21 @@ export function cchEnabledFromCompat(
 ): boolean {
   return compat?.cch_enabled !== false
 }
+/** `routing.compatibility.cc_entrypoint`：只有显式 sdk-cli 离开 cli 缺省。 */
+export function ccEntrypointFromCompat(
+  compat: Record<string, unknown> | undefined
+): 'sdk-cli' | 'cli' {
+  return compat?.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli'
+}
+
+/** `routing.compatibility.thinking_display`：缺省 summarized，显式 passthrough 才关。 */
+export function thinkingDisplayFromCompat(
+  compat: Record<string, unknown> | undefined
+): 'summarized' | 'passthrough' {
+  return compat?.thinking_display === 'passthrough'
+    ? 'passthrough'
+    : 'summarized'
+}
 
 /** `routing.inference.session_idle_ttl_seconds`：kernel 原生 sticky 槽空闲，默认 600。 */
 export function sessionIdleTtlFromInference(
