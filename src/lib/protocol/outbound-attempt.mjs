@@ -6,9 +6,9 @@ import { officialMessagesBody } from './anthropic-messages.mjs'
 import {
   prepareAnthropicRequest,
   rewriteToolNames,
+  scrubUpstreamClientBody,
   sanitizeAnthropicBodyForBetaTokens,
   ensureFastModeBeta,
-  ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
@@ -56,6 +56,8 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 
 import { isApiKeyMode, isAnySetupTokenMode } from '../oauth/credential-mode.mjs'
 import { prepareClassifierBody } from './request-purpose.mjs'
+import { validateBetweenToolsThinking } from './model-policy.mjs'
+import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 
 export const INFERENCE_UA = 'kin-inference/1.0'
 
@@ -245,25 +247,17 @@ function stampMessageTail(messages, index, ttl) {
     return
   }
 }
-/** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
-function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) {
+/** Tool-cache cleanup must not remove caller or panel-controlled eager streaming. */
+function stripToolCacheControl(tools, { preserveCacheControl = false } = {}) {
   if (!Array.isArray(tools)) return tools
   let changed = false
   const next = tools.map((tool) => {
     if (!tool || typeof tool !== 'object') return tool
-    const hasOwn = Object.prototype.hasOwnProperty.call(tool, 'eager_input_streaming')
     const hasCache = !preserveCacheControl && Object.prototype.hasOwnProperty.call(tool, 'cache_control')
-    const fn = tool.function
-    const fnHas = fn && typeof fn === 'object' && Object.prototype.hasOwnProperty.call(fn, 'eager_input_streaming')
-    if (!hasOwn && !hasCache && !fnHas) return tool
+    if (!hasCache) return tool
     changed = true
     const copy = { ...tool }
-    delete copy.eager_input_streaming
-    if (!preserveCacheControl) delete copy.cache_control
-    if (fnHas) {
-      copy.function = { ...fn }
-      delete copy.function.eager_input_streaming
-    }
+    delete copy.cache_control
     return copy
   })
   return changed ? next : tools
@@ -273,7 +267,7 @@ function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) 
 export function prepareCliPersonaInput(body, preset) {
   if (preset === 'zero') return body
   const { cache_control: _automatic, ...out } = body
-  if (Array.isArray(out.tools)) out.tools = stripEagerInputStreaming(out.tools)
+  if (Array.isArray(out.tools)) out.tools = stripToolCacheControl(out.tools)
   return out
 }
 
@@ -333,6 +327,7 @@ export function prepareCliHopBody(
   } = {},
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
+  validateBetweenToolsThinking(canonicalBody)
   // official_303 lean: renderOfficial303Body owns system, role=system placement and markers.
   const lean = outboundShape === 'lean' && !requestContext
   if (preserveSystem) validateCacheBreakpoints(canonicalBody)
@@ -405,7 +400,7 @@ export function prepareCliHopBody(
     // Keep official tool-marker cleanup before counting available slots. A
     // caller's 5m tool marker must not precede a template-owned 1h system marker.
     if (Array.isArray(body.tools)) {
-      body = { ...body, tools: stripEagerInputStreaming(body.tools, { preserveCacheControl: zeroFallback }) }
+      body = { ...body, tools: stripToolCacheControl(body.tools, { preserveCacheControl: zeroFallback }) }
     }
     // Assembled official templates own their system markers, not the growing
     // conversation. Fill missing message anchors without moving caller markers.
@@ -419,9 +414,30 @@ export function prepareCliHopBody(
         const ttl = markers.some((marker) => marker.ttl !== '1h') ? '5m' : cacheTtl
         body.messages = officialMessageMarker(body.messages, ttl, Math.min(2, available))
       }
+      // These CLI presets always stamp both system boundaries, including one
+      // Node may have unmarked while preserving interpolated caller anchors.
+      // Budget the final wire shape, retaining the newest message anchors.
+      if (personaPreset === 'official' || personaPreset === 'official_full') {
+        const markers = listCacheMarkers(body)
+        const prefixCount = markers.filter((marker) => marker.section !== 'messages').length
+        const messages = markers.filter((marker) => marker.section === 'messages')
+        const excess = messages.length - Math.max(0, 4 - Math.max(2, prefixCount))
+        if (excess > 0) {
+          const drop = new Set(messages.slice(0, excess).map((marker) => `${marker.index}:${marker.blockIndex}`))
+          body.messages = body.messages.map((message, index) => {
+            if (!Array.isArray(message?.content)) return message
+            const content = message.content.map((block, blockIndex) => {
+              if (!drop.has(`${index}:${blockIndex}`)) return block
+              const { cache_control, ...rest } = block
+              return rest
+            })
+            return { ...message, content }
+          })
+        }
+      }
     }
   }
-  return body
+  return applyEagerToolStreaming(body, routing)
 }
 
 export function prepareOutboundAttempt({
@@ -512,8 +528,17 @@ export function prepareOutboundAttempt({
   cleaned = stripIllegalCacheControlFields(cleaned)
   if (cacheTtl) cleaned = applyCacheTtlToBody(cleaned, cacheTtl)
   cleaned = enforceCacheTtlOrder(cleaned)
-  const tools = rewriteToolNames(cleaned, { enabled: toolNameRewrite !== false })
-  return { body: tools.body, toolNames: tools.reverse }
+  const scrubbed = scrubUpstreamClientBody(cleaned, {
+    official: !unofficial,
+    rewriteTools: toolNameRewrite !== false,
+  })
+  const tools = rewriteToolNames(scrubbed.body, { enabled: toolNameRewrite !== false })
+  const toolNames = {}
+  for (const [wire, mid] of Object.entries(tools.reverse)) {
+    const client = scrubbed.reverse[mid] || mid
+    if (client !== wire) toolNames[wire] = client
+  }
+  return { body: tools.body, toolNames }
 }
 
 export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m } = {}) {

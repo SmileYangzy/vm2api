@@ -1,3 +1,5 @@
+import { REASONING_EFFORTS, reasoningEffortOf } from './log-fields.mjs'
+
 import { BETA_THINKING_DISPLAY_UPDATES } from './claude-code-betas.mjs'
 
 import {
@@ -95,18 +97,6 @@ export function modelSupportsAdaptiveThinking(model = '') {
   return false
 }
 
-/** Models that reject thinking.type=enabled (adaptive-only) */
-export function modelRequiresAdaptiveThinking(model = '') {
-  const m = String(model || '')
-    .toLowerCase()
-    .split('[')[0]
-  if (m.includes('haiku')) return false
-  if (/claude-opus-4-[7-9]/.test(m) || /claude-opus-4\.[7-9]/.test(m)) return true
-  if (/claude-(opus|sonnet|fable|mythos)-5/.test(m)) return true
-  if (m.includes('fable') || m.includes('mythos')) return true
-  return false
-}
-
 /**
  * Normalize body.thinking for the target model (mutates body).
  * - adaptive on unsupported (Haiku / 4.5) -> enabled + budget (keep thinking intent)
@@ -165,27 +155,6 @@ export function downgradeUngatedThinkingDisplay(body = {}, anthropicBetaHeader =
 }
 
 const HIDDEN_THINKING_DISPLAYS = new Set(['omitted', 'updates'])
-
-function bareModel(model) {
-  return (
-    String(model || '')
-      .toLowerCase()
-      .split('[')[0]
-      .split('/')
-      .filter(Boolean)
-      .pop() || ''
-  )
-}
-
-/** Opus 4.7+, the 5 series, Haiku 5.5, Fable and Mythos return empty thinking unless asked. */
-export function modelHidesThinkingByDefault(model) {
-  const m = bareModel(model)
-  if (!m) return false
-  if (/^claude-haiku-5(?:[-.]|$)/.test(m)) return true
-  if (/^claude-opus-4[-.][7-9](?:[-.]|$)/.test(m)) return true
-  if (/^claude-(?:opus|sonnet|fable|mythos)-5(?:[-.]|$)/.test(m)) return true
-  return /(?:^|-)(?:fable|mythos)(?:-|$)/.test(m)
-}
 
 /**
  * `summarized` (the default) asks for a readable summary whenever the caller
@@ -309,4 +278,47 @@ export function ensureUnofficialEffortHigh(body = {}) {
     return { ...body, output_config: { ...body.output_config, effort } }
   }
   return { ...body, output_config: { effort } }
+}
+
+// Same order as cli-node getDefaultEffortForModel: longer ids first.
+const CATALOG_EFFORT = [
+  ['haiku-5', 'medium'],
+  ['sonnet-5-5', 'medium'],
+  ['sonnet-5', 'high'],
+  ['sonnet-4-6', 'high'],
+  ['opus-5-5', 'medium'],
+  ['opus-5', 'high'],
+  ['opus-4-8', 'high'],
+  ['opus-4-7', 'xhigh'],
+  ['opus-4-6', 'xhigh'],
+  ['fable-5-1', 'high'],
+  ['fable-5', 'high'],
+  ['mythos-5-1', 'high'],
+]
+
+function catalogEffort(model) {
+  const id = String(model || '').toLowerCase()
+  const hit = CATALOG_EFFORT.find(([needle]) => id.includes(needle))
+  return hit ? hit[1] : null
+}
+
+/**
+ * Effort column. Caller or outbound field wins. Otherwise the level cli-node
+ * attaches: panel default_effort, else the catalog default. `off` stays null.
+ * Models that reject effort stay null.
+ */
+export function loggedReasoningEffort(body) {
+  const explicit = reasoningEffortOf(body)
+  if (explicit) return explicit
+  if (!body || typeof body !== 'object' || !modelSupportsEffort(body.model)) return null
+  let configured
+  try {
+    configured = getModelParams(body.model)?.default_effort
+  } catch {
+    configured = undefined
+  }
+  if (!configured) configured = catalogEffort(body.model) || 'high'
+  if (configured === 'off') return null
+  const effort = String(configured).trim().toLowerCase()
+  return REASONING_EFFORTS.has(effort) ? effort : null
 }

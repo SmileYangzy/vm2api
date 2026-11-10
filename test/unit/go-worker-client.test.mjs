@@ -224,6 +224,99 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
 })
 
+test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
+  const block = {
+    type: 'tool_addition',
+    tool: {
+      type: 'tool_definition',
+      definition: { name: 'lookup', description: 'lookup', input_schema: { type: 'object' } },
+    },
+  }
+  const out = finalizeWorkerPayload({
+    body: {
+      model: 'claude-opus-5-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: [{ type: 'text', text: 'note' }, block] },
+      ],
+    },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(out.body.betas.includes('inline-tools-2026-09-15'))
+  assert.equal(out.body.messages[1].content[1].tool.type, 'tool_definition')
+  const plain = finalizeWorkerPayload({
+    body: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
+})
+
+test('CRAG v2 receives the preset model boundary and the standard kernel does not', () => {
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  const reqHeaders = {}
+  const crag = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } },
+    },
+    identity: null,
+  })
+  assert.equal(crag.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(crag.body.crag_model.capabilities.supports_context_management, false)
+  assert.equal(crag.body.crag_model.capabilities.supports_effort, false)
+  assert.equal(crag.body.crag_model.params.max_tokens_default, 8192)
+  assert.equal(crag.body.crag_model.params.max_tokens_cap, 64000)
+  assert.ok(crag.body.crag_model.betas.drop.includes('context-management-2025-06-27'))
+  const wrap = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec: { homeDir: '', vm: { dataplane: 'wrap', claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+  })
+  assert.equal(wrap.body.crag_model, undefined)
+})
+
+test('a wrap VM does not inherit a global CRAG v2 route', () => {
+  const body = {
+    model: 'claude-haiku-4-5',
+    crag_prompt: { mode: 'append', text: 'caller' },
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  const wrap = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' } },
+    routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
+    identity: null,
+  })
+  assert.equal(wrap.body.crag_model, undefined)
+  assert.equal(wrap.body.crag_prompt, undefined)
+  const forced = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    identity: null,
+    cragPrint: false,
+  })
+  assert.equal(forced.body.crag_model, undefined)
+  const live = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    identity: null,
+  })
+  assert.equal(live.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(live.body.crag_prompt.mode, 'append')
+})
+
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
 

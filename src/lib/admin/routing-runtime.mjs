@@ -31,6 +31,8 @@ import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import { mergeNotifyConfig } from './notify.mjs'
+import { normalizeRedaction } from '../redaction/policy.mjs'
+import { ensureRedaction } from '../redaction/runtime.mjs'
 import { normalizeLoggingConfig } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
@@ -50,9 +52,8 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
-import { syncWorkerTelemetry } from '../vm/vm-runtime.mjs'
-import { slotHost } from '../vm/slot-host.mjs'
-import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
+import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
+import { telemetryUploadInterval } from '../vm/native-telemetry.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -407,21 +408,24 @@ export function createRoutingRuntime(ctx) {
     return queued
   }
 
-  // The sidecar re-reads worker.json on mtime change, so a rewrite applies without a restart.
-  // Node slots read a pushed copy; that push is queued and only logged on failure.
-  function syncTelemetryUploadInterval(routingConfig) {
+  // Native slots hot-read kernel.json; publication must be acknowledged per VM.
+  async function syncTelemetryUploadInterval(routingConfig) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
       try {
-        if (!syncWorkerTelemetry(vm, project, routingConfig).wrote) {
+        const result = await applyNativeTelemetry({ projectRoot: project, vm, routing: routingConfig })
+        if (result.supported === false) {
           applied.skipped += 1
           continue
         }
-        if (slotHost(vm).queueSyncRun(vm, path.join(project, 'vms', vm.id))) applied.queued += 1
-        else applied.updated += 1
+        if (!result.ok || !result.published) {
+          applied.failed.push(vm.id)
+          continue
+        }
+        applied.updated += 1
       } catch {
         applied.failed.push(vm.id)
       }
@@ -429,10 +433,17 @@ export function createRoutingRuntime(ctx) {
     return applied
   }
 
-  function persistRoutingPatch(body = {}) {
+  async function persistRoutingPatch(body = {}) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    let nextRedaction = null
+    if (body.redaction !== undefined) {
+      nextRedaction = normalizeRedaction(body.redaction)
+      if (nextRedaction.enabled) {
+        await ensureRedaction({ redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+      }
+    }
     let routingConfig = getRouting()
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
@@ -515,6 +526,7 @@ export function createRoutingRuntime(ctx) {
         mutedErrorClasses: routingConfig.logging.muted_error_classes,
       })
     }
+    if (nextRedaction) routingConfig.redaction = nextRedaction
     fs.mkdirSync(path.dirname(ctx.routingConfigPath), { recursive: true })
     fs.writeFileSync(ctx.routingConfigPath, JSON.stringify(routingConfig, null, 2))
     ctx.stickyRouter.reloadConfig(routingConfig)
@@ -533,7 +545,9 @@ export function createRoutingRuntime(ctx) {
     // Stream idle / body-limit still need an idle restart; CCH and sticky-slot TTL hot-read kernel.json.
     const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval ? syncTelemetryUploadInterval(routingConfig) : null
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval
+        ? await syncTelemetryUploadInterval(routingConfig)
+        : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).
@@ -590,6 +604,7 @@ export function createRoutingRuntime(ctx) {
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {
       throw new Error(`Routing config '${ctx.routingConfigPath}' has invalid JSON: ${error?.message || error}`, {

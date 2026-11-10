@@ -15,18 +15,23 @@ import {
 } from './rust-kernel-client.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
+import { resolveWorkstationProfile } from '../identity/workstation-profile.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
+import { thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { getModelPolicy } from '../protocol/model-policy.mjs'
 import { ccEntrypointFromRouting } from '../identity/crs-persona.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
   normalizeSessionIdleTtlSeconds,
+  REMOTE_CRAG_CLAUDE,
   resolveCliSystemLayout,
+  resolveCragKernelVersion,
   resolveKernelDataplane,
   resolveSlotPersonaPreset,
 } from '../vm/slot-engine.mjs'
@@ -39,6 +44,22 @@ import {
   runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
+import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
+import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
+import { checkCragLicense } from '../vm/crag-license.mjs'
+import { workerPaths } from './go-worker-client.mjs'
+
+/** The native host is authenticated separately from account scheduling readiness. */
+function runtimeReady(health, allowMissingCredential) {
+  if (!allowMissingCredential) return rustKernelReachable(health)
+  return (
+    health?.vm_telemetry === true &&
+    health?.telemetry_ready === true &&
+    health?.healthy !== false &&
+    Number(health?.cli_pid) > 0
+  )
+}
 
 function normalizeAutoCompactWindow(value) {
   const windowTokens = Number(value)
@@ -127,14 +148,15 @@ export function readExistingKernelConfig(configPath) {
   }
 }
 
-/** crag and cc run cc-node. Restarting that slot SIGKILLs the worker. */
+/** Legacy crag and cc use cc-node; native V2 owns its own child lifecycle. */
 export function dataplaneUsesCcNode(exec) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
-  const plane = String(readExistingKernelConfig(configPath).dataplane || '')
+  const config = readExistingKernelConfig(configPath)
+  const plane = String(config.dataplane || '')
     .trim()
     .toLowerCase()
-  return plane === 'crag' || plane === 'cc' || plane === 'cc-node'
+  return (plane === 'crag' && config.crag_kernel_version !== 'v2') || plane === 'cc' || plane === 'cc-node'
 }
 function projectRootFromExec(exec = {}) {
   if (exec?.projectRoot) return exec.projectRoot
@@ -174,7 +196,15 @@ export function stopRustKernel(exec = {}) {
     execArgv(exec, [
       'sh',
       '-lc',
-      'kill $(pidof kin-kernel) >/dev/null 2>&1 || true; kill $(pidof bun) >/dev/null 2>&1 || true',
+      [
+        'for p in $(pidof crag-v2 2>/dev/null); do',
+        '  case "$(tr "\\000" " " < "/proc/$p/cmdline" 2>/dev/null)" in',
+        '    *" --gateway-worker "*) kill -TERM "$p" 2>/dev/null || true ;;',
+        '  esac',
+        'done',
+        'kill $(pidof kin-kernel) >/dev/null 2>&1 || true',
+        'kill $(pidof bun) >/dev/null 2>&1 || true',
+      ].join('\n'),
     ]),
     { encoding: 'utf8', timeout: 5000, ...(env ? { env } : {}) },
   )
@@ -224,12 +254,12 @@ function runDocker(args, { timeoutMs = 5000, env } = {}) {
   })
 }
 
-async function waitForHealth(exec, timeoutMs) {
+async function waitForHealth(exec, timeoutMs, allowMissingCredential = false) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   let last = { ok: false, reason: 'not_ready' }
   while (Date.now() < deadline) {
     last = await rustKernelHealth(exec, { timeoutMs: 400 })
-    if (rustKernelReachable(last)) return { ok: true, reason: 'started_in_vm', health: last }
+    if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     await new Promise((resolve) => setTimeout(resolve, 80))
   }
   return { ok: false, reason: 'health_timeout', health: last, error: last?.error || 'rust kernel health timeout' }
@@ -238,18 +268,23 @@ async function waitForHealth(exec, timeoutMs) {
 async function kernelProcessAlive(exec, runDockerExec) {
   const container = slotContainerName(exec)
   if (!container) return false
-  const result = await runDockerExec(
-    execArgv(exec, [
-      'sh',
-      '-c',
-      'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null',
-    ]),
-    { timeoutMs: 1500 },
-  )
+  const config = readExistingKernelConfig(rustKernelPaths(exec).configPath)
+  const probe =
+    config.dataplane === 'crag' && config.crag_kernel_version === 'v2'
+      ? [
+          'for p in $(pidof crag-v2 2>/dev/null); do',
+          '  case "$(tr "\\000" " " < "/proc/$p/cmdline" 2>/dev/null)" in',
+          '    *" --gateway-worker "*) exit 0 ;;',
+          '  esac',
+          'done',
+          'exit 1',
+        ].join('\n')
+      : 'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null'
+  const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: 1500 })
   return result?.ok === true
 }
 
-async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control }) {
+async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control, allowMissingCredential }) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   const started = Date.now()
   let last = { ok: false, reason: 'not_ready' }
@@ -257,7 +292,7 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
   while (Date.now() < deadline) {
     if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
     last = await rustKernelHealth(exec, { timeoutMs: 400 })
-    if (rustKernelReachable(last)) return { ok: true, reason: 'started_in_vm', health: last }
+    if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     // KVM guest boot is minutes under TCG; a missing process at 1.2s is not failure.
     if (!isKvmRuntime(exec?.vm) && !checkedProcess && Date.now() - started >= 1200 && container) {
       checkedProcess = true
@@ -276,13 +311,34 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
   return { ok: false, reason: 'health_timeout', health: last, error: last?.error || 'rust kernel health timeout' }
 }
 
-export async function ensureRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker, force = false } = {}) {
+export async function ensureRustKernel(
+  exec,
+  {
+    timeoutMs = 30000,
+    healthTimeoutMs = 800,
+    runDockerExec = runDocker,
+    force = false,
+    allowMissingCredential = false,
+  } = {},
+) {
   const vmId = exec?.vmId || exec?.vm?.id || 'unknown'
   const pending = starts.get(vmId)
-  if (pending && !force) return pending.promise
+  if (pending && !force) {
+    const result = await pending.promise
+    if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
+    return { ok: false, reason: 'telemetry_not_ready', health: result?.health }
+  }
   const control = { cancelled: false }
   const run = slotRunner(exec, runDockerExec)
-  const promise = startRustKernel(exec, { timeoutMs, vmId, control, runDockerExec: run, force })
+  const promise = startRustKernel(exec, {
+    timeoutMs,
+    healthTimeoutMs,
+    vmId,
+    control,
+    runDockerExec: run,
+    force,
+    allowMissingCredential,
+  })
   const start = { promise, control }
   starts.set(vmId, start)
   try {
@@ -308,8 +364,11 @@ async function killWrapDataplane(exec, runDockerExec) {
         'for d in /proc/[0-9]*; do',
         '  exe=$(readlink "$d/exe" 2>/dev/null || true)',
         '  case "$exe" in */qemu-*) exe=$(tr "\\000" "\\n" < "$d/cmdline" 2>/dev/null | sed -n 2p) ;; esac',
+        '  case "$exe" in */.kin/crag-v2/crag-v2)',
+        '    case "$(tr "\\000" " " < "$d/cmdline" 2>/dev/null)" in *" --internal-execution-guard "*) continue ;; esac ;;',
+        '  esac',
         '  case "$exe" in',
-        '    */.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|*/.kin/glibc239/arm64/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*|/opt/kin/glibc239/arm64/ld-linux*)',
+        '    */.kin/crag-v2/*|*/.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|*/.kin/glibc239/arm64/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*|/opt/kin/glibc239/arm64/ld-linux*)',
         '      kill -KILL "${d#/proc/}" 2>/dev/null || true',
         '  esac',
         'done',
@@ -430,6 +489,14 @@ const kernelReloadPending = new Map()
 function kernelJobsRunning(exec, health) {
   if (!rustKernelProcessUp(health)) return 0
   if (health.recovering === true) return 1
+  if (health.runtime_variant === 'crag-v2') {
+    return (
+      Math.max(
+        Number(health.active || 0) + Number(health.waiting || 0),
+        Array.isArray(health.pids) ? health.pids.length : 0,
+      ) + Number(health.queued || 0)
+    )
+  }
   const ready = Number(health.ready_slots)
   if (!Number.isFinite(ready)) return 0
   const total = Number(readExistingKernelConfig(rustKernelPaths(exec).configPath).slots_per_worker) || WRAP_SLOT_MAX
@@ -522,7 +589,7 @@ export async function recycleWrapIfIdle(
 async function containerKernelIsPid1(container, runDockerExec, vm) {
   if (isKvmRuntime(vm)) return false
   const info = await runDockerExec(['inspect', '--format', '{{.Path}}', container], { timeoutMs: 3000 })
-  return /kin-kernel/.test(String(info?.stdout || ''))
+  return /kin-kernel|(?:^|\/)crag-v2$/.test(String(info?.stdout || '').trim())
 }
 function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
   if (!pid1Kernel && !wedged) return 0
@@ -532,22 +599,38 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
   return cap
 }
 
-async function startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, force, host, paths, container }) {
+/** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
+async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
+  try {
+    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY], { user: '0' }), {
+      timeoutMs: 5000,
+    })
+    if (retired?.ok) return { ok: true }
+  } catch {}
+  return { ok: false, reason: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+}
+
+async function startKvmGuestKernel(
+  exec,
+  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential },
+) {
   const budget = kvmBootBudget(exec.vm, timeoutMs)
   if (!force) {
-    const waited = await waitForHealth(exec, budget)
+    const waited = await waitForHealth(exec, budget, allowMissingCredential)
     if (waited?.ok) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
     }
   }
+  const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
+  if (!retired.ok) return retired
   await killWrapDataplane(exec, runDockerExec)
   const launched = await runDockerExec(execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0' }), {
     timeoutMs: Math.min(budget, 30_000),
   })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   if (!launched?.ok) {
-    const waited = await waitForHealth(exec, budget)
+    const waited = await waitForHealth(exec, budget, allowMissingCredential)
     if (waited?.ok) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
@@ -555,13 +638,15 @@ async function startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, fo
     const error = String(launched?.error || waited?.error || 'guest kernel restart failed')
     return { ok: false, reason: 'health_timeout', error }
   }
-  const started = await waitForHealthOrExit(exec, { timeoutMs: budget, container, runDockerExec, control })
+  const started = await waitForHealthOrExit(exec, {
+    timeoutMs: budget,
+    container,
+    runDockerExec,
+    control,
+    allowMissingCredential,
+  })
   if (started?.ok) {
     started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
-    await runDockerExec(
-      execArgv(exec, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], { detach: true }),
-      { timeoutMs: 5000 },
-    )
   }
   return started
 }
@@ -576,7 +661,14 @@ async function startNativeKernel(exec, { timeoutMs, control, host }) {
   return waitForHealth(exec, timeoutMs)
 }
 
-async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force = false }) {
+async function startRustKernel(
+  exec,
+  { timeoutMs, healthTimeoutMs = 800, control, runDockerExec, force = false, allowMissingCredential = false },
+) {
+  const licensed = checkCragLicense(projectRootFromExec(exec), exec?.vm, {
+    inference: { dataplane: readExistingKernelConfig(rustKernelPaths(exec).configPath).dataplane },
+  })
+  if (!licensed.ok) return { ...licensed, reason: licensed.code }
   if (exec?.homeDir) {
     const ids = slotUidGidFromHomeDir(exec.homeDir)
     ensureOfficialCredentialLink(exec.homeDir, ids || {})
@@ -586,7 +678,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   }
   const paths = rustKernelPaths(exec)
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
-  const existing = await rustKernelHealth(exec, { timeoutMs: 800 })
+  const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const staleWrap = wrapNewerThanKernel(exec)
   const slotMismatch =
@@ -594,11 +686,11 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
   const host = slotHost(exec?.vm)
   // Credential rotation is read by the live kernel/CLI; it is not a lifecycle change.
-  if (!force && occupied && !staleWrap && !slotMismatch) {
+  if (!allowMissingCredential && !force && occupied && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'busy', health: existing, reconcile }
   }
-  if (!force && rustKernelReachable(existing) && !staleWrap && !slotMismatch) {
+  if (!force && runtimeReady(existing, allowMissingCredential) && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
@@ -613,18 +705,29 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
   if (isKvmRuntime(exec?.vm)) {
-    return startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, force, host, paths, container })
+    return startKvmGuestKernel(exec, {
+      timeoutMs,
+      control,
+      runDockerExec,
+      force,
+      host,
+      paths,
+      container,
+      allowMissingCredential,
+    })
   }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
   const pid1Kernel = await containerKernelIsPid1(container, runDockerExec, exec?.vm)
   const waitMs = force || staleWrap || slotMismatch ? 0 : bootWaitMs(timeoutMs, { pid1Kernel, wedged })
   if (waitMs > 0) {
-    const waited = await waitForHealth(exec, waitMs)
+    const waited = await waitForHealth(exec, waitMs, allowMissingCredential)
     if (waited?.ok) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
     }
   }
+  const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
+  if (!retired.ok) return retired
   try {
     if (host.ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
@@ -650,17 +753,15 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
     return { ok: false, reason, error }
   }
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-  const started = await waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control })
+  const started = await waitForHealthOrExit(exec, {
+    timeoutMs,
+    container,
+    runDockerExec,
+    control,
+    allowMissingCredential,
+  })
   if (started?.ok) {
     started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
-    if (pid1Kernel) {
-      await runDockerExec(
-        execArgv(exec, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
-          detach: true,
-        }),
-        { timeoutMs: 5000 },
-      )
-    }
   }
   return started
 }
@@ -674,6 +775,55 @@ export function stopAllRustKernels() {
 }
 function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'
+}
+
+function acceptNativeClaudeSetup(homeDir, workDir) {
+  // The TUI refuses login, theme, and folder-trust screens. The credential file is
+  // separate; these flags are what Claude reads before it will take a prompt.
+  for (const file of [path.join(homeDir, '.claude', '.claude.json'), path.join(homeDir, '.claude.json')]) {
+    let raw
+    try {
+      raw = fs.readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    let doc
+    try {
+      doc = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) continue
+    let changed = false
+    if (doc.hasCompletedOnboarding !== true) {
+      doc.hasCompletedOnboarding = true
+      changed = true
+    }
+    if (typeof doc.theme !== 'string' || !doc.theme) {
+      doc.theme = 'dark'
+      changed = true
+    }
+    if (!doc.projects || typeof doc.projects !== 'object' || Array.isArray(doc.projects)) {
+      doc.projects = {}
+      changed = true
+    }
+    for (const folder of [workDir, '/home/kincli']) {
+      const current = doc.projects[folder]
+      const project = current && typeof current === 'object' && !Array.isArray(current) ? current : {}
+      if (project.hasTrustDialogAccepted === true) continue
+      project.hasTrustDialogAccepted = true
+      doc.projects[folder] = project
+      changed = true
+    }
+    if (!changed) continue
+    const st = fs.statSync(file)
+    const tmp = `${file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode: st.mode & 0o777 })
+    try {
+      fs.chownSync(tmp, st.uid, st.gid)
+    } catch {}
+    fs.renameSync(tmp, file)
+  }
 }
 
 function writeKernelJsonAtomically(configPath, config, vm) {
@@ -693,11 +843,16 @@ function writeKernelJsonAtomically(configPath, config, vm) {
 export function writeKernelConfig(
   projectRoot,
   vm,
-  { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing } = {},
+  { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing, publish = true } = {},
 ) {
-  const root = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
-  const runDir = root ? path.join(root, vm.id) : path.join(projectRoot, 'vms', vm.id, 'run')
+  // Callers pass partial vm snapshots; persisted placement owns the guest run mount.
+  const record = getVm(projectRoot, vm.id) || vm
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
+  const runDir = workerPaths({
+    vm: record,
+    homeDir,
+    runRoot: String(process.env.KIN_SLOT_RUN_ROOT || '').trim(),
+  }).runDir
   const privileged = typeof process.getuid === 'function' && process.getuid() === 0
   const dirMode = privileged ? 0o700 : 0o2770
   fs.mkdirSync(runDir, { recursive: true, mode: dirMode })
@@ -727,8 +882,6 @@ export function writeKernelConfig(
   const testEndpoints = process.env.KIN_KERNEL_TEST_ENDPOINTS === '1'
   const dataplane = resolveKernelDataplane(vm, routing || {}) || 'wrap'
   const envBin = String(process.env.KIN_CLAUDE_BIN || '').trim()
-  // Callers pass partial vm snapshots (summaries, exec contexts); the vm json decides placement.
-  const record = getVm(projectRoot, vm.id) || vm
   const host = slotHost(record)
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
@@ -742,6 +895,12 @@ export function writeKernelConfig(
   const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
+  const thinkingDisplay =
+    routing != null
+      ? thinkingDisplayMode(routing)
+      : previous.thinking_display === 'passthrough'
+        ? 'passthrough'
+        : 'summarized'
   const previousIdleSeconds = Number(previous.idle_timeout_seconds)
   const idleMs = routing == null && previousIdleSeconds > 0 ? previousIdleSeconds * 1000 : streamIdleTimeoutMs(routing)
   const previousMax = Number(previous.max_request_bytes)
@@ -780,11 +939,12 @@ export function writeKernelConfig(
     session_idle_ttl_seconds: sessionIdleTtlSeconds,
     max_request_bytes: requestBytes,
     max_response_bytes: 64 * 1024 * 1024,
-    max_event_bytes: 32 * 1024 * 1024,
+    max_event_bytes: 64 * 1024 * 1024,
     runtime_kind: kind,
     test_endpoints: testEndpoints,
     provider: 'local_cli',
     dataplane,
+    ...(dataplane === 'crag' ? { license_dir: '/run/kin/crag-license' } : {}),
     claude_bin: claudeBin,
     slots_per_worker: wrapSlotCount(vm, routing || {}),
     persona_preset: resolveSlotPersonaPreset(vm, routing || {}),
@@ -792,11 +952,54 @@ export function writeKernelConfig(
     // cli-node hot-reads this per job: UA, billing cc_version and CCH input follow the slot's profile.
     cli_version: profileForPreset(resolveSlotPersonaPreset(vm, routing || {})).cliVersion,
     default_cache_ttl: defaultCacheTtl,
+    thinking_display: thinkingDisplay,
     cc_entrypoint:
       routing == null ? (previous.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli') : ccEntrypointFromRouting(routing),
     cch_enabled: cchEnabled,
     auto_compact_window: autoCompactWindow,
     model_effort: modelEffort,
+    ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
+  }
+  if (
+    dataplane === 'crag' &&
+    resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' &&
+    !isKvmRuntime(record) &&
+    !host.native
+  ) {
+    config.crag_kernel_version = 'v2'
+    config.runtime_variant = 'crag-v2'
+    config.claude_bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+    config.asset_dir = '/run/kin/crag-native-assets'
+    config.work_dir = '/run/kin/work'
+    config.cli_version = ''
+    if (!host.bakedKernel) {
+      const owner = runtimeFileOwner(vm)
+      for (const name of ['crag-native-assets', 'work']) {
+        ensureHostPrivateDir(path.join(runDir, name), {
+          uid: owner.uid,
+          gid: owner.gid,
+          privileged,
+        })
+      }
+      acceptNativeClaudeSetup(homeDir, '/run/kin/work')
+      if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
+        const workstation = resolveWorkstationProfile(record)
+        config.telemetry = {
+          ...config.telemetry,
+          enabled: true,
+          dmi_dir: '/etc/kin-dmi',
+          identity: {
+            enabled: true,
+            linux_kernel: workstation.linux_kernel,
+            linux_distro_id: workstation.linux_distro_id,
+            linux_distro_version: workstation.linux_distro_version,
+            shell: workstation.shell,
+            terminal: workstation.terminal,
+            package_managers: workstation.package_managers,
+          },
+        }
+      }
+    }
   }
 
   if (tz) config.timezone = tz
@@ -810,8 +1013,8 @@ export function writeKernelConfig(
   try {
     fs.chmodSync(configPath, privileged ? 0o600 : 0o640)
   } catch {}
-  // kin-kernel hot-reloads kernel.json: the change must reach wherever the slot reads it.
-  if (changed) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
+  // Legacy cli-node hot-reads settings; native V2 uses an explicit idle restart.
+  if (changed && publish) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
   return {
     runDir,
     socketPath,

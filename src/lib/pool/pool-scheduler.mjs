@@ -599,6 +599,13 @@ export class PoolScheduler extends EventEmitter {
       }
       const now = Date.now()
       const wakeAts = waitPool.map((candidate) => Number(candidate.availableAt) || 0).filter((value) => value > now)
+      // Health / quota hops are async; availableAt can expire before we slice the wait.
+      const staleWindowWake =
+        !wakeAts.length &&
+        waitPool.some((candidate) => {
+          const at = Number(candidate.availableAt) || 0
+          return at > 0 && at <= now
+        })
       const concurrencyWait = waitPool.some((candidate) => candidate.busy && stickyShouldWait(candidate.waitReason))
       const waitPlan = this.resolveWaitPlan({
         candidates: waitPool,
@@ -614,7 +621,7 @@ export class PoolScheduler extends EventEmitter {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
       const waitCap = Math.min(waitDeadline, loopDeadline)
-      const sliceDeadline = wakeAts.length ? Math.min(waitCap, ...wakeAts) : waitCap
+      const sliceDeadline = wakeAts.length ? Math.min(waitCap, ...wakeAts) : staleWindowWake ? now + 1 : waitCap
       const queuedAt = Date.now()
       const waited = await this.waitForCapacity({
         signal,
@@ -1176,7 +1183,10 @@ export class PoolScheduler extends EventEmitter {
     }
     let headroom = null
     if (!pinned) {
-      if (account && (account.status !== 'active' || !account.schedulable)) {
+      // Panel switch is vm.schedulable (evaluateSlotGate). accounts.schedulable
+      // is a legacy column nothing writes; a leftover 0 must not hide a slot
+      // the panel still shows as participating.
+      if (account && account.status !== 'active') {
         return { ok: false, reason: 'account_disabled' }
       }
       const modelGate = await slotAllowsModel({ vm, account, model })
@@ -1738,7 +1748,7 @@ export class PoolScheduler extends EventEmitter {
     if (!noRefreshPin && isCredentialRuntimeBlocked(state, now, vm)) return null
     if (!pinned) {
       if (hardBlockOf(state, now)) return null
-      if (account && (account.status !== 'active' || !account.schedulable)) return null
+      if (account && account.status !== 'active') return null
       if (account) {
         const availability = evaluateAccount({
           vm,
@@ -1808,7 +1818,9 @@ export class PoolScheduler extends EventEmitter {
       if (quotaReservation) this.accountQuota?.release?.(candidate.accountId)
       return null
     }
-    this.inflight.set(candidate.accountId, requestInflight + 1)
+    // Admission hooks may release an existing reservation. Use the live count
+    // rather than restoring occupancy from before those hooks ran.
+    this.inflight.set(candidate.accountId, (this.inflight.get(candidate.accountId) || 0) + 1)
     this.bumpFamily(candidate.accountId, family, 1)
     this.bumpVmInflight(candidate.vmId, 1)
     let released = false
