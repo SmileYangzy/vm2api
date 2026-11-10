@@ -33,7 +33,6 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
@@ -551,10 +550,7 @@ export function WrapSamplePage() {
                               <SelectItem value='cli-node'>
                                 cli-node · 默认
                               </SelectItem>
-                              <SelectItem
-                                value='crag'
-                                disabled={cragBlocked}
-                              >
+                              <SelectItem value='crag' disabled={cragBlocked}>
                                 CRAG · 付费
                               </SelectItem>
                             </SelectContent>
