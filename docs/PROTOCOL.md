@@ -6,6 +6,19 @@
 
 上游 hop 始终 `stream:true`。客户端 SSE 透传；非流或 `x-kin-delivery: verified` 则缓冲到 `message_stop` 再聚合。
 
+## CRAG native V2 部署边界
+
+仅 `dataplane: "crag"` 且显式 `crag_kernel_version: "v2"` 的本地 Linux Docker 槽采用 native V2；省略版本仍选 legacy ELF。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude；不接受旧 Node、明文 native V2 或未 bundled 的独立部署变体。
+
+物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，Claude 位于 `.kin/crag-v2/claude-code-2.1.317/claude`；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart 流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
+
+所有 CRAG 选择与正常 hop 都要求该 VM 的离线注册码；V2 原生网关再次校验签名、设备绑定和当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 注册码。
+
+槽详情「推理内核」提供机器码复制、注册码激活/替换，以及签名内的期限、生效时间和到期时间；无授权点击 CRAG 会进入激活，不提前改 VM 配置或停内核。期限只能由供应方签发为 1个月/半年/1年（UTC 自然月 1/6/12，月底收敛），客户不能直接改过期时间。错误替换码不破坏现有有效授权，续期只换授权，不隐式切换内核。
+
+设备私钥/注册码保存在与现有 worker run 映射一致的 Linux 私有目录；保留运行数据与 machine-id 的普通容器重建保留授权，复制到不同 VM/设备无效。不要把 `license_dir` 放在 WSL DrvFS。启动器只在 sealed memfd 解密业务程序，不写明文；客户包不含供应方私钥/产品 AES key。离线授权不支持远程吊销，不能可靠阻止 root 回拨时间或复制全部设备材料。
+
+
 ## 官方 Claude Code 判定
 
 `isOfficialClaudeCodeTraffic(headers, body)` 四闸：
@@ -56,6 +69,20 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该值仅是默认值，不覆盖请求头、请求显式 TTL、已有会话锁定值或 system 模板显式 TTL；官方透传的调用方 marker 及缺失 TTL 保持原样。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
+### CRAG v2 print
+
+CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.317`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。是否走 print 只看这台 VM 实际启用的内核：运行中的 health `runtime_variant=crag-v2` 优先，其次是槽位自己写明的 `dataplane` / `crag_kernel_version`，再其次是该槽 `run/kernel.json`。全局 `routing.inference` 不能把 wrap、cc 或未写内核的槽送上 print。legacy CRAG 仍走 cli-node。
+
+system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认 `compatibility.crag_persona_preset`：
+
+| 值 | 清洗 |
+|----|------|
+| `official_full`（缺省） | 不把官方四块 system 再贴进去。调用方剩余文本走 `crag_prompt.mode=append`（裸 `system` 在 v2 里也是 append）。≤ 64 KiB 才是 `--append-system-prompt`；更长由 helper 写进用户消息，不是 system 缓存块。没有尾巴就不发 system 旗标。 |
+| `zero` | 必须 `crag_prompt.mode=replace`。超过 64 KiB 直接 400，不假装替换成功。没有调用方文本时发不出 replace。`--system-prompt` 是否换掉 identity/harness/guidance，2.1.303 没复抓，未证实。 |
+
+槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
+
+
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
 Go worker JSON 透传，不必因人设重建 worker。
@@ -64,9 +91,19 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 全部非官方协议（Messages / Chat / Completions / Responses）回包 usage 按「没有被网关改写的 system、没有注入 tools」显示：藏网关注入的 persona system 块与 server tools，保留用户 prompt 与用户自己的 tools，抹掉因 persona 产生的官方 cache。官方 CC 不遮罩。
 
+## DSH 工具结果裁剪与缓存
+
+`routing.compatibility.preserve_pruned_tool_results: true` 可为槽位推理开启 DSH 工具结果裁剪保护；缺省关闭，API 直连端点不启用。它不会修改客户端配置或路由粘性。
+
+DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pruned标记和后1024码点。开启后，网关在同一认证密钥、严格的DSH `session-UUID`、模型和完整历史前缀内，仅恢复精确等于该裁剪结果的旧文本。必须有此前完整verified且未重试的请求作为原文基线；仅收到keepalive、取消、失败或不完整流不会提交原文。真正的历史编辑、删消息、工具参数变化及摘要替换不还原。
+
+原文只在进程内保存：TTL 1小时、总量16MiB、最多128会话、每会话2MiB、单工具文本256KiB，待确认快照也计入总预算。凭据和会话仅用于进程HMAC隔离，日志只记录 `hop_meta.tool_result_prune` 的恢复数量和原因，不增加正文日志。并发同会话、快照缺失、超预算或无法确认上下文空间时，整组保持调用方较短的原请求；不做部分还原。重启后从自然成功请求重新建立基线。
+
+恢复在persona重渲染、额度风险估算和传输前完成。上下文检查使用上一次真实输入/输出、追加消息的UTF-8字节上界、输出预留和16K余量；新增图片、文档或其它无法可靠估价的内容时不恢复。该保护不能让真实摘要或新摘要后的上下文免于冷写，也不能保证上游缓存永不淘汰。
+
 ## thinking 与 max_tokens
 
-`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。调用方有值则不覆盖；缺失时 OAuth 默认 **128000**。绝对上限 128000。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
+`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。缺失时用该模型目录的 `max_tokens_default`，目录没有时用 4096。调用方有值且低于 `compatibility.min_max_tokens` 时默认抬到该值，模式「不改」则不抬。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
 
 | 模型 | thinking |
 |------|----------|
@@ -131,6 +168,8 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
 
 关闭透传或非官方请求仍走 Node rewrite：清除 caller marker，生成最后消息及 `messages.length>=4` 时倒数第二 user 的点，TTL 用入站会话 pin 值。应用 persona 后，模板显式 TTL 保留，只补自产缺失 TTL；超额时优先删 tools、system 尾部的自产点。非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
+
+识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。凡经重写的入站（官方家族与第三方客户端一样），不写 `ttl` 的 marker 都表示未选择，渲染前按会话 pin 值补齐（调用方显式 `5m` / `1h` 保留，前面已有 5m 时补 5m），cli-hop、HTTP hop 与 API 直连一致。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
 
 native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代理布局）、wire tools 和 wire messages，不自动给最后一个 tool 加点；caller tool 的缺失 TTL 也保持缺失。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。Node native envelope 不用菜单 TTL 重分类上游 usage，日志/计费保留真实 5m/1h 分桶。Node 对象不等于最终 wire；HTTP hop 原有独立缓存整流不变。
 

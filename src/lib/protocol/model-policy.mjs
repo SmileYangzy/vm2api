@@ -303,7 +303,7 @@ export function seedDefaultPolicy() {
     display_name: 'Sonnet 5.5',
     family: 'sonnet',
     sort: 31,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: { ...CAP_ADAPTIVE_ONLY, supports_between_tools: true },
     betas: { pass_context_1m: true },
     params: {
       max_tokens_default: 128000,
@@ -731,8 +731,41 @@ export function getCapabilities(modelId = '') {
   return getModelEntry(modelId).capabilities
 }
 
-export function getBetaPolicy(modelId = '') {
-  return getModelEntry(modelId).betas
+/**
+ * Preset capability boundary for one model. CRAG's official CLI table is not
+ * this matrix: the pre-clean stage hands the entry across, and CRAG applies it.
+ */
+export function modelDirectiveForCrag(modelId = '') {
+  const entry = getModelEntry(modelId)
+  const caps = entry.capabilities || {}
+  const params = entry.params || {}
+  const positive = (value) => {
+    const n = Number(value)
+    return Number.isSafeInteger(n) && n > 0 ? n : 0
+  }
+  const drop = Array.isArray(entry.betas?.drop)
+    ? entry.betas.drop.map((beta) => String(beta || '')).filter(Boolean)
+    : []
+  return {
+    id: entry.id || String(modelId || ''),
+    capabilities: {
+      thinking_mode: String(caps.thinking_mode || ''),
+      supports_adaptive: caps.supports_adaptive === true,
+      supports_effort: caps.supports_effort === true,
+      supports_context_management: caps.supports_context_management === true,
+      supports_1m: caps.supports_1m === true,
+      supports_interleaved: caps.supports_interleaved === true,
+    },
+    params: {
+      max_tokens_default: positive(params.max_tokens_default),
+      max_tokens_cap: positive(params.max_tokens_cap),
+      thinking_fallback_budget: positive(params.thinking_fallback_budget),
+      on_adaptive: String(params.on_adaptive || ''),
+      on_enabled: String(params.on_enabled || ''),
+      ...(params.default_effort ? { default_effort: String(params.default_effort) } : {}),
+    },
+    betas: { drop },
+  }
 }
 
 export function getContext1mWhitelist() {
@@ -868,12 +901,13 @@ function applyHaiku55Thinking(body) {
 
 /**
  * Opus 5.5 and Sonnet 5.5 reject forced tool choice and legacy thinking.
- * Keep the existing auto + strict compatibility policy; strict constrains
- * arguments, not whether the model calls a tool. Computer migration is Opus-only.
+ * Preserve tool choice and strictness; incompatible caller contracts are
+ * rejected at ingress. Computer migration is Opus-only.
  * The patched CLI forwards caller fields, so this has to happen before the hop.
  */
 export function applyModelRequestRules(body = {}) {
   if (!body || typeof body !== 'object') return body
+  validateBetweenToolsThinking(body)
   const canonical = resolvePolicyModelId(body.model)
   if (isHaiku55Model(body.model) || canonical === HAIKU_55_ID) {
     if (canonical === HAIKU_55_ID) body.model = canonical
@@ -894,22 +928,6 @@ export function applyModelRequestRules(body = {}) {
       if (tool.type !== OPUS_55_COMPUTER_FROM) return tool
       return { ...tool, type: OPUS_55_COMPUTER_TO }
     })
-  }
-  const choice = body.tool_choice
-  const choiceType =
-    typeof choice === 'string'
-      ? choice.toLowerCase()
-      : choice && typeof choice === 'object'
-        ? String(choice.type || '').toLowerCase()
-        : ''
-  if (choiceType === 'any' || choiceType === 'tool' || choiceType === 'required') {
-    const name = choice && typeof choice === 'object' ? choice.name : ''
-    if (choiceType === 'tool' && name && Array.isArray(body.tools)) {
-      body.tools = body.tools.map((tool) =>
-        tool?.name === name && tool.input_schema ? { ...tool, strict: true } : tool,
-      )
-    }
-    body.tool_choice = { type: 'auto' }
   }
   return body
 }
@@ -1067,4 +1085,53 @@ export function applyMaxTokensCap(body = {}) {
   const mt = Number(body.max_tokens)
   if (Number.isFinite(mt) && mt > cap) body.max_tokens = cap
   return body
+}
+
+/** between_tools is a distinct mode; never repair it into adaptive thinking. */
+export function validateBetweenToolsThinking(body = {}, { code = 'thinking_incompatible' } = {}) {
+  if (body.thinking?.type !== 'between_tools') return
+  const invalid = (message) => {
+    const error = new Error(message)
+    error.status = 400
+    error.body = { type: 'error', error: { type: 'invalid_request_error', code, message } }
+    throw error
+  }
+  if (getModelEntry(body.model).capabilities.supports_between_tools !== true)
+    invalid('The selected model does not support between_tools thinking.')
+  if (Object.keys(body.thinking).some((key) => key !== 'type'))
+    invalid('between_tools thinking accepts only type; additional thinking fields are not supported.')
+  // A per-turn control can override effort, but the top-level field must also
+  // be legal when it is forwarded by a transport.
+  const efforts = [body.output_config?.effort, reasoningEffortOf(body)].map((effort) =>
+    String(effort || '').toLowerCase(),
+  )
+  if (efforts.some((effort) => ['xhigh', 'max'].includes(effort.trim())))
+    invalid('between_tools thinking does not support xhigh or max effort.')
+}
+
+/** Validate the caller contract before any model or persona rewrite. */
+export function validateToolChoice(body = {}) {
+  const choice = body.tool_choice
+  if (choice == null) return
+  const invalid = (message, code = 'invalid_tool_choice') => {
+    const error = new Error(message)
+    error.status = 400
+    error.body = { type: 'error', error: { type: 'invalid_request_error', code, message } }
+    throw error
+  }
+  if (!choice || typeof choice !== 'object' || !['auto', 'none', 'any', 'tool'].includes(choice.type))
+    invalid('tool_choice.type must be auto, none, any, or tool.')
+  const tools = Array.isArray(body.tools) ? body.tools : []
+  if (choice.type !== 'none' && tools.length === 0) invalid('tool_choice requires a non-empty tools list.')
+  if (choice.type === 'tool' && (!choice.name || !tools.some((tool) => tool?.name === choice.name)))
+    invalid('tool_choice.name must identify a supplied tool.')
+  if (!['any', 'tool'].includes(choice.type)) return
+  const entry = getModelEntry(body.model)
+  if (entry.capabilities?.requires_adaptive === true)
+    invalid(
+      'This model requires adaptive thinking and does not support forced tool_choice. Choose a model that supports disabled thinking.',
+      'tool_choice_incompatible',
+    )
+  if (['enabled', 'adaptive'].includes(body.thinking?.type))
+    invalid('Forced tool_choice cannot be combined with enabled or adaptive thinking.', 'tool_choice_incompatible')
 }

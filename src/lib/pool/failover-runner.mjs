@@ -18,6 +18,7 @@ import {
 } from '../core/errors.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
+import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
@@ -26,6 +27,25 @@ import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
 const SEARCH_REPAIR_LIMIT = 512
+
+export const vmTimeoutTracker = {
+  counts: new Map(),
+  recordTimeout(vmId, threshold = 3) {
+    if (!vmId) return false
+    const entry = this.counts.get(vmId) || { count: 0, lastAt: 0 }
+    entry.count += 1
+    entry.lastAt = Date.now()
+    this.counts.set(vmId, entry)
+    return entry.count >= threshold
+  },
+  recordSuccess(vmId) {
+    if (vmId) this.counts.delete(vmId)
+  },
+  reset(vmId) {
+    if (vmId) this.counts.delete(vmId)
+    else this.counts.clear()
+  },
+}
 
 const DEFAULTS = {
   max_account_switches: 10,
@@ -471,10 +491,34 @@ export class FailoverRunner {
 
   noteUnitHealth(selected, policy, result) {
     const circuit = this.scheduler?.unitCircuit
-    if (!circuit || !selected?.accountId) return
-    if (policy?.circuit) circuit.recordFailure(selected.accountId)
-    else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
-    else circuit.releaseProbe?.(selected.accountId)
+    if (circuit && selected?.accountId) {
+      if (policy?.circuit) circuit.recordFailure(selected.accountId)
+      else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
+      else circuit.releaseProbe?.(selected.accountId)
+    }
+
+    const vmId = selected?.vmId
+    if (vmId) {
+      if (verifiedSuccess(result)) {
+        vmTimeoutTracker.recordSuccess(vmId)
+      } else {
+        const isTimeout =
+          policy?.reason === 'worker_timeout' ||
+          policy?.reason === 'provider_timeout' ||
+          result?.status === 504 ||
+          result?.upstream_status === 504 ||
+          /no CLI frame|timed out|timeout/i.test(String(result?.error?.message || result?.message || ''))
+        const ttft = result?.ttft_ms ?? result?.meta?.ttft_ms
+        if (isTimeout && ttft == null) {
+          const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
+          if (tripped) {
+            const fault = `consecutive_timeouts: VM ${vmId} had 3 consecutive silent inference timeouts`
+            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing`)
+            kernelFaults.set(vmId, fault)
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -659,11 +703,13 @@ export class FailoverRunner {
         for (const key of bindKeys) {
           if (pinMoved(key)) continue
           const prev = this.stickyRouter.resolve?.(key)
+          // A granted seat follows the scheduler's device home even when the
+          // previous account is still eligible. Capacity spills keep its pin.
           const ownMove =
-            !!outboundSessionAccountId &&
-            prev?.accountId === outboundSessionAccountId &&
+            !!prev?.accountId &&
             prev.accountId !== account.accountId &&
-            opts?.borrowed !== true
+            opts?.borrowed !== true &&
+            (prev.accountId === outboundSessionAccountId || (!!lastSelected?.seatKey && !spilled.has(prev.accountId)))
           if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
@@ -985,14 +1031,18 @@ export class FailoverRunner {
         if (typeof onAttempt === 'function') {
           await onAttempt({ attemptNo, selected, result, policy })
         }
-        if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
+        if (
+          policy.reason === 'content_filter_refusal' ||
+          policy.reason === 'usage_policy_refusal' ||
+          policy.reason === 'content_policy_refusal'
+        ) {
           this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
           bindAll({ accountId: selected.accountId, vmId: selected.vmId })
           releaseStickySlots()
           return {
             ...result,
             ...attribution(),
-            finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
+            finalState: policy.reason === 'content_filter_refusal' ? 'content_filter' : 'rejected',
             policy,
           }
         }
@@ -1054,8 +1104,10 @@ export class FailoverRunner {
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
-        const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
-        noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
+        const invalidRequest =
+          error?.status === 400 &&
+          (error.body?.error?.code === 'invalid_cache_control' || error.body?.error?.code === 'crag_prompt_too_large')
+        noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 403,
@@ -1077,7 +1129,7 @@ export class FailoverRunner {
             finalState: 'policy_block',
           }
         }
-        if (invalidCache) {
+        if (invalidRequest) {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,
             errorScope: 'request',

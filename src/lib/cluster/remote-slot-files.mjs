@@ -26,25 +26,27 @@ import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
 import {
   openSftp,
+  privateDirectoriesScript,
   readRemoteFileNoFollow,
   remoteSymlink,
   runRemote,
   shellQuote,
   writeRemoteFile,
 } from './remote-fs.mjs'
-
+import { cragSlotPayload } from './slot-image.mjs'
+const SEED_SETTINGS_FILES = Object.freeze([
+  'cli-home/.claude/settings.json',
+  'cli-home/.claude/claude.setting',
+  'cli-home/.claude/kin-seed.json',
+])
 export const SLOT_FILE_SETS = Object.freeze({
   run: ['run/kernel.json', 'run/worker.json', 'run/internal.token'],
-  seed: [
-    'cli-home/.claude/settings.json',
-    'cli-home/.claude/claude.setting',
-    'cli-home/.claude/kin-seed.json',
-    'machine-id',
-  ],
-  touch: ['run/telemetry.touch'],
+  seed: [...SEED_SETTINGS_FILES, 'machine-id'],
+  // Policy publication must not overwrite node-owned identity or OAuth files.
+  seed_settings: SEED_SETTINGS_FILES,
+  telemetry: ['run/kernel.json', ...SEED_SETTINGS_FILES, 'cli-home/.claude/telemetry/egress.json'],
 })
 const CREDENTIALS = 'cli-home/.claude/credentials.json'
-const TOUCH_PUSH_MS = 30_000
 const SLOT_BINARIES = Object.freeze(['kin-worker', 'kin-egress'])
 
 function clusterBin(envKey, fallback) {
@@ -70,14 +72,15 @@ async function prepareRemoteDir(session, vm) {
   const dir = remoteSlotDir(session.host, vm.id)
   const owner = remoteSlotOwner(session.host, vm)
   // Mount roots only: nothing here resolves through a path the guest can rewrite.
-  const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/cli-home`].map(shellQuote).join(' ')
+  const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/claude/telemetry`, `${dir}/cli-home`].map(shellQuote).join(' ')
   const binDir = shellQuote(`${dir}/slot-bin`)
-  // Docker creates a missing bind source as root:root, which the slot uid cannot write.
   const chown =
     session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots} ${binDir}` : ''
+  const privateDirs = ['crag-native-assets', 'work', 'crag-license'].map((name) => `${dir}/run/${name}`)
+  const privateScript = privateDirectoriesScript(privateDirs, session.host.uid === 0 ? owner : null)
   await runRemote(
     session.client,
-    `umask 077 && mkdir -p ${roots} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} && chmod 755 ${binDir}${chown}`,
+    `umask 077 && mkdir -p ${roots} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} && chmod 755 ${binDir}${chown} && ${privateScript}`,
     { timeoutMs: 20_000 },
   )
   done.add(vm.id)
@@ -91,7 +94,7 @@ function ownerFor(session, vm) {
   return session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null
 }
 
-/** Push the named sets (`run`, `seed`, `touch`). Missing local files are skipped. */
+/** Push the named sets (`run`, `seed`). Missing local files are skipped. */
 export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
   await prepareRemoteDir(s, vm)
@@ -104,7 +107,8 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
     let data
     try {
       data = fs.readFileSync(local)
-    } catch {
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
       continue
     }
     // Never mirror local modes: a drvfs / 0777 checkout would publish tokens world-readable on the node.
@@ -142,7 +146,42 @@ export async function pushSlotBinaries(vm, projectRoot, session = null) {
     digest.update(name).update(data)
     pushed.push(name)
   }
-  return { pushed, digest: digest.digest('hex') }
+  const crag = await pushCragSlot(vm, projectRoot, s)
+  return { pushed, digest: digest.digest('hex'), crag }
+}
+
+/** Same CRAG tree the slot image bakes, for containers created before that image. */
+export async function pushCragSlot(vm, projectRoot, session = null) {
+  const s = session || (await nodeSession(vmNodeId(vm)))
+  await prepareRemoteDir(s, vm)
+  const payload = cragSlotPayload(projectRoot)
+  const slotDir = remoteSlotDir(s.host, vm.id)
+  const remote = `${slotDir}/slot-bin`
+  const marker = `${remote}/crag.digest`
+  const seccomp = fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url))
+  const owner = ownerFor(s, vm)
+  const sftp = await openSftp(s.client)
+  await writeRemoteFile(sftp, `${slotDir}/crag-v2-seccomp.json`, seccomp, { mode: 0o644, owner })
+  const current = await readRemoteFileNoFollow(s.client, marker)
+  if (current?.toString('utf8').trim() === payload.digest) return { pushed: false, digest: payload.digest }
+  const dirs = new Set()
+  for (const file of payload.files) {
+    const rel = file.name.slice('opt/kin/'.length)
+    const slash = rel.lastIndexOf('/')
+    if (slash > 0) dirs.add(`${remote}/${rel.slice(0, slash)}`)
+  }
+  if (dirs.size) {
+    const quoted = [...dirs].sort().map(shellQuote).join(' ')
+    const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${quoted}` : ''
+    await runRemote(s.client, `umask 022 && mkdir -p ${quoted} && chmod 755 ${quoted}${chown}`, { timeoutMs: 20_000 })
+  }
+  for (const file of payload.files) {
+    const rel = file.name.slice('opt/kin/'.length)
+    const data = file.body || fs.readFileSync(file.src)
+    await writeRemoteFile(sftp, `${remote}/${rel}`, data, { mode: file.mode, owner })
+  }
+  await writeRemoteFile(sftp, marker, `${payload.digest}\n`, { mode: 0o644, owner })
+  return { pushed: true, digest: payload.digest }
 }
 
 /** Explicit import only: replace the remote credential with the local one. */
@@ -235,16 +274,6 @@ export function queueSlotPush(vm, slotDir, sets, { logger = console } = {}) {
     })
   queues.set(vm.id, next)
   return next
-}
-
-const touchedAt = new Map()
-
-/** Telemetry idle detection reads telemetry.touch in the slot; once per 30s is enough there. */
-export function pushTelemetryTouch(vm, slotDir, now = Date.now()) {
-  const last = touchedAt.get(vm.id) || 0
-  if (now - last < TOUCH_PUSH_MS) return null
-  touchedAt.set(vm.id, now)
-  return queueSlotPush(vm, slotDir, ['touch'])
 }
 
 /** Delete the node-side slot tree (explicit delete / factory reset only). */
