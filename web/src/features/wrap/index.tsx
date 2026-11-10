@@ -33,7 +33,6 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { isRemoteVm } from '@/features/vm/placement'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
@@ -144,12 +143,12 @@ export function WrapSamplePage() {
       return (
         target.kernel === 'crag' &&
         vm &&
-        (isRemoteVm(vm) || vm.runtime_type === 'kvm')
+        (vm.runtime_type === 'kvm' || vm.node_platform === 'darwin')
       )
     })
     if (unsupported) {
       toast.error(
-        `${vmById.get(unsupported.id)?.name || unsupported.id} 仅能安装默认内核`
+        `${vmById.get(unsupported.id)?.name || unsupported.id} 不能安装 CRAG`
       )
       return
     }
@@ -456,8 +455,8 @@ export function WrapSamplePage() {
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
                     const active = installing && job?.activeId === vm.id
-                    const nativeUnsupported =
-                      isRemoteVm(vm) || vm.runtime_type === 'kvm'
+                    const cragBlocked =
+                      vm.runtime_type === 'kvm' || vm.node_platform === 'darwin'
                     const currentKernel =
                       vm.resolved_dataplane === 'crag' &&
                       vm.resolved_crag_kernel_version === 'v2'
@@ -551,10 +550,7 @@ export function WrapSamplePage() {
                               <SelectItem value='cli-node'>
                                 cli-node · 默认
                               </SelectItem>
-                              <SelectItem
-                                value='crag'
-                                disabled={nativeUnsupported}
-                              >
+                              <SelectItem value='crag' disabled={cragBlocked}>
                                 CRAG · 付费
                               </SelectItem>
                             </SelectContent>
@@ -579,8 +575,10 @@ export function WrapSamplePage() {
                                       : 'text-destructive'
                                   }
                                 >
-                                  {nativeUnsupported
-                                    ? '仅支持本地 Docker'
+                                  {cragBlocked
+                                    ? vm.runtime_type === 'kvm'
+                                      ? '不支持 KVM'
+                                      : '不支持 macOS'
                                     : license
                                       ? LICENSE_LABELS[license.status]
                                       : '状态未知'}
@@ -597,7 +595,7 @@ export function WrapSamplePage() {
                               <Button
                                 variant='ghost'
                                 className='h-11'
-                                disabled={!canEdit || busy || nativeUnsupported}
+                                disabled={!canEdit || busy || cragBlocked}
                                 onClick={() => setLicenseVm(vm)}
                                 aria-label={`管理 ${vm.name || vm.id} CRAG 授权`}
                               >
@@ -621,7 +619,7 @@ export function WrapSamplePage() {
                             disabled={
                               !canEdit ||
                               busy ||
-                              (kernel === 'crag' && nativeUnsupported)
+                              (kernel === 'crag' && cragBlocked)
                             }
                             loading={active}
                             aria-label={`${changed ? '安装' : '重装'} ${vm.name || vm.id} 并停用`}
