@@ -23,8 +23,8 @@ import {
   wrapCliTemplateDir,
 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
-import { activateCragLicense } from '../../src/lib/vm/crag-license.mjs'
-import { activateFixture, issueUniversalCode, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import { cragSlotPayload } from '../../src/lib/cluster/slot-image.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const prevKernelBin = process.env.KIN_KERNEL_BIN
 const prevCragV2Root = process.env.KIN_CRAG_V2_ROOT
@@ -527,7 +527,7 @@ test('CRAG v2 rejects a bad package and a cluster slot without replacing cli-nod
     assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'keep-cli')
     assert.equal(fs.existsSync(path.join(dest, 'crag-v2')), false)
     const remote = materializeCragV2(project, { id: 'vm-remote', node_id: 'node-1' })
-    assert.equal(remote.code, 'crag_v2_hash_mismatch')
+    assert.equal(remote.code, 'crag_v2_unsupported_placement')
     assert.equal(fs.existsSync(wrapCliHomeDir(project, 'vm-remote')), false)
     const kvm = materializeCragV2(project, { id: 'vm-kvm', runtime: { type: 'kvm' } })
     assert.notEqual(kvm.code, 'crag_v2_unsupported_placement')
@@ -540,18 +540,15 @@ test('CRAG v2 rejects a bad package and a cluster slot without replacing cli-nod
 test('a cluster Docker slot keeps native Claude Code inside the CRAG package', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-cluster-'))
   try {
-    const dir = seedV2Package(project)
-    activateCragLicense(project, { id: 'vm-13' }, issueUniversalCode(project).code)
-    const laid = materializeCragV2(project, {
-      id: 'vm-remote',
-      node_id: 'node-1',
-      dataplane: 'crag',
-      crag_kernel_version: 'v2',
-    })
-    assert.equal(laid.ok, true, laid.error)
-    assert.equal(laid.remote, true)
-    assert.equal(laid.claude_bin, 'claude-code-2.1.317/claude')
-    assert.equal(fs.existsSync(path.join(dir, 'claude-code-2.1.317', 'claude')), true)
+    const dir = seedEncryptedPackage(project, { arch: 'amd64' })
+    const member = 'claude-code-2.1.321/claude'
+    const file = cragSlotPayload(project).files.find((entry) => entry.name === 'opt/kin/crag-v2/' + member)
+    assert.ok(file)
+    assert.equal(file.src, path.join(dir, member))
+    assert.equal(file.mode, 0o755)
+    assert.equal(file.sha256, sha256(fs.readFileSync(file.src)))
+    fs.appendFileSync(file.src, 'tampered')
+    assert.throws(() => cragSlotPayload(project), { code: 'slot_payload_invalid' })
     assert.equal(fs.existsSync(wrapCliHomeDir(project, 'vm-remote')), false)
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
