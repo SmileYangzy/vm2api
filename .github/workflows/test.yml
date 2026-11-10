@@ -136,6 +136,12 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: redact/go.sum
+      - name: Fetch the pinned helpers required by unit tests
+        run: node scripts/fetch-payload.mjs
       - run: npm run test:unit
 
   ci-go:
