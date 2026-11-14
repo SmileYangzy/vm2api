@@ -2,9 +2,10 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
-import { sanitizeAnthropicBody } from '../protocol/sanitize.mjs'
+import { prepareCliNodeRequest, prepareCragRequest } from '../protocol/kernel-request.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
@@ -29,7 +30,14 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { cragConsumesModelDirective, cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
+import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
+import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
+import {
+  cragConsumesModelDirective,
+  cragV2KernelActive,
+  readSlotKernelConfig,
+  validateCallerCwd,
+} from '../protocol/crag-print-prompt.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -41,8 +49,17 @@ import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
+import { inferenceCodec } from './inference-codec.mjs'
+import { parseWorkerJson as parseJson } from './inference-codec-json.mjs'
+import {
+  createNativeHandoffState,
+  consumeNativeHandoffStream,
+  negotiateNativeHandoff,
+} from '../protocol/native-handoff.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
+const MAX_GATEWAY_CLOCK_MS = 86_400_000
+const CRAG_HEADER_ALLOWANCE_MS = 5_000
 const credentialRefreshTail = new Map()
 
 function withCredentialRefreshLock(key, fn) {
@@ -88,7 +105,7 @@ function readInternalToken(exec) {
   }
 }
 
-function workerRequest(
+async function workerRequest(
   exec,
   {
     method = 'GET',
@@ -99,15 +116,24 @@ function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    inference = false,
+    onRequestStarted,
+    requireInternalToken = false,
   } = {},
 ) {
+  if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+  const { socketPath } = workerPaths(exec)
+  if (!socketPath) {
+    throw Object.assign(new Error('slot worker socket is not configured'), { code: 'worker_socket_missing' })
+  }
+  const payload =
+    body == null
+      ? null
+      : inference
+        ? await inferenceCodec.encode(body, { signal })
+        : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+  if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
   return new Promise((resolve, reject) => {
-    const { socketPath } = workerPaths(exec)
-    if (!socketPath) {
-      reject(Object.assign(new Error('slot worker socket is not configured'), { code: 'worker_socket_missing' }))
-      return
-    }
-    const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
     // Include the headers, session metadata and request_id added around the caller's body.
     if (maxRequestBytes > 0 && payload?.length > maxRequestBytes) {
       reject(
@@ -119,6 +145,10 @@ function workerRequest(
       return
     }
     const internalToken = readInternalToken(exec)
+    if (requireInternalToken && !internalToken) {
+      reject(Object.assign(new Error('slot worker internal token is not configured'), { code: 'worker_token_missing' }))
+      return
+    }
     const requestHeaders = { ...headers }
     if (payload) {
       requestHeaders['content-type'] = 'application/json'
@@ -157,12 +187,103 @@ function workerRequest(
         resolve(res)
       },
     )
-    arm(timeoutMs, `slot worker timeout after ${timeoutMs}ms`)
+    if (timeoutMs != null) arm(timeoutMs, `slot worker timeout after ${timeoutMs}ms`)
     req.once('close', clearTimer)
     req.once('error', reject)
     if (payload) req.write(payload)
     req.end()
+    // Once handed to HTTP, the kernel may see the request before 'finish'.
+    onRequestStarted?.()
   })
+}
+
+function clockMs(value, fallback) {
+  const ms = Number(value)
+  return Number.isFinite(ms) && ms > 0 ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(1, Math.round(ms))) : fallback
+}
+
+function nativeCragRequest(exec, cragPrint) {
+  return (
+    cragPrint !== false &&
+    cragV2KernelActive({
+      vm: exec?.vm,
+      health: exec?.workerStatus,
+      kernelConfig: readSlotKernelConfig(exec?.homeDir),
+    })
+  )
+}
+
+function inferenceRequest(
+  exec,
+  {
+    envelope,
+    requestId,
+    stream,
+    deliveryMode,
+    managedCrag,
+    nativeHandoff = false,
+    tenantId,
+    slotWaitDeadlineMs,
+    timeoutMs,
+    idleTimeoutMs,
+    routing,
+    requestPath,
+    ...options
+  },
+) {
+  const headers = stream ? { te: 'trailers' } : {}
+  const body = { ...envelope, request_id: requestId }
+  const authenticatedPolicy = managedCrag && requestPath === '/internal/v1/messages'
+  if (authenticatedPolicy) {
+    body.stream = stream
+    body.delivery_mode = deliveryMode === 'verified' ? 'verified' : 'realtime'
+    if (tenantId) headers['x-tenant-id'] = tenantId
+    const firstByteMs = clockMs(timeoutMs, 600_000)
+    const idleMs = clockMs(idleTimeoutMs, clockMs(resolveStreamIdleTimeoutMs(routing), 180_000))
+    const queueWaitMs = Number.isFinite(slotWaitDeadlineMs)
+      ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(0, Math.floor(slotWaitDeadlineMs - Date.now())))
+      : 0
+    body.gateway_policy = {
+      queue_wait_ms: queueWaitMs,
+      first_byte_timeout_ms: firstByteMs,
+      stream_idle_timeout_ms: idleMs,
+      session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds),
+    }
+    if (nativeHandoff) body.gateway_policy.native_handoff_v1 = true
+    // Only realtime exposes headers before completion. The native worker owns
+    // activity deadlines while verified and JSON responses are held back.
+    timeoutMs =
+      stream && body.delivery_mode === 'realtime' ? queueWaitMs + firstByteMs + CRAG_HEADER_ALLOWANCE_MS : null
+  }
+  return workerRequest(exec, {
+    ...options,
+    requestPath,
+    // Do not let async codec queue time be added back to the worker's budget.
+    inference: options.inference && !authenticatedPolicy,
+    requireInternalToken: authenticatedPolicy,
+    method: 'POST',
+    body,
+    headers,
+    timeoutMs,
+    timeoutMode: stream ? 'first-byte' : 'overall',
+  })
+}
+
+function classifyManagedQueueRejection(result, managedCrag) {
+  const error = result.body?.error
+  if (!managedCrag || result.ok || result.body?.type !== 'error') return result
+  if (
+    !(result.status === 503 && error?.type === 'overloaded_error' && error.message === 'runtime queue is full') &&
+    !(result.status === 504 && error?.type === 'timeout_error' && error.message === 'runtime queue timeout')
+  ) {
+    return result
+  }
+  return {
+    ...result,
+    body: { ...result.body, error: { ...error, code: 'slot_busy' } },
+    upstreamExecutions: 0,
+    terminalState: 'rejected',
+  }
 }
 
 /**
@@ -172,7 +293,7 @@ function workerRequest(
  * and an old worker without the route just answers 404.
  */
 function cancelOnAbort(exec, signal, requestId) {
-  if (!signal || signal.aborted) return () => {}
+  if (!signal) return () => {}
   const onAbort = () => {
     workerRequest(exec, {
       method: 'POST',
@@ -186,6 +307,7 @@ function cancelOnAbort(exec, signal, requestId) {
       })
   }
   signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) onAbort()
   return () => signal.removeEventListener('abort', onAbort)
 }
 
@@ -204,34 +326,21 @@ async function readAll(stream, limit = MAX_BODY) {
   return Buffer.concat(chunks)
 }
 
-function parseJson(buffer, status = 0) {
-  try {
-    return JSON.parse(String(buffer || ''))
-  } catch {
-    if (status === 413) {
-      return {
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          code: 'body_too_large',
-          message: 'Request body exceeds the slot kernel limit',
-          details: { retryable: false },
-        },
-      }
-    }
-    return {
-      type: 'error',
-      error: { type: 'worker_error', code: 'worker_invalid_json', message: String(buffer || '').slice(0, 400) },
-    }
-  }
-}
-
 function publicHeaders(headers = {}) {
   const result = {}
   for (const [key, value] of Object.entries(headers || {})) {
     if (value == null) continue
     const lower = String(key).toLowerCase()
     if (lower === 'set-cookie' || lower === 'authorization' || lower === 'x-api-key') continue
+    if (lower === 'x-kin-provider-result') continue
+    if (lower === 'trailer') {
+      const visible = String(value)
+        .split(',')
+        .map((name) => name.trim())
+        .filter((name) => name.toLowerCase() !== 'x-kin-provider-result')
+      if (visible.length) result[lower] = visible.join(', ')
+      continue
+    }
     result[lower] = Array.isArray(value) ? value.join(',') : String(value)
   }
   return result
@@ -280,21 +389,25 @@ export function isDownstreamCommitEvent(event) {
 
   if (t === 'content_block_delta') {
     const d = event.delta || {}
-    return !!(d.text || d.thinking || d.partial_json || d.refusal || d.signature)
+    return !!(
+      d.text ||
+      d.thinking ||
+      d.partial_json ||
+      d.refusal ||
+      d.signature ||
+      (d.type === 'thinking_delta' && Number.isFinite(d.estimated_tokens) && d.estimated_tokens > 0)
+    )
   }
   if (t === 'content_block_start') {
     const b = event.content_block || {}
     const kind = String(b.type || '')
     return (
-      kind === 'text' ||
-      kind === 'thinking' ||
-      kind === 'redacted_thinking' ||
-      kind === 'refusal' ||
+      (kind === 'redacted_thinking' && !!b.data) ||
       kind === 'tool_use' ||
       kind === 'server_tool_use' ||
       kind === 'mcp_tool_use' ||
       kind.endsWith('_tool_use') ||
-      !!(b.text || b.thinking)
+      !!(b.text || b.thinking || b.refusal)
     )
   }
   return t.startsWith('response.output_')
@@ -322,7 +435,7 @@ export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {})
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
   const status = semanticStatusForStreamError(body)
-  if (status !== 403 && status !== 429 && status !== 529) return result
+  if (status !== 403 && status !== 429 && status !== 503 && status !== 529) return result
   const headers =
     status === 429
       ? extraHeadersFromLimitError(String(body?.error?.message || ''), result.headers || {}, now)
@@ -396,7 +509,7 @@ function dumpSessionEnvelope(envelope) {
     const rec = {
       ts: new Date().toISOString(),
       hop: 'go-worker-envelope',
-      note: 'This is the JSON body+headers the slot worker POSTs to api.anthropic.com/v1/messages. Authorization is attached by the worker from OAuth and is not in this envelope.',
+      note: 'Panel-to-kernel body and protocol headers, not the final Anthropic wire request. The selected CLI owns outbound authentication and wire assembly.',
       stream: envelope.stream,
       delivery_mode: envelope.delivery_mode,
       headers,
@@ -407,12 +520,19 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
-function stripCragEnvelope(body) {
+function gateCragBody(body, print, health) {
   if (!body || typeof body !== 'object') return body
-  if (!body.crag_prompt && !body.crag_model && !body.crag_options?.prompt) return body
+  const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
+  const prompt = body.crag_prompt
+  const model = print && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
+  const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
+  if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
+    return body
+  }
   const out = { ...body }
-  delete out.crag_prompt
-  delete out.crag_model
+  if (!['append', 'replace'].includes(prompt?.mode) || !caps.includes(`prompt_${prompt.mode}`)) delete out.crag_prompt
+  if (model) out.crag_model = model
+  else delete out.crag_model
   if (out.crag_options && typeof out.crag_options === 'object' && !Array.isArray(out.crag_options)) {
     const { prompt: _prompt, ...rest } = out.crag_options
     if (Object.keys(rest).length) out.crag_options = rest
@@ -441,14 +561,14 @@ export function prepareWorkerPayload({
   requestContext = null,
   repaired = false,
 } = {}) {
-  // This is the last panel-owned boundary before either kernel. Keep the
-  // worker contract Anthropic-shaped even when a caller selected passthrough;
-  // cli-node and CRAG must never receive OpenAI/client-only request fields.
-  const canonicalBody = sanitizeAnthropicBody(body, { preserveContentShape: false }) || body
+  const health = exec?.workerStatus
+  const print = nativeCragRequest(exec, cragPrint)
+  const canonicalBody = print ? prepareCragRequest(body) : prepareCliNodeRequest(body)
   const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
+    routing,
     want1m: want1m === true,
   })
   const displayed =
@@ -468,26 +588,13 @@ export function prepareWorkerPayload({
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
-  // CRAG's CLI rebuilds the wire from its own model table. Pass the preset
-  // boundary only when that worker applies it locally. A cluster hop forwards
-  // unknown fields and Anthropic rejects `crag_model`.
-  const print =
-    cragPrint == null
-      ? cragV2KernelActive({
-          vm: exec?.vm,
-          health: exec?.workerStatus,
-          kernelConfig: readSlotKernelConfig(exec?.homeDir),
-        })
-      : cragPrint === true
-  const directed =
-    print && cragConsumesModelDirective(exec?.workerStatus)
-      ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) }
-      : stripCragEnvelope(gated)
+  const directed = gateCragBody(gated, print, health)
   return {
     headers,
     gated: directed,
     cliHop,
     routing,
+    acceptsCallerCwd: print && Array.isArray(health?.capabilities) && health.capabilities.includes('caller_cwd'),
     thread: thread.turn,
   }
 }
@@ -522,6 +629,7 @@ async function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
   cragPrint = null,
+  callerCwd = null,
   repaired = false,
   redactionPrincipal = '',
   redactionSession = '',
@@ -539,10 +647,15 @@ async function workerEnvelope({
     repaired,
   })
   const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
-  const gated = redaction ? await maskJson(prepared.gated, redaction) : prepared.gated
+  // Mask the separated path with the same policy as the original system text.
+  const cwd = (prepared.acceptsCallerCwd && validateCallerCwd(callerCwd)) || undefined
+  const masked = redaction ? await maskJson({ body: prepared.gated, caller_cwd: cwd }, redaction) : null
+  const gated = redaction ? masked.body : prepared.gated
+  const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
+    ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
     body: finalized.body,
     headers: finalized.headers,
     stream: !!stream,
@@ -558,12 +671,46 @@ async function redactionContext({ routing, exec, redactionPrincipal, redactionSe
   const projectRoot = exec?.projectRoot || process.env.KIN_PROJECT_ROOT || ''
   const state = await ensureRedaction(routing, { projectRoot })
   if (!state.enabled) return null
-  return { principal: redactionPrincipal, session: redactionSession || '' }
+  return { principal: redactionPrincipal, session: redactionSession || '', maxBodyBytes: state.maxBodyBytes }
 }
 
-async function maskEnvelopeBody(envelope, redaction) {
-  if (!redaction || !envelope?.body) return envelope
-  return { ...envelope, body: await maskJson(envelope.body, redaction) }
+async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, cragPrint) {
+  // A prebuilt (e.g. Codex) envelope has no trusted Messages-side cwd source.
+  const { caller_cwd: _callerCwd, ...out } = envelope
+  if (messages) {
+    delete out.gateway_policy
+    const print = nativeCragRequest(exec, cragPrint)
+    out.body = gateCragBody(
+      print ? prepareCragRequest(out.body) : prepareCliNodeRequest(out.body),
+      print,
+      exec?.workerStatus,
+    )
+    if (out.headers && typeof out.headers === 'object') {
+      out.headers = Object.fromEntries(
+        Object.entries(out.headers).filter(([name]) => name.toLowerCase() !== 'x-tenant-id'),
+      )
+    }
+  }
+  if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
+    const { caller_cwd: _bodyCwd, ...body } = out.body
+    out.body = body
+  }
+  if (redaction && out.body) out.body = await maskJson(out.body, redaction)
+  return out
+}
+
+function invalidKernelResult(error) {
+  return {
+    ok: false,
+    status: 400,
+    via: 'kernel-preflight',
+    body: error.body,
+    headers: {},
+    terminalState: 'rejected',
+    transportError: false,
+    committed: false,
+    upstreamExecutions: 0,
+  }
 }
 
 function redactionResult(error) {
@@ -575,9 +722,10 @@ function redactionResult(error) {
     body: {
       type: 'error',
       error: {
-        type: 'api_error',
+        type: error.status === 413 ? 'invalid_request_error' : 'api_error',
         code: error.code,
         message: String(error.message || error).slice(0, 300),
+        ...(error.status === 413 ? { details: { retryable: false } } : {}),
       },
     },
     headers: {},
@@ -614,6 +762,10 @@ export async function callGoWorker({
   body,
   reqHeaders = {},
   timeoutMs,
+  idleTimeoutMs,
+  managedCrag = false,
+  tenantId = '',
+  slotWaitDeadlineMs,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -625,6 +777,7 @@ export async function callGoWorker({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  callerCwd = null,
   repaired = false,
   onEnvelope = null,
   redactionPrincipal = '',
@@ -656,11 +809,25 @@ export async function callGoWorker({
     }
   }
   const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
+  let nativeHandoff = false
+  let handoff = null
+  let observedHeaders = {}
+  const nativeMetadata = () => (nativeHandoff ? handoff.metadata : { nativeHandoff: false, providerResult: null })
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope: await maskEnvelopeBody(envelope, redaction), thread: null, redaction }
+      ? {
+          envelope: await preparePrebuiltEnvelope(
+            envelope,
+            redaction,
+            requestPath === '/internal/v1/messages',
+            exec,
+            cragPrint,
+          ),
+          thread: null,
+          redaction,
+        }
       : await workerEnvelope({
           body,
           reqHeaders,
@@ -673,28 +840,64 @@ export async function callGoWorker({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          callerCwd,
           requestContext,
           repaired,
           redactionPrincipal,
           redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
-    const response = await workerRequest(exec, {
-      method: 'POST',
+    const useNativeHandoff = negotiateNativeHandoff(exec, {
+      managedCrag,
       requestPath,
-      body: { ...prepared.envelope, request_id: requestId },
+      requestContext,
+      envelope: prepared.envelope,
+    })
+    if (useNativeHandoff) handoff = createNativeHandoffState()
+    const response = await inferenceRequest(exec, {
+      stream: false,
+      managedCrag,
+      nativeHandoff: useNativeHandoff,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
+      requestPath,
+      envelope: prepared.envelope,
+      requestId,
       maxRequestBytes,
+      inference: true,
+      onRequestStarted: () => {
+        nativeHandoff = useNativeHandoff
+        stopCancel = cancelOnAbort(exec, signal, requestId)
+      },
       signal,
       timeoutMs,
     })
+    observedHeaders = mergeRateLimitHeaders(publicHeaders(response.headers))
+    handoff?.observeHeaders(response.headers)
     const data = await readAll(response)
-    const parsedRaw = parseJson(data, response.statusCode)
-    const parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
-    const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
-    const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
-    return restoreKernelErrorStatus({
+    const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+    let parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
+    if (handoff) {
+      handoff.observeHeaders(response.trailers)
+      handoff.observeMessage(parsed?.type === 'error' ? null : parsed)
+      parsed = handoff.finish(parsed)
+    }
+    const headers = mergeRateLimitHeaders(
+      publicHeaders(nativeHandoff ? { ...response.headers, ...response.trailers } : response.headers),
+    )
+    const ok =
+      response.statusCode >= 200 &&
+      response.statusCode < 300 &&
+      parsed?.type !== 'error' &&
+      (!nativeHandoff || !parsed?.error)
+    const result = restoreKernelErrorStatus({
       ok,
-      status: response.statusCode || 0,
+      status:
+        nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(parsed)
+          : response.statusCode || 0,
       via: 'go-worker',
       body: parsed,
       headers,
@@ -704,15 +907,26 @@ export async function callGoWorker({
       terminalState: headers['x-terminal-state'] || null,
       transportError: false,
       threadBetas: prepared.thread,
+      ...nativeMetadata(),
     })
+    return classifyManagedQueueRejection(result, managedCrag)
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return blocked
+    if (blocked) return { ...blocked, ...nativeMetadata() }
+    if (error.code === 'invalid_kernel_request') return { ...invalidKernelResult(error), ...nativeMetadata() }
+    if (signal?.aborted) return clientCancelledResult({ via: 'go-worker', ...nativeMetadata() })
     return {
       ok: false,
-      status: error.status === 413 ? 413 : 0,
+      status:
+        nativeHandoff && handoff?.errorBody
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(handoff.errorBody)
+          : nativeHandoff
+            ? error.status || 0
+            : error.status === 413
+              ? 413
+              : 0,
       via: 'go-worker',
-      body: {
+      body: handoff?.errorBody || {
         type: 'error',
         error: {
           type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
@@ -721,9 +935,15 @@ export async function callGoWorker({
           message: String(error.message || error).slice(0, 300),
         },
       },
-      headers: {},
-      terminalState: error.status === 413 ? 'rejected' : 'transport_error',
-      transportError: error.status !== 413,
+      headers: observedHeaders,
+      ...nativeMetadata(),
+      terminalState:
+        nativeHandoff && String(error.code).startsWith('native_handoff_')
+          ? 'incomplete'
+          : error.status === 413
+            ? 'rejected'
+            : 'transport_error',
+      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
@@ -737,6 +957,9 @@ export async function streamGoWorker({
   reqHeaders = {},
   timeoutMs,
   idleTimeoutMs = 0,
+  managedCrag = false,
+  tenantId = '',
+  slotWaitDeadlineMs,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -751,6 +974,7 @@ export async function streamGoWorker({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  callerCwd = null,
   repaired = false,
   onEnvelope = null,
   onOutboundHeaders = null,
@@ -841,11 +1065,25 @@ export async function streamGoWorker({
   let committed = false
   const timing = createStreamTiming()
   const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
+  let nativeHandoff = false
+  let handoff = null
+  let observedHeaders = {}
+  const nativeMetadata = () => (nativeHandoff ? handoff.metadata : { nativeHandoff: false, providerResult: null })
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope: await maskEnvelopeBody(envelope, redaction), thread: null, redaction }
+      ? {
+          envelope: await preparePrebuiltEnvelope(
+            envelope,
+            redaction,
+            requestPath === '/internal/v1/messages',
+            exec,
+            cragPrint,
+          ),
+          thread: null,
+          redaction,
+        }
       : await workerEnvelope({
           body,
           reqHeaders,
@@ -859,36 +1097,123 @@ export async function streamGoWorker({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          callerCwd,
           requestContext,
           repaired,
           redactionPrincipal,
           redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
-    const response = await workerRequest(exec, {
-      method: 'POST',
+    const useNativeHandoff = negotiateNativeHandoff(exec, {
+      managedCrag,
       requestPath,
-      body: { ...prepared.envelope, request_id: requestId },
+      requestContext,
+      envelope: prepared.envelope,
+    })
+    if (useNativeHandoff) handoff = createNativeHandoffState()
+    const response = await inferenceRequest(exec, {
+      stream: true,
+      deliveryMode,
+      managedCrag,
+      nativeHandoff: useNativeHandoff,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
+      requestPath,
+      envelope: prepared.envelope,
+      requestId,
       maxRequestBytes,
+      inference: true,
+      onRequestStarted: () => {
+        nativeHandoff = useNativeHandoff
+        stopCancel = cancelOnAbort(exec, signal, requestId)
+      },
       signal,
       timeoutMs,
-      timeoutMode: 'first-byte',
-      headers: { te: 'trailers' },
     })
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
+    observedHeaders = headers
+    handoff?.observeHeaders(response.headers)
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
-      return restoreKernelErrorStatus({
+      const decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+      handoff?.observeHeaders(response.trailers)
+      // A real HTTP error remains the failure, even if handoff metadata is absent.
+      const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: parseJson(data, response.statusCode),
+        body: decoded,
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
+        ...nativeMetadata(),
       })
+      return classifyManagedQueueRejection(result, managedCrag)
+    }
+    if (nativeHandoff) {
+      const received = await consumeNativeHandoffStream(response, {
+        state: handoff,
+        deliveryMode,
+        onEvent,
+        isCommitEvent: isDownstreamCommitEvent,
+        onCommit: () => {
+          committed = true
+          onCommit?.()
+        },
+        onObserve: (event) => {
+          timing.observe(event)
+          if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
+        },
+        onProviderResult: (result) => {
+          // Freeze the already-observed generation window at the native stop;
+          // internal metadata alone must not start a TTFT/generation clock.
+          if (result.stop_reason && timing.snapshot().firstByteAt != null) {
+            timing.observe({ type: 'message_delta', delta: { stop_reason: result.stop_reason } })
+          }
+        },
+        restoreEvent: prepared.redaction ? (event) => restoreJsonValue(event, prepared.redaction) : null,
+        onOutboundHeaders: (event) => {
+          if (
+            !event.headers ||
+            typeof event.headers !== 'object' ||
+            Array.isArray(event.headers) ||
+            typeof onOutboundHeaders !== 'function'
+          )
+            return
+          try {
+            const body = event.body == null ? undefined : capOutboundBody(event.body)
+            onOutboundHeaders(event.headers, {
+              body,
+              body_truncated: event.body_truncated === true || (typeof event.body === 'string' && body !== event.body),
+            })
+          } catch {
+            console.warn('[worker] outbound header observer failed')
+          }
+        },
+      })
+      const body = received.body
+      const failed = body?.type === 'error' || !!body?.error
+      const trailers = publicHeaders(response.trailers)
+      return {
+        ok: !failed,
+        status: failed
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(body)
+          : response.statusCode,
+        via: 'go-worker-stream',
+        body,
+        headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
+        ...nativeMetadata(),
+        ...timing.snapshot(),
+        sawMessageStop: received.sawMessageStop,
+        committed,
+        terminalState: failed ? 'incomplete' : 'verified',
+        transportError: false,
+        threadBetas: prepared.thread,
+      }
     }
     let buffer = ''
     let receivedAt = null
@@ -948,7 +1273,7 @@ export async function streamGoWorker({
     let sawMessageStop = false
     let outboundHeadersFrame = false
     let idleTimer = null
-    if (firstByteMs > 0 || idleMs > 0) {
+    if (!managedCrag && (firstByteMs > 0 || idleMs > 0)) {
       idleTimer = setInterval(() => {
         const limit = sawChunk ? idleMs : firstByteMs
         if (limit <= 0) return
@@ -974,7 +1299,8 @@ export async function streamGoWorker({
           if (sseRestorer) line = await sseRestorer.line(line)
           buffer = buffer.slice(newline + 1)
           // CLI diagnostics share the internal stream, never the caller's SSE.
-          if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
+          if (line.startsWith('event:'))
+            outboundHeadersFrame = ['kin_outbound_headers', 'kin_provider_result'].includes(line.slice(6).trim())
           if (outboundHeadersFrame) {
             if (line.startsWith('data:')) {
               const event = parseJson(line.slice(5).trim())
@@ -1052,9 +1378,12 @@ export async function streamGoWorker({
       if (!committed && complete) await flushCommit()
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
+      // A native activity timeout can follow HTTP/SSE metadata but precede
+      // visible output. It is neither an empty hop nor a transport failure.
+      const nativeTimeout = managedCrag && lastError?.error?.type === 'timeout_error'
       return restoreUncommittedHop({
         ok: response.statusCode === 200 && !lastError && complete,
-        status: response.statusCode || 0,
+        status: nativeTimeout && !committed ? 504 : response.statusCode || 0,
         via: 'go-worker-stream',
 
         body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
@@ -1067,7 +1396,7 @@ export async function streamGoWorker({
         sawMessageStop,
         ...timing.snapshot(),
         committed,
-        terminalState,
+        terminalState: nativeTimeout && !committed ? 'rejected' : terminalState,
         transportError: false,
         threadBetas: prepared.thread,
       })
@@ -1076,19 +1405,29 @@ export async function streamGoWorker({
     }
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return { ...blocked, ...timing.snapshot(), committed }
+    if (blocked) return { ...blocked, ...timing.snapshot(), committed, ...nativeMetadata() }
+    if (error.code === 'invalid_kernel_request')
+      return { ...invalidKernelResult(error), ...timing.snapshot(), committed, ...nativeMetadata() }
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
         ...timing.snapshot(),
         committed,
+        ...nativeMetadata(),
       })
     }
     return {
       ok: false,
-      status: error.status === 413 ? 413 : 0,
+      status:
+        nativeHandoff && handoff?.errorBody
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(handoff.errorBody)
+          : nativeHandoff
+            ? error.status || 0
+            : error.status === 413
+              ? 413
+              : 0,
       via: 'go-worker-stream',
-      body: {
+      body: handoff?.errorBody || {
         type: 'error',
         error: {
           type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
@@ -1097,11 +1436,17 @@ export async function streamGoWorker({
           message: String(error.message || error).slice(0, 300),
         },
       },
-      headers: {},
+      headers: observedHeaders,
+      ...nativeMetadata(),
       ...timing.snapshot(),
       committed,
-      terminalState: committed ? 'incomplete' : error.status === 413 ? 'rejected' : 'transport_error',
-      transportError: error.status !== 413,
+      terminalState:
+        committed || (nativeHandoff && String(error.code).startsWith('native_handoff_'))
+          ? 'incomplete'
+          : error.status === 413
+            ? 'rejected'
+            : 'transport_error',
+      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
@@ -1268,27 +1613,62 @@ export function credentialSummary(credential, now = Date.now()) {
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
-  try {
-    writeWorkerCredentialFile(exec.homeDir, credential)
-    // Import is the one case where the control plane's credential replaces the slot's copy.
-    await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
-  } catch (error) {
-    return {
-      ok: false,
-      status: 500,
-      error: { code: 'credential_import_failed', message: String(error.message || error).slice(0, 300) },
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      if (!writeWorkerCredentialFile(exec.homeDir, credential)) throw new Error('credential_required')
+      // Import is the one case where the control plane's credential replaces the slot's copy.
+      await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
+    } catch (error) {
+      return {
+        ok: false,
+        status: 500,
+        error: { code: 'credential_import_failed', message: '凭证导入未完成，请检查 VM 连接后重试面板导入' },
+      }
     }
-  }
-  return {
-    ok: true,
-    status: 200,
-    credential: {
-      has_access: !!credential?.access_token || !!credential?.api_key,
-      has_refresh: !!credential?.refresh_token,
-      expires_at: credential?.expires_at || null,
-      generation: Date.now(),
-    },
-  }
+    return {
+      ok: true,
+      status: 200,
+      credential: {
+        has_access: !!credential?.access_token || !!credential?.api_key,
+        has_refresh: !!credential?.refresh_token,
+        expires_at: credential?.expires_at || null,
+        generation: Date.now(),
+      },
+    }
+  })
+}
+
+export async function syncClaudeClientCredentials(
+  exec,
+  { host = slotHost(exec.vm), ensureRemoteLink = ensureRemoteOfficialCredentialLink } = {},
+) {
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      const slotDir = path.dirname(exec.homeDir)
+      if (host.kind === 'node') {
+        const pulled = await host.afterRefresh(exec.vm, slotDir)
+        if (pulled?.reason === 'remote_missing') throw new Error('remote_missing')
+        const linked = await ensureRemoteLink(exec.vm, slotDir)
+        if (!linked?.linked) throw new Error('remote_link_failed')
+      }
+      const credential = readWorkerCredentialFile(exec.homeDir)
+      if (!credential?.access_token && !credential?.api_key) {
+        return { ok: false, status: 409, error: { code: 'credential_required', message: '请先在面板导入凭证' } }
+      }
+      const linked = ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
+      if (!linked.linked) throw new Error('credential_link_failed')
+      return { ok: true, synced: true, credential: credentialSummary(credential) }
+    } catch {
+      return {
+        ok: false,
+        status: 502,
+        error: {
+          code: 'client_credential_sync_failed',
+          message: '客户端凭证同步失败，请检查 VM 连接后重试同步；无需重新换票',
+        },
+      }
+    }
+  })
 }
 
 export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {

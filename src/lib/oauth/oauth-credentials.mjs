@@ -187,14 +187,14 @@ function officialGrantWins(official, worker) {
  * grant is copied onto the worker file first. Deleting it and refreshing
  * the older RT is what revokes the new grant.
  */
-export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false } = {}) {
+export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false, adoptOfficial = true } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
   const officialGrant = regularOauthGrant(officialFile)
   const workerGrant = regularOauthGrant(workerFile)
-  const adopt = officialGrantWins(officialGrant, workerGrant)
+  const adopt = adoptOfficial && officialGrantWins(officialGrant, workerGrant)
   if (!workerGrant && !fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
@@ -443,7 +443,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
     )
     chownSlotCredentialFile(homeDir, file)
     sealSlotCredentialFile(file)
-    ensureOfficialCredentialLink(homeDir)
+    ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
     return file
   }
   const n = normalizeOauth(cred)
@@ -492,15 +492,15 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   atomicWriteJson(file, { type: mode, authScheme, kinGeneration: generation, claudeAiOauth: oauth }, { mode: 0o600 })
   chownSlotCredentialFile(homeDir, file)
   sealSlotCredentialFile(file)
-  ensureOfficialCredentialLink(homeDir)
+  ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
   return file
 }
 
 /**
  * Old slot files predate subscriptionType. Fill from the identified plan,
- * otherwise pro; repair the legacy pro fallback for an identified Max slot.
+ * otherwise pro. Only authoritative profile/usage can downgrade an old Max.
  */
-export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
+export function ensureSlotSubscriptionType(homeDir, accountTier = null, { source = null } = {}) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file || !fs.existsSync(file)) return { wrote: false, reason: 'missing' }
   let doc
@@ -514,8 +514,13 @@ export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
   const present = normalizeSubscriptionType(oauth.subscriptionType)
   const identified = normalizeSubscriptionType(accountTier)
   // Startup summaries used to lose the identified tier and write pro. A pro
-  // hint may itself be a default, so it must not downgrade an existing plan.
-  if (present && !(present === 'pro' && identified === 'max')) {
+  // hint may itself be a default; only an explicit source can downgrade a plan.
+  const authoritative = source === 'profile' || source === 'usage'
+  if (
+    present &&
+    !(present === 'pro' && identified === 'max') &&
+    !(authoritative && identified && present !== identified)
+  ) {
     chownSlotCredentialFile(homeDir, file)
     return { wrote: false, reason: 'present' }
   }
