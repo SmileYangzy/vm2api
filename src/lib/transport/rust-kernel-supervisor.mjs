@@ -31,6 +31,8 @@ import {
   normalizeSessionIdleTtlSeconds,
   LOCAL_CRAG_CLAUDE,
   REMOTE_CRAG_CLAUDE,
+  REMOTE_CRAG_ENTRY,
+  resolveSlotClaude,
   resolveCliSystemLayout,
   resolveCragKernelVersion,
   resolveKernelDataplane,
@@ -49,17 +51,14 @@ import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
 import { checkCragLicense } from '../vm/crag-license.mjs'
+import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
+import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { workerPaths } from './go-worker-client.mjs'
 
 /** The native host is authenticated separately from account scheduling readiness. */
 function runtimeReady(health, allowMissingCredential) {
   if (!allowMissingCredential) return rustKernelReachable(health)
-  return (
-    health?.vm_telemetry === true &&
-    health?.telemetry_ready === true &&
-    health?.healthy !== false &&
-    Number(health?.cli_pid) > 0
-  )
+  return rustKernelProcessUp(health) && health?.healthy !== false && Number(health?.cli_pid) > 0
 }
 
 function normalizeAutoCompactWindow(value) {
@@ -149,7 +148,7 @@ export function readExistingKernelConfig(configPath) {
   }
 }
 
-/** Legacy crag and cc use cc-node; native V2 owns its own child lifecycle. */
+/** The cc dataplane runs cc-node. CRAG always runs native Claude. */
 export function dataplaneUsesCcNode(exec) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
@@ -157,7 +156,7 @@ export function dataplaneUsesCcNode(exec) {
   const plane = String(config.dataplane || '')
     .trim()
     .toLowerCase()
-  return (plane === 'crag' && config.crag_kernel_version !== 'v2') || plane === 'cc' || plane === 'cc-node'
+  return plane === 'cc' || plane === 'cc-node'
 }
 function projectRootFromExec(exec = {}) {
   if (exec?.projectRoot) return exec.projectRoot
@@ -320,14 +319,21 @@ export async function ensureRustKernel(
     runDockerExec = runDocker,
     force = false,
     allowMissingCredential = false,
+    prepareGuestAppArmor = false,
   } = {},
 ) {
   const vmId = exec?.vmId || exec?.vm?.id || 'unknown'
-  const pending = starts.get(vmId)
-  if (pending && !force) {
+  let pending = starts.get(vmId)
+  while (pending && !force) {
     const result = await pending.promise
-    if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
-    return { ok: false, reason: 'telemetry_not_ready', health: result?.health }
+    if (!prepareGuestAppArmor || pending.prepareGuestAppArmor) {
+      if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
+      return { ok: false, reason: 'kernel_not_ready', health: result?.health }
+    }
+    // A normal health check cannot satisfy cold-boot permission preparation.
+    const next = starts.get(vmId)
+    if (next === pending) break
+    pending = next
   }
   const control = { cancelled: false }
   const run = slotRunner(exec, runDockerExec)
@@ -339,8 +345,9 @@ export async function ensureRustKernel(
     runDockerExec: run,
     force,
     allowMissingCredential,
+    prepareGuestAppArmor,
   })
-  const start = { promise, control }
+  const start = { promise, control, prepareGuestAppArmor }
   starts.set(vmId, start)
   try {
     return await promise
@@ -403,6 +410,9 @@ export function wrapNewerThanKernel(exec) {
 }
 
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
+  if (isKvmRuntime(exec?.vm)) {
+    return ensureRustKernel(exec, { timeoutMs, runDockerExec, force: true })
+  }
   const run = slotRunner(exec, runDockerExec)
   await killWrapDataplane(exec, run)
   const paths = rustKernelPaths(exec)
@@ -589,8 +599,20 @@ export async function recycleWrapIfIdle(
 
 async function containerKernelIsPid1(container, runDockerExec, vm) {
   if (isKvmRuntime(vm)) return false
-  const info = await runDockerExec(['inspect', '--format', '{{.Path}}', container], { timeoutMs: 3000 })
-  return /kin-kernel|(?:^|\/)crag-v2$/.test(String(info?.stdout || '').trim())
+  const info = await runDockerExec(['inspect', '--format', '{{json .Path}}{{printf "\\n"}}{{json .Args}}', container], {
+    timeoutMs: 3000,
+  })
+  try {
+    const [path, args] = String(info?.stdout || '')
+      .trimEnd()
+      .split('\n')
+    const executable = JSON.parse(path)
+    // Cluster CRAG boots the slot-bin entry; its node home has no .kin/kin-kernel to exec.
+    if (/kin-kernel|(?:^|\/)crag-v2$/.test(executable) || executable === REMOTE_CRAG_ENTRY) return true
+    return kernelCpuCommandMatches([executable, ...JSON.parse(args)])
+  } catch {
+    return false
+  }
 }
 function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
   if (!pid1Kernel && !wedged) return 0
@@ -603,7 +625,7 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 /** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
 async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
   try {
-    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY], { user: '0' }), {
+    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
       timeoutMs: 5000,
     })
     if (retired?.ok) return { ok: true }
@@ -613,22 +635,44 @@ async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
 
 async function startKvmGuestKernel(
   exec,
-  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential },
+  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential, prepareGuestAppArmor },
 ) {
   const budget = kvmBootBudget(exec.vm, timeoutMs)
   if (!force) {
     const waited = await waitForHealth(exec, budget, allowMissingCredential)
-    if (waited?.ok) {
+    if (waited?.ok && !prepareGuestAppArmor) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
+    }
+  }
+  const sshDeadline = Date.now() + 15_000
+  let prepared
+  do {
+    prepared = await runDockerExec(execArgv(exec, kvmCragAppArmorCommand(), { user: '0', interactive: true }), {
+      timeoutMs: 30_000,
+    })
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+    if (prepared?.ok) break
+    // The guest health relay can become ready before sshd during cold boot.
+    const sshUnavailable = `${prepared?.error || ''}\n${prepared?.stderr || ''}`.includes('guest ssh unavailable')
+    if (!prepareGuestAppArmor || !sshUnavailable || Date.now() >= sshDeadline) break
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  } while (startCurrent(control))
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!prepared?.ok) {
+    return {
+      ok: false,
+      reason: 'guest_apparmor_failed',
+      error: String(prepared?.error || prepared?.stderr || 'Guest AppArmor preparation failed'),
     }
   }
   const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
   if (!retired.ok) return retired
   await killWrapDataplane(exec, runDockerExec)
-  const launched = await runDockerExec(execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0' }), {
-    timeoutMs: Math.min(budget, 30_000),
-  })
+  const launched = await runDockerExec(
+    execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0', interactive: true }),
+    { timeoutMs: Math.min(budget, 30_000) },
+  )
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   if (!launched?.ok) {
     const waited = await waitForHealth(exec, budget, allowMissingCredential)
@@ -664,7 +708,15 @@ async function startNativeKernel(exec, { timeoutMs, control, host }) {
 
 async function startRustKernel(
   exec,
-  { timeoutMs, healthTimeoutMs = 800, control, runDockerExec, force = false, allowMissingCredential = false },
+  {
+    timeoutMs,
+    healthTimeoutMs = 800,
+    control,
+    runDockerExec,
+    force = false,
+    allowMissingCredential = false,
+    prepareGuestAppArmor = false,
+  },
 ) {
   const licensed = checkCragLicense(projectRootFromExec(exec), exec?.vm, {
     inference: { dataplane: readExistingKernelConfig(rustKernelPaths(exec).configPath).dataplane },
@@ -674,7 +726,9 @@ async function startRustKernel(
     const ids = slotUidGidFromHomeDir(exec.homeDir)
     ensureOfficialCredentialLink(exec.homeDir, ids || {})
     try {
-      ensureSlotSubscriptionType(exec.homeDir, exec.vm?.claude?.account_tier || exec.vm?.account_tier)
+      ensureSlotSubscriptionType(exec.homeDir, exec.vm?.claude?.account_tier || exec.vm?.account_tier, {
+        source: exec.vm?.claude?.account_tier ? exec.vm.claude.account_tier_source : exec.vm?.account_tier_source,
+      })
     } catch {}
   }
   const paths = rustKernelPaths(exec)
@@ -687,11 +741,17 @@ async function startRustKernel(
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
   const host = slotHost(exec?.vm)
   // Credential rotation is read by the live kernel/CLI; it is not a lifecycle change.
-  if (!allowMissingCredential && !force && occupied && !staleWrap && !slotMismatch) {
+  if (!allowMissingCredential && !force && !prepareGuestAppArmor && occupied && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'busy', health: existing, reconcile }
   }
-  if (!force && runtimeReady(existing, allowMissingCredential) && !staleWrap && !slotMismatch) {
+  if (
+    !force &&
+    !prepareGuestAppArmor &&
+    runtimeReady(existing, allowMissingCredential) &&
+    !staleWrap &&
+    !slotMismatch
+  ) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
@@ -715,6 +775,7 @@ async function startRustKernel(
       paths,
       container,
       allowMissingCredential,
+      prepareGuestAppArmor,
     })
   }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
@@ -733,10 +794,15 @@ async function startRustKernel(
     if (host.ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
   if (!pid1Kernel) await killWrapDataplane(exec, runDockerExec)
+  const argv = [CONTAINER_KERNEL_BIN, '--gateway-worker', '--config', CONTAINER_KERNEL_CONFIG]
+  const cpuLimited = usesKernelCpuLimit({
+    ...exec?.vm,
+    dataplane: readExistingKernelConfig(paths.configPath).dataplane || exec?.vm?.dataplane,
+  })
   const launched = pid1Kernel
     ? await runDockerExec(['restart', container], { timeoutMs: Math.min(timeoutMs, 15000) })
     : await runDockerExec(
-        execArgv(exec, [CONTAINER_KERNEL_BIN, '--gateway-worker', '--config', CONTAINER_KERNEL_CONFIG], {
+        execArgv(exec, cpuLimited ? kernelCpuCommand(argv) : argv, {
           detach: true,
           env: ['KIN_SUBMIT_WAIT_MS=30000', 'KIN_SLOT_MAX_LIFETIME_SECS=604800'],
         }),
@@ -893,7 +959,7 @@ export function writeKernelConfig(
     if (host.native) return null
     throw err
   }
-  const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
+  const claudeBin = envBin || resolveSlotClaude(vm, routing || {}, host).bin
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const thinkingDisplay =
@@ -964,7 +1030,7 @@ export function writeKernelConfig(
   if (dataplane === 'crag' && resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' && !host.native) {
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
-    config.claude_bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+    config.claude_bin = resolveSlotClaude({ ...record, ...vm }, routing || {}, host).bin
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
     config.cli_version = ''

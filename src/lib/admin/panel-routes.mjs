@@ -42,13 +42,7 @@ import {
   looksLikeOfficialSetupToken,
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
-import {
-  completeClaudeAuthLogin,
-  readAuthLoginSession,
-  startClaudeAuthLoginSession,
-  AUTH_LOGIN_FLAVOR,
-  AUTH_LOGIN_SOURCE,
-} from '../oauth/claude-auth-login.mjs'
+import { AUTH_LOGIN_FLAVOR, AUTH_LOGIN_SOURCE } from '../oauth/claude-auth-login.mjs'
 import {
   canOfficialCc,
   isApiKeyMode,
@@ -166,6 +160,7 @@ import {
   migrateScheduleRecord,
 } from '../pool/schedule-state.mjs'
 import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
+import { proxyScheme } from '../vm/proxy-pool.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
@@ -206,6 +201,7 @@ import {
 import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
 import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
 import { installKernelTargets, releaseKernelInstallSafetyHold, validateKernelTargets } from '../vm/kernel-install.mjs'
+import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
 import { reloadActiveVm } from '../core/config.mjs'
@@ -282,7 +278,7 @@ import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
-import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import {
@@ -291,6 +287,7 @@ import {
   CragLicenseError,
   distributeCragUniversalGrant,
   getCragLicense,
+  projectCragUniversalVm,
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
@@ -1142,16 +1139,38 @@ export function createPanelHandler(ctx) {
     )
   }
 
+  async function projectKvmCragSwitchLicense(current, desired, previousRouting, nextRouting) {
+    if (!isKvmRuntime(desired) || resolveKernelDataplane(desired, nextRouting) !== 'crag') return
+    if (
+      resolveKernelDataplane(current, previousRouting) === 'crag' &&
+      resolveCragKernelVersion(current, previousRouting) === resolveCragKernelVersion(desired, nextRouting)
+    )
+      return
+    try {
+      const project = ctx.kernelPolicyOps?.projectCragUniversalVm || projectCragUniversalVm
+      const projected = await project(cfg.paths.project, desired)
+      if (!projected?.ok) throw new Error(projected?.error || 'CRAG license projection failed')
+    } catch (cause) {
+      const error = new Error(`CRAG 授权同步失败：${String(cause?.message || cause).slice(0, 200)}`)
+      error.code = 'crag_license_projection_failed'
+      throw error
+    }
+  }
+
   // PATCH already owns the full record lock, including its other metadata/config writes.
-  async function applySlotPolicyWithRuntimeLocked(id, patch) {
+  async function applySlotPolicyWithRuntimeLocked(
+    id,
+    patch,
+    { maintenance = false, previousRouting = structuredClone(ctx.routingConfig), cragLicenseProjected = false } = {},
+  ) {
     const current = getVm(cfg.paths.project, id)
     if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
     const desired = vmWithSlotPolicyPatch(current, patch)
-    const previousEngine = resolveInferenceEngine(current, ctx.routingConfig)
+    const previousEngine = resolveInferenceEngine(current, previousRouting)
     const targetEngine = resolveInferenceEngine(desired, ctx.routingConfig)
-    const previousDataplane = resolveKernelDataplane(current, ctx.routingConfig)
+    const previousDataplane = resolveKernelDataplane(current, previousRouting)
     const targetDataplane = resolveKernelDataplane(desired, ctx.routingConfig)
-    const previousVersion = resolveCragKernelVersion(current, ctx.routingConfig)
+    const previousVersion = resolveCragKernelVersion(current, previousRouting)
     const targetVersion = resolveCragKernelVersion(desired, ctx.routingConfig)
     const licensed = checkCragLicense(cfg.paths.project, desired, ctx.routingConfig)
     if (!licensed.ok) return { ...licensed, id }
@@ -1160,12 +1179,29 @@ export function createPanelHandler(ctx) {
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
     const kernelSwitch = dataplaneChanged || versionChanged
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
-      if (isKvmRuntime(desired)) {
-        return { ok: false, id, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' }
-      }
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
       }
+    }
+    if (kernelSwitch && current.status === 'running' && !maintenance) {
+      return withSlotMaintenance({
+        projectRoot: cfg.paths.project,
+        id,
+        watchdog: ctx.kernelWatchdog,
+        poolScheduler: ctx.poolScheduler,
+        operation: () => applySlotPolicyWithRuntimeLocked(id, patch, { maintenance: true, previousRouting }),
+      })
+    }
+    if (!cragLicenseProjected) {
+      try {
+        await projectKvmCragSwitchLicense(current, desired, previousRouting, ctx.routingConfig)
+      } catch (error) {
+        return { ok: false, id, code: error.code, error: error.message }
+      }
+    }
+    const restartFailed = (result) => {
+      markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: result.code })
+      return result
     }
     let switched = null
     if (Object.prototype.hasOwnProperty.call(patch, 'inference_engine') && previousEngine !== targetEngine) {
@@ -1190,28 +1226,26 @@ export function createPanelHandler(ctx) {
             return { ok: false, id, code: laid.code || 'dataplane_materialize_failed', error: laid.error }
           }
         }
-        writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
+        const write = ctx.kernelPolicyOps?.writeKernelConfig || writeKernelConfig
+        write(cfg.paths.project, saved, { routing: ctx.routingConfig })
         if (kernelSwitch && saved.status === 'running') {
           const remoteDocker =
             Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
           const recreateNative =
-            !isKvmRuntime(saved) &&
-            (remoteDocker ||
-              (targetDataplane === 'crag' && targetVersion === 'v2' && !String(saved.node_id || '').trim()))
-          // docker restart keeps HostConfig. A CRAG v2 command, or any cluster
-          // kernel change, has to recreate the container.
+            !isKvmRuntime(saved) && (remoteDocker || previousDataplane === 'crag' || targetDataplane === 'crag')
+          // Both directions must replace CRAG's creation-only sandbox and command.
           if (recreateNative) {
-            const booted = await startSlotReady(saved, cfg.paths.project, {
+            const booted = await (ctx.kernelPolicyOps?.startSlotReady || startSlotReady)(saved, cfg.paths.project, {
               recreate: true,
               routing: ctx.routingConfig,
             })
-            if (!booted?.ok) {
-              return {
+            if (!booted?.ok || booted.rust_ok === false || booted.rust?.ok === false || booted.kernel?.ok === false) {
+              return restartFailed({
                 ok: false,
                 id,
                 code: booted?.code || 'kernel_restart_failed',
-                error: booted?.error || 'kernel recreate failed',
-              }
+                error: booted?.error || booted?.rust?.error || booted?.rust?.reason || 'kernel recreate failed',
+              })
             }
           } else {
             const exec = slotExec(cfg.paths.project, saved)
@@ -1220,13 +1254,18 @@ export function createPanelHandler(ctx) {
               error: String(e?.message || e).slice(0, 200),
             }))
             if (!restarted?.ok) {
-              return {
+              return restartFailed({
                 ok: false,
                 id,
                 code: 'kernel_restart_failed',
                 error: restarted?.error || 'kernel restart failed',
-              }
+              })
             }
+          }
+          ctx.kernelWatchdog?.reset?.(id)
+          panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+          if (getVm(cfg.paths.project, id)?.unschedulable?.reason === 'runtime_start_failed') {
+            clearUnschedulable(cfg.paths.project, id, { by: 'operator' })
           }
         }
       }
@@ -1242,6 +1281,9 @@ export function createPanelHandler(ctx) {
         runtime: switched?.runtime || null,
       }
     } catch (error) {
+      if (kernelSwitch && current.status === 'running') {
+        markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: 'kernel_switch_failed' })
+      }
       let rollback = null
       if (switched) rollback = await switchSlotInferenceEngine(current, cfg.paths.project, previousEngine)
       return {
@@ -2595,6 +2637,7 @@ export function createPanelHandler(ctx) {
           targets: body.targets,
           routing: ctx.routingConfig,
           watchdog: ctx.kernelWatchdog,
+          poolScheduler: ctx.poolScheduler,
           ops: ctx.kernelInstallOps,
         })
         return json(res, 200, panel.ok(report))
@@ -2634,6 +2677,75 @@ export function createPanelHandler(ctx) {
           },
           async (syncArgs) => {
             const previous = structuredClone(ctx.routingConfig)
+            if (body.restart !== false) {
+              const nextRouting = targets.all
+                ? { ...ctx.routingConfig, inference: { ...ctx.routingConfig.inference, dataplane: parsed.value } }
+                : ctx.routingConfig
+              for (const id of syncArgs.body.ids) {
+                const vm = getVm(cfg.paths.project, id)
+                const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                const licensed = checkCragLicense(cfg.paths.project, desired, nextRouting)
+                if (!licensed.ok)
+                  return json(res, 403, { ok: false, error: { code: licensed.code, message: licensed.error } })
+                if (resolveKernelDataplane(desired, nextRouting) === 'crag' && isNativeNodeVm(desired)) {
+                  return json(res, 400, {
+                    ok: false,
+                    error: { code: 'remote_unsupported', message: 'CRAG 切核暂不支持 macOS 原生槽' },
+                  })
+                }
+              }
+              let switchAll = async () => {
+                // Publish every KVM grant before changing the inherited default or any slot policy.
+                for (const id of syncArgs.body.ids) {
+                  const vm = getVm(cfg.paths.project, id)
+                  const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                  await projectKvmCragSwitchLicense(vm, desired, previous, nextRouting)
+                }
+                if (targets.all) await persistRoutingPatch({ inference: nextRouting.inference })
+                const items = []
+                for (const id of syncArgs.body.ids) {
+                  const switched = await applySlotPolicyWithRuntimeLocked(
+                    id,
+                    targets.all ? {} : { dataplane: parsed.value },
+                    { maintenance: true, previousRouting: previous, cragLicenseProjected: true },
+                  )
+                  items.push({ id, ok: switched.ok, code: switched.code, error: switched.error })
+                }
+                const failed = items.filter((item) => !item.ok).length
+                return {
+                  ok: failed === 0,
+                  total: items.length,
+                  ok_count: items.length - failed,
+                  failed_count: failed,
+                  items,
+                }
+              }
+              for (const id of [...syncArgs.body.ids].reverse()) {
+                if (getVm(cfg.paths.project, id)?.status !== 'running') continue
+                const operation = switchAll
+                switchAll = () =>
+                  withSlotMaintenance({
+                    projectRoot: cfg.paths.project,
+                    id,
+                    watchdog: ctx.kernelWatchdog,
+                    poolScheduler: ctx.poolScheduler,
+                    operation,
+                  })
+              }
+              try {
+                const report = await switchAll()
+                return json(res, report.ok ? 200 : 503, panel.ok({ dataplane: parsed.value, ...report }))
+              } catch (error) {
+                ctx.routingConfig = previous
+                return json(res, 503, {
+                  ok: false,
+                  error: {
+                    code: error?.code === 'crag_license_projection_failed' ? error.code : 'dataplane_persist_failed',
+                    message: String(error?.message || error),
+                  },
+                })
+              }
+            }
             try {
               if (targets.all) {
                 await persistRoutingPatch({
@@ -2941,12 +3053,36 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok({ id, reload: reloaded }))
       }
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/credentials\/sync$/.test(p)) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        if (isCodexVm(vm))
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'credential_kind_mismatch', message: '此同步仅用于 Claude 客户端' },
+          })
+        const result = await syncClaudeClientCredentials(slotExec(cfg.paths.project, vm))
+        if (!result.ok) return json(res, result.status, result)
+        return json(res, 200, panel.ok({ synced: true }))
+      }
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
         const body = await readBody(req, 1024).catch(() => ({}))
-        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], { login: body.login === true })
+        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], {
+          login: body.login === true,
+          cliBin: body.cli_bin ?? '',
+        })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
-        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
+        return json(
+          res,
+          200,
+          panel.ok({
+            ticket: issued.ticket,
+            expires_in: issued.expires_in,
+            ...(issued.cli_bin ? { cli_bin: issued.cli_bin } : {}),
+          }),
+        )
       }
       // POST /api/panel/vms/:id/collect-identity
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/collect-identity$/.test(p)) {
@@ -2995,30 +3131,26 @@ export function createPanelHandler(ctx) {
           })
         const vm = getVm(cfg.paths.project, p.split('/')[4])
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
-        if (isCodexVm(vm) || isKvmRuntime(vm) || isNativeNodeVm(vm))
+        if (isCodexVm(vm) || isNativeNodeVm(vm))
           return json(res, 400, {
             ok: false,
             error: {
               code: 'crag_v2_unsupported_placement',
-              message: isCodexVm(vm)
-                ? '请选择 Claude 虚拟机'
-                : isKvmRuntime(vm)
-                  ? 'CRAG v2 不支持 KVM 槽'
-                  : 'CRAG v2 不支持 macOS 原生节点',
+              message: isCodexVm(vm) ? '请选择 Claude 虚拟机' : 'CRAG v2 不支持 macOS 原生节点',
             },
           })
-        const remotePlacement = Boolean(vm.node_id) || isKvmRuntime(vm)
+        const offlineOnlyPlacement = Boolean(vm.node_id) || isKvmRuntime(vm)
         try {
           if (req.method === 'GET')
             return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
           const body = await readBody(req, 32768)
           const registrationCode = typeof body?.registration_code === 'string' ? body.registration_code.trim() : ''
-          if (remotePlacement && !registrationCode.startsWith('CRAGU1.')) {
+          if (offlineOnlyPlacement && !registrationCode.startsWith('CRAGU1.')) {
             return json(res, 400, {
               ok: false,
               error: {
                 code: 'crag_v2_unsupported_placement',
-                message: '集群槽只能激活离线通用码。设备注册码仍需要本机 Linux Docker 槽。',
+                message: 'KVM 和集群槽只能激活 CRAGU1 离线通用码。设备注册码仍需要本机 Linux Docker 槽。',
               },
             })
           }
@@ -3371,7 +3503,7 @@ export function createPanelHandler(ctx) {
                 : body.memory
             const liveVm = getVm(cfg.paths.project, id) || currentVm
             const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
-            const raised = raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
+            const raised = await raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
               routing: ctx.routingConfig,
             })
             if (!raised.ok) {
@@ -3391,6 +3523,13 @@ export function createPanelHandler(ctx) {
                   requested: raised.requested ?? requestedMemory ?? null,
                   container_memory: raised.container_memory ?? null,
                   current: raised.current ?? null,
+                  application_state: raised.application_state ?? null,
+                  config_unchanged: raised.config_unchanged ?? null,
+                  rollback_attempted: raised.rollback_attempted ?? false,
+                  rollback_succeeded: raised.rollback_succeeded ?? false,
+                  before_memory: raised.before_memory ?? null,
+                  before_swap_bytes: raised.before_swap_bytes ?? null,
+                  observed_memory_swap: raised.observed_memory_swap ?? null,
                 },
               })
             }
@@ -3472,10 +3611,21 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/claude-reset\/redeem$/.test(p)) {
         const id = p.split('/')[4]
+        // A body that cannot be read must not fall back to the server's next grant.
+        let body
+        try {
+          body = (await readBody(req, 4096)) || {}
+        } catch (error) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: String(error?.message || 'invalid JSON body') },
+          })
+        }
         const result = await panel.buildClaudeResetRedeem({
           cfg,
           id,
           idempotencyKey: req.headers['idempotency-key'],
+          card: body.card,
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
@@ -4758,11 +4908,13 @@ export function createPanelHandler(ctx) {
             routing: ctx.routingConfig,
             fillTimezone: fillTimezoneFromExit,
             watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
             internal: panelIdentity(req).role === 'admin',
             ops: ctx.kernelRecoveryOps,
           })
           // Recovery returns outer ok even when a boot/readiness/diagnosis step failed.
           if (result.ok && result.report?.ok === true) {
+            panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
             releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
           }
           return result
@@ -5006,23 +5158,6 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
-          if (normalizeOauthFlavor(flavor) === 'claude_code') {
-            const generated = await startClaudeAuthLoginSession({
-              vm: existing,
-              projectRoot: cfg.paths.project,
-              routing: ctx.routingConfig,
-              force: body.force === true || body.force === 'true' || body.force === 1,
-            })
-            const px = existing.proxy || {}
-            return json(
-              res,
-              200,
-              panel.ok({
-                ...generated,
-                proxy_hint: slotProxyHint(px, proxyPool?.labelOf(px.id)),
-              }),
-            )
-          }
           const generated = generateAuthUrl({
             vmId: id,
             proxyUrl: slotProxy.proxyUrl,
@@ -5110,25 +5245,11 @@ export function createPanelHandler(ctx) {
           }
           const code = body.code || body.auth_code || ''
           const flavor = body.flavor || body.type || ''
-          const loginSession = readAuthLoginSession(cfg.paths.project, id)
           const sessionKey = String(body.session_id || body.sessionId || '')
-          const officialLogin =
-            normalizeOauthFlavor(flavor) === 'claude_code' ||
-            (loginSession?.alive &&
-              !loginSession.expired &&
-              loginSession.session_id &&
-              loginSession.session_id === sessionKey)
           let oauth
           let oauthFromVm = false
           if (looksLikeOfficialSetupToken(code)) {
             oauth = await completeClaudeSetupToken({
-              projectRoot: cfg.paths.project,
-              vmId: id,
-              sessionId: sessionKey,
-              code,
-            })
-          } else if (officialLogin) {
-            oauth = await completeClaudeAuthLogin({
               projectRoot: cfg.paths.project,
               vmId: id,
               sessionId: sessionKey,
@@ -6056,7 +6177,22 @@ export function createPanelHandler(ctx) {
         if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
           return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         }
+        // Protocol for lines without their own scheme:// prefix. Reject unknown
+        // values rather than silently importing them as SOCKS5.
+        const defaultScheme =
+          body.default_scheme == null || body.default_scheme === '' ? 'socks5' : proxyScheme(body.default_scheme)
+        if (!defaultScheme) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              type: 'invalid_request_error',
+              code: 'invalid_scheme',
+              message: 'default_scheme must be socks5 or http',
+            },
+          })
+        }
         const result = proxyPool.importLines(text, {
+          defaultScheme,
           fields: body.proxies || body.entries || null,
           host: body.host,
           port: body.port,
@@ -6148,7 +6284,7 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+        for (const key of ['scheme', 'host', 'port', 'username', 'password', 'label', 'domain_forward']) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)

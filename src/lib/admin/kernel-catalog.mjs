@@ -406,12 +406,30 @@ function pinnedAuthority(projectRoot) {
     .export({ format: 'der', type: 'spki' })
 }
 
-export async function pullKernelRelease(projectRoot, { kernel, tag = '' } = {}, { fetchImpl = globalThis.fetch } = {}) {
+function cragReleaseTag(projectRoot) {
+  try {
+    return jsonFile(path.join(projectRoot, 'deploy/payload.json')).crag_release || ''
+  } catch (error) {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  }
+}
+
+export async function pullKernelRelease(
+  projectRoot,
+  { kernel, tag = '', latest = false } = {},
+  { fetchImpl = globalThis.fetch } = {},
+) {
   if (!['cli-node', 'crag'].includes(kernel))
     return { ok: false, code: 'kernel_invalid', error: '请选择 cli-node 或 CRAG' }
   let stage, published, lock, pointerTemp
   try {
-    const payload = await fetchKernelReleaseMetadata({ tag, fetchImpl })
+    const payload = await fetchKernelReleaseMetadata({
+      tag,
+      kernel,
+      cragReleaseTag: kernel === 'crag' && !latest ? cragReleaseTag(projectRoot) : '',
+      fetchImpl,
+    })
     const specs =
       kernel === 'cli-node'
         ? [selectKernelAsset(payload), selectCliNodeAsset(payload)]

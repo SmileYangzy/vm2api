@@ -75,7 +75,6 @@ import { clientIp } from '../pool/sticky-router.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
-  'originator',
   'openai-beta',
   'session-id',
   'thread-id',
@@ -185,7 +184,10 @@ export function isRetryableSameCodexAccount(
   if (status === 408) return true
   if (status === 500 || status === 502 || status === 503 || status === 504) {
     return (
-      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+      code === '' ||
+      /server_error|provider_error|upstream_error|overloaded_error|internal_error|server_is_overloaded|transport/i.test(
+        code,
+      )
     )
   }
   return false
@@ -826,7 +828,7 @@ export async function handleCodexProtocol({
                 headers: outboundHeaders,
                 stream: true,
                 session,
-                options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+                options: { ...codexKernelRequestOptions(routing, vm), installation_id: written?.installationId },
               },
             },
             onReasoningFallback: ({ body: retryBody }) => {
@@ -1244,6 +1246,7 @@ export async function handleCodexSearch({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }
@@ -1403,6 +1406,7 @@ export async function handleCodexImages({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }

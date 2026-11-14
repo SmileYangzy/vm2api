@@ -4,6 +4,7 @@
  */
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
+import { hashKey } from '../core/security.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
 import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
@@ -93,10 +94,13 @@ import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.m
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
+  callerCwdDeclaration,
   cragV2KernelActive,
   prepareCragPrintBody,
+  projectCallerSystem,
   readSlotKernelConfig,
   resolveCragPrintPersona,
+  trackCallerSystemBlock,
 } from './crag-print-prompt.mjs'
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
@@ -155,10 +159,10 @@ import {
 } from '../identity/crs-persona-usage.mjs'
 import {
   applyCacheTtlToUsage,
+  enforceCacheTtlOrder,
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
-  fillMissingCacheTtl,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import {
@@ -171,7 +175,7 @@ import {
 import { createRequestBodyContext, shallowCopyBody } from './request-body-context.mjs'
 import { jevInterceptSessionCache } from './jev-intercept.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
-import { dispatchStreamInference } from '../transport/kernel-router.mjs'
+import { dispatchStreamInference, prepareInferenceHop } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
@@ -550,6 +554,8 @@ export function createHandleProtocol(deps) {
     preserveCacheBreakpoints = false,
     cliHop = false,
     cragPrint = false,
+    preparedHop = null,
+    callerCwd = null,
     repaired = false,
     requestContext = null,
     routing = {},
@@ -558,6 +564,7 @@ export function createHandleProtocol(deps) {
     onOutboundHeaders = null,
     redactionPrincipal = '',
     redactionSession = '',
+    tenantId = '',
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -574,9 +581,13 @@ export function createHandleProtocol(deps) {
       preserveCacheBreakpoints,
       cliHop,
       cragPrint,
+      preparedHop,
+      callerCwd,
       repaired,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
+      slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
+      tenantId,
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       redactionPrincipal,
@@ -804,6 +815,7 @@ export function createHandleProtocol(deps) {
       )
     }
 
+    const callerEnvironment = protocol === 'anthropic.messages' ? callerCwdDeclaration(inbound?.system) : null
     const autoCompactWindow = callerAutoCompactWindow(inbound)
     let ctx = {
       path: pathName,
@@ -1088,6 +1100,10 @@ export function createHandleProtocol(deps) {
       rewrite: rewriteEnabled,
       model_map: false,
       preserve_content_shape: officialPassthrough,
+      onSystemBlock:
+        inferenceBackend !== 'api' && !officialPassthrough
+          ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+          : undefined,
     })
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -1111,8 +1127,30 @@ export function createHandleProtocol(deps) {
         logBag.error_message = error.body.error.message
         return json(res, error.status, error.body)
       }
-    } else if (!apiOpenAI) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    } else if (!apiOpenAI) {
+      // Classify against the original budget, before the floor and persona add content.
+      // The health monitor can carry a longer diagnostic marker than an external short probe.
+      if (
+        !officialPassthrough &&
+        !Object.hasOwn(ctx.body, 'thinking') &&
+        !ctx.body.system?.length &&
+        /^claude-haiku-4-5(?:-|$)/i.test(ctx.body.model || '') &&
+        Number.isInteger(inbound.max_tokens) &&
+        inbound.max_tokens > 0 &&
+        inbound.max_tokens <= 64 &&
+        (isShortProbeRequest(inbound) ||
+          (isHealthRealBypass(req.headers) &&
+            !ctx.body.tools?.length &&
+            ctx.body.messages?.length === 1 &&
+            ctx.body.messages[0]?.role === 'user'))
+      ) {
+        ctx.body = { ...ctx.body, thinking: { type: 'disabled' } }
+      }
+      ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    }
     let inboundToolReverse = {}
+    const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
+    const hasCragSystem = cragSystem !== ctx.body.system
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       const standard = toStandardAnthropicBody(ctx.body, {
         official: officialTraffic === true,
@@ -1296,13 +1334,10 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     if (!apiOpenAI) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
-    // #850: every rewritten inbound. A cache marker without a TTL means "not
-    // chosen", for Claude Code and third-party callers alike; resolve it to this
-    // conversation's TTL before rendering, so the template budgets against the
-    // real value and no caller marker reaches Anthropic as implicit 5m. Explicit
-    // TTLs stay. Passthrough keeps the caller body untouched.
+    // Repair TTL order before rendering, retaining valid caller omissions and
+    // mixed TTLs. The session default only governs platform-created markers.
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
-      ctx.body = fillMissingCacheTtl(ctx.body, requestedCacheTtl)
+      ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     }
     const personaIn = ctx.body
     // Capture ownership before rendering supplies gateway markers or projects
@@ -1327,6 +1362,7 @@ export function createHandleProtocol(deps) {
         model: ctx.body?.model,
         cliVersion: OFFICIAL_CLI_VERSION,
       })
+    if (!officialPassthrough && !requestContext) ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     let personaHideTokens =
       requestContext || apiOpenAI
         ? 0
@@ -1461,6 +1497,14 @@ export function createHandleProtocol(deps) {
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
     const managedKey = req.apiKeyRecord || null
+    // Only the authentication layer supplies these identities. Namespace the
+    // sources so a key ID cannot share native sessions with a panel login.
+    let tenantPrincipal = ''
+    if (managedKey?.id != null) tenantPrincipal = `key:${managedKey.id}`
+    else if (req.apiKeyKind === 'master') tenantPrincipal = 'master'
+    else if (req.panelUserId != null) tenantPrincipal = `panel-id:${req.panelUserId}`
+    else if (req.panelUser) tenantPrincipal = `panel-user:${req.panelUser}`
+    const tenantId = tenantPrincipal ? hashKey(`crag-tenant:${tenantPrincipal}`) : ''
     if (managedKey) {
       const gate = apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
@@ -1477,7 +1521,6 @@ export function createHandleProtocol(deps) {
       clientStream && protocol === 'anthropic.messages' ? createAnthropicSseErrorRemapper() : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
-    let activeAttemptCommit = null
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
@@ -1488,9 +1531,6 @@ export function createHandleProtocol(deps) {
               if (res.writableEnded || res.destroyed) return
               if (!res.headersSent) writeSSEHeaders(res)
               res.write(chunk)
-              // A queue ping commits the HTTP response only. The slot commits
-              // while an attempt is active, same as an in-attempt ping.
-              activeAttemptCommit?.()
             },
           })
         : null
@@ -1594,6 +1634,23 @@ export function createHandleProtocol(deps) {
               thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
             }
           }
+          const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
+          // The runner snapshots after this session's queue turn, before VM prebinding.
+          const attemptBound = extra.stickyBound
+          const keptSession = extra.freshSlot ? '' : attemptBound?.sessionId || ''
+          const keptAccount = extra.freshSlot ? '' : attemptBound?.accountId || ''
+          const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
+          const attemptSessionId = resolveOutboundSessionId(executionSession, {
+            ...sessionContext,
+            accountId: selected.accountId,
+            boundSessionId: keptSession,
+            boundAccountId: keptAccount,
+            boundVmId: keptVm,
+            vmId: selected.vmId,
+            epoch: extra.freshSlot
+              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
+              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
+          })
           if (claudeScopePending()) {
             const blocked = await applyProtocolIntercept({
               req,
@@ -1614,23 +1671,6 @@ export function createHandleProtocol(deps) {
             }
           }
           const identity = loadVmIdentity(selected.exec)
-          const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
-          // The runner snapshots after this session's queue turn, before VM prebinding.
-          const attemptBound = extra.stickyBound
-          const keptSession = extra.freshSlot ? '' : attemptBound?.sessionId || ''
-          const keptAccount = extra.freshSlot ? '' : attemptBound?.accountId || ''
-          const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
-          const attemptSessionId = resolveOutboundSessionId(executionSession, {
-            ...sessionContext,
-            accountId: selected.accountId,
-            boundSessionId: keptSession,
-            boundAccountId: keptAccount,
-            boundVmId: keptVm,
-            vmId: selected.vmId,
-            epoch: extra.freshSlot
-              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
-              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
-          })
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
           const modeOverride = slotPersonaModeOverride(selected.vm)
@@ -1659,11 +1699,19 @@ export function createHandleProtocol(deps) {
           )
           let hopBody = body
           if (cliHop) {
+            const transportRouting = getRouting()
+            const preparedHop = await prepareInferenceHop({
+              exec: selected.exec,
+              routing: transportRouting,
+              slotWaitMs: selected.slotWaitMs,
+              slotWaitDeadlineMs: selected.slotWaitDeadlineMs,
+            })
             const cragPrint =
               !requestContext &&
+              preparedHop.ready?.ok === true &&
               cragV2KernelActive({
                 vm: selected.vm,
-                health: selected.workerStatus,
+                health: preparedHop.ready.health,
                 kernelConfig: readSlotKernelConfig(selected.exec?.homeDir),
               })
             if (cragPrint) {
@@ -1671,20 +1719,26 @@ export function createHandleProtocol(deps) {
               // CRAG print bypasses the cli-node envelope builder. Canonicalize
               // once more at this boundary so passthrough traffic cannot carry
               // client/OpenAI fields into the native worker.
-              const cragStandard = toStandardAnthropicBody(personaIn, {
+              const cragInput = hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn
+              const cragStandard = toStandardAnthropicBody(cragInput, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
               })
               if (Object.keys(cragStandard.reverse || {}).length) {
                 inboundToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
               }
-              let source = filterThinkingForAccount(
-                shallowCopyBody(cragStandard.body),
-                selected.accountId,
-                thinkingOwnerStore,
-              ).body
+              // The CRAG kernel fingerprints the public stream it already sent,
+              // including thinking. Rewriting an unrecorded signature into text
+              // makes the tool continuation fail with tool_result history mismatch.
+              let source = shallowCopyBody(cragStandard.body)
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
-              hopBody = prepareCragPrintBody(source, { preset: cragPersona, officialPassthrough })
+              const caps = preparedHop.ready.health?.capabilities
+              hopBody = prepareCragPrintBody(source, {
+                preset: cragPersona,
+                officialPassthrough,
+                capabilities: Array.isArray(caps) ? caps : [],
+                agentSummary: !!summarySession,
+              })
               hopBody = await materializeRemoteImageSources(hopBody)
               if (identity) {
                 hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
@@ -1725,6 +1779,9 @@ export function createHandleProtocol(deps) {
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,
+                  callerCwd: callerEnvironment?.cwd,
+                  preparedHop,
+                  transportRouting,
                   requestContext,
                   repaired,
                 },
@@ -1824,6 +1881,8 @@ export function createHandleProtocol(deps) {
                 sessionId: attemptSessionId,
                 cliHop: true,
                 cragPrint: false,
+                preparedHop,
+                transportRouting,
                 requestContext,
                 repaired,
               },
@@ -1927,15 +1986,18 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              callerCwd: attemptMeta?.callerCwd,
+              preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
-              routing: getRouting(),
+              routing: attemptMeta?.transportRouting ?? getRouting(),
               noGoFallback: !!pinVmId,
               onEnvelope: noteOutboundEnvelope,
               onOutboundHeaders: noteOutboundHeaders,
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              tenantId,
             })
           }
           let state
@@ -1956,12 +2018,8 @@ export function createHandleProtocol(deps) {
                 if (res.writableEnded || res.destroyed) return
                 if (!res.headersSent) writeSSEHeaders(res)
                 res.write(chunk)
-                // A ping is already a downstream byte. Commit so a later upstream
-                // failure cannot switch slots onto this socket.
-                onCommit()
               },
             })
-          if (anthropicKeepalive) activeAttemptCommit = onCommit
           keepalive.arm()
           try {
             return await dispatchStreamInference({
@@ -1970,6 +2028,8 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              callerCwd: attemptMeta?.callerCwd,
+              preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
@@ -1980,8 +2040,10 @@ export function createHandleProtocol(deps) {
               signal,
               deliveryMode: attemptDelivery,
               want1m,
-              routing: getRouting(),
+              routing: attemptMeta?.transportRouting ?? getRouting(),
               slotWaitMs: candidate.slotWaitMs,
+              slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
+              tenantId,
               noGoFallback: !!pinVmId,
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
@@ -2023,10 +2085,8 @@ export function createHandleProtocol(deps) {
               },
             })
           } finally {
-            if (anthropicKeepalive) {
-              activeAttemptCommit = null
-              anthropicKeepalive.endAttempt()
-            } else keepalive.stop()
+            if (anthropicKeepalive) anthropicKeepalive.endAttempt()
+            else keepalive.stop()
           }
         },
       })
@@ -2052,6 +2112,17 @@ export function createHandleProtocol(deps) {
     logBag.account_id = result?.accountId || null
     logBag.final_account_id = result?.accountId || null
     if (result?.threadBetas) logBag.hop_meta = { ...logBag.hop_meta, thread_betas: result.threadBetas }
+    if (result?.nativeHandoff === true) {
+      const provider = result.providerResult
+      logBag.hop_meta = {
+        ...logBag.hop_meta,
+        native_handoff: {
+          message_id: provider?.message_id ?? null,
+          stop_reason: provider?.stop_reason ?? null,
+          usage_complete: provider?.usage_complete === true,
+        },
+      }
+    }
     if (result?.accountId && (result.ok || result.committed))
       recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
     // Zero executions is a real 0, not unknown; the VM is the last one that ran.
@@ -2136,11 +2207,11 @@ export function createHandleProtocol(deps) {
         else if (
           protocol === 'anthropic.messages' &&
           !res.writableEnded &&
-          !streamTracker?.hasStarted() &&
+          (result?.nativeHandoff === true || !streamTracker?.hasStarted()) &&
           !streamTracker?.isFinished()
         ) {
-          // Headers already went out (queue ping or an in-attempt ping), so the
-          // status can no longer be 429/529/503. Close with the Anthropic event.
+          // A strict handoff failure must remain an error even after partial
+          // content. Legacy queue pings still receive the mapped SSE error.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }
