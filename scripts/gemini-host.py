@@ -104,10 +104,36 @@ AUTH_FAILURE = re.compile(
 )
 SYSTEM_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
 EMULATION_FLAG = "VM2API_GEMINI_AMD64_EMULATION"
+X86_GUEST_FLAG = "VM2API_GEMINI_VERIFIED_X86_GUEST"
 
 
 def is_arm_host():
     return sys.platform == "linux" and platform.machine() in ("aarch64", "arm64")
+
+
+def x86_guest_requested():
+    return os.environ.get(X86_GUEST_FLAG) == "1"
+
+
+def readonly_guest_entitlement(directory):
+    if directory is None:
+        return False
+    try:
+        return directory.is_dir() and os.path.ismount(directory) and bool(os.statvfs(directory).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
+def check_x86_guest(uid, payload):
+    if sys.platform != "linux" or platform.machine() != "x86_64" or os.geteuid() != 0:
+        raise RuntimeError("Gemini full-system preflight requires a Linux x86_64 guest")
+    detected = subprocess.run(
+        ["/usr/bin/systemd-detect-virt", "--vm"], env=SYSTEM_ENV, cwd="/",
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+    )
+    if detected.returncode or detected.stdout.strip() not in ("qemu", "kvm"):
+        raise RuntimeError("Gemini full-system preflight requires a QEMU or KVM guest")
+    check_amd64_sandbox(uid, payload, [], probe_timeout=25)
 
 
 def check_amd64_emulation(uid, payload=None):
@@ -121,6 +147,10 @@ def check_amd64_emulation(uid, payload=None):
             problems.append("enable a persistent qemu-x86_64 binfmt handler with the F flag")
     except OSError:
         problems.append("qemu-x86_64 binfmt handler is missing")
+    check_amd64_sandbox(uid, payload, problems, probe_timeout=10)
+
+
+def check_amd64_sandbox(uid, payload, problems, *, probe_timeout):
     loader = "/lib64/ld-linux-x86-64.so.2"
     multiarch = "/usr/lib/x86_64-linux-gnu/libc.so.6"
     has_loader = os.access(loader, os.X_OK) and os.path.isfile(multiarch)
@@ -151,7 +181,7 @@ def check_amd64_emulation(uid, payload=None):
     for executable, expected in probes:
         try:
             result = subprocess.run(sandbox + ["--", *executable], stdin=subprocess.DEVNULL, capture_output=True,
-                                    env=SYSTEM_ENV, cwd="/", timeout=10, text=True)
+                                    env=SYSTEM_ENV, cwd="/", timeout=probe_timeout, text=True)
             if result.returncode:
                 problems.append(f"sandbox {executable[0]}: {result.stderr.strip()[:240] or result.returncode}")
                 break
@@ -3481,7 +3511,7 @@ class Host:
         check_root_owned(source)
         check_root_owned(public_key)
         crag = self.is_crag_encrypted_payload(source)
-        if is_arm_host() and not crag:
+        if (is_arm_host() or x86_guest_requested()) and not crag:
             raise RuntimeError("ARM64 emulation requires a signed CRAGGemini subscription payload")
         members = CRAG_PAYLOAD_FILES if crag else PAYLOAD_FILES
         for name in members:
@@ -3507,9 +3537,10 @@ class Host:
         )
         if not version:
             raise RuntimeError("Unexpected Gemini installer response")
-        if is_arm_host():
+        if is_arm_host() or x86_guest_requested():
             try:
-                check_amd64_emulation(self.uid_base, self.payload if install else source)
+                check = check_amd64_emulation if is_arm_host() else check_x86_guest
+                check(self.uid_base, self.payload if install else source)
             except RuntimeError as error:
                 if self.payload_issue != "gemini_emulation_not_ready":
                     print(f"Gemini ARM64 sandbox: {error}", file=sys.stderr)
@@ -5988,16 +6019,19 @@ class Host:
             return self.redeem_payload(body.get("redemption_code"))
         if operation == "list":
             self.inspect_payload()
+            oauth_issue = self.oauth_runtime_issue()
             return {
                 "payload_state": self.payload_state,
                 "amd64_emulation_ready": (
-                    is_arm_host() and self.payload_state == "installed"
+                    (is_arm_host() or (x86_guest_requested() and oauth_issue is None
+                                       and readonly_guest_entitlement(self.crag_host_dir)))
+                    and self.payload_state == "installed"
                     and self.payload_mode == "crag_subscription" and self.verified_payload is not None
                 ),
                 "payload_mode": self.payload_mode,
                 "payload_issue": self.payload_issue,
                 "release_activated": self.payload_state == "installed",
-                "oauth_runtime_issue": self.oauth_runtime_issue(),
+                "oauth_runtime_issue": oauth_issue,
                 "environments": [self.view(env) for env in self.environments.values()],
             }
         if operation == "create":

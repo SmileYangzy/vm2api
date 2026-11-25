@@ -63,6 +63,39 @@ class EmulationPreflight(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing host amd64 loader.*uid map denied"):
             self.check(loader=False, returncode=1)
 
+    def test_full_guest_checks_sandbox_only_after_confirming_the_vm(self):
+        with (
+            patch.object(host.sys, "platform", "linux"),
+            patch.object(host.platform, "machine", return_value="x86_64"),
+            patch.object(host.os, "geteuid", return_value=0),
+            patch.object(host.subprocess, "run") as detect,
+            patch.object(host, "check_amd64_sandbox") as sandbox,
+        ):
+            for kind in ("none", "docker", "qemu"):
+                detect.return_value = subprocess.CompletedProcess([], int(kind == "none"), kind, "")
+                if kind == "qemu":
+                    host.check_x86_guest(29000, Path("/payload"))
+                    sandbox.assert_called_once_with(29000, Path("/payload"), [], probe_timeout=25)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "QEMU or KVM"):
+                        host.check_x86_guest(29000, Path("/payload"))
+                    sandbox.assert_not_called()
+
+    def test_guest_entitlement_requires_a_present_readonly_mount(self):
+        self.assertFalse(host.readonly_guest_entitlement(None))
+        with (
+            patch.object(Path, "is_dir", return_value=True),
+            patch.object(host.os.path, "ismount", return_value=False) as mount,
+            patch.object(host.os, "statvfs") as statvfs,
+        ):
+            directory = Path("/public")
+            self.assertFalse(host.readonly_guest_entitlement(directory))
+            mount.return_value = True
+            statvfs.return_value.f_flag = 0
+            self.assertFalse(host.readonly_guest_entitlement(directory))
+            statvfs.return_value.f_flag = host.os.ST_RDONLY
+            self.assertTrue(host.readonly_guest_entitlement(directory))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,12 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 3. 在该部署的 `.env` 设置 `VM2API_GEMINI_AMD64_EMULATION=1`，确保控制面收到这个环境变量；在已准备好的源码部署目录执行 `sudo bash deploy/install.sh prepare-gemini --dir /实际安装目录`。安装器先检查宿主隔离，再安装本机服务，并在独立的空授权目录内验证 `agy` 版本和签名启动器的 `license_required` 回应；不使用兑换码。关闭实验时，撤去控制面开关并停止此实验创建的 Gemini 宿主服务；保留授权、数据和原有 Claude 槽。
 4. 在 ARM 控制面，兑换 API 先通过本机 socket 检查宿主是否实际验过签名载荷、沙箱内的 `agy` 和空许可证响应。旧宿主或未就绪时不提交兑换码。只有通过后才在预定长期使用的宿主兑换。面板可访问、空许可证检查、授权后 worker 的健康 socket 和真实 Gemini 推理是四项不同的验收。
 
+### ARM 控制面连接本机的完整 x86 客机（实验）
+
+完整 x86_64 Linux 客机走原生载荷路径，不需要在 ARM 宿主放开 AppArmor 或安装 x86 用户态库。只有在专用 QEMU/KVM 客机的 Gemini unit 显式设置 `VM2API_GEMINI_VERIFIED_X86_GUEST=1` 时，服务才为 ARM 控制面执行额外的兑换前检查：校验发行方签名与文件、用服务 UID 在断网 Bubblewrap 中执行 `agy --version` 和空授权 worker，并核实 OAuth 工具可用、`--crag-host-dir` 指向只读挂载。失去该挂载时 `/list` 不再报告可兑换。这个选项不设置网络或建立授权绑定，也不把普通 x64 安装标记为已通过实验检查。
+
+连接生产前，固定长期使用的客机磁盘、身份和备份；仅导出该部署的 `crag-gemini-subscription/public`，不要向客机提供私有凭据或整个数据目录。面板与客机之间的管理 socket 不应公开。应分别验证服务重启、实际代理、兑换、账号授权和模型请求。成功的空授权检查不会消耗兑换码，也不表示兑换成功。
+
 ## 默认安装与激活
 
 1. 在有 `systemd` 的 Linux amd64 宿主运行一键安装或升级。Ubuntu 24.04 等 apt 宿主会自动补齐缺少的 `nodejs`、`python3` 和 Gemini 网络、沙箱工具；其他发行版请按安装器提示准备依赖。安装器按 [`deploy/payload.json`](../deploy/payload.json) 下载固定的 CRAGGemini 运行产物和公钥，再直接从 Google 下载 `agy 1.5.9`。校验大小、SHA-256 和 Ed25519 签名后，原子安装到 `share/gemini/current`。默认路径无需手工下载、放公钥或创建兑换校验文件。
