@@ -15,6 +15,8 @@ export type VmPerms = {
   test: boolean
   /** GET /api/panel/test-models（后端目前只放行 admin）。 */
   testModels: boolean
+  /** 手动刷新官方额度：管理员及槽位属主。 */
+  usageQuery: boolean
   /** oauth/*、导入凭证、额度刷新、重置券、诊断与恢复服务。租户只查看。 */
   credential: boolean
   /** 槽位出口页。租户不开放代理。 */
@@ -30,6 +32,7 @@ const NONE: VmPerms = {
   power: false,
   test: false,
   testModels: false,
+  usageQuery: false,
   credential: false,
   proxy: false,
   remove: false,
@@ -47,6 +50,7 @@ export function vmPermsFor(
       power: true,
       test: true,
       testModels: true,
+      usageQuery: true,
       credential: true,
       proxy: true,
       remove: true,
@@ -58,6 +62,7 @@ export function vmPermsFor(
       known: true,
       power: true,
       test: true,
+      usageQuery: true,
       credential: false,
       proxy: false,
     }
@@ -73,13 +78,13 @@ export function useVmPerms(): VmPerms {
 }
 
 export type VmDetailTab =
-  'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'seed'
+  'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'desktop' | 'seed'
 
 export function vmDetailTabs(perms: VmPerms): VmDetailTab[] {
   const tabs: VmDetailTab[] = ['overview', 'account']
   if (perms.proxy) tabs.push('proxy')
   if (perms.test) tabs.push('test')
-  if (perms.admin) tabs.push('ops', 'seed')
+  if (perms.admin) tabs.push('ops', 'desktop', 'seed')
   return tabs
 }
 

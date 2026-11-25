@@ -35,6 +35,7 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { ActiveUsageAction } from '@/features/vm/active-usage-action'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
 import { kernelRouteLabel } from '@/features/vm/dataplane-contract'
@@ -51,6 +52,7 @@ import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { OpenaiQuotaPanel } from '@/features/vm/openai-quota-panel'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
+import { ClaudeQuotaObservations } from '@/features/vm/usage-windows'
 import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 import { telemetryEnabled } from './telemetry-policy'
@@ -390,6 +392,8 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
+                <ClaudeQuotaObservations vm={vm} now={now} />
+                <ActiveUsageAction vm={vm} />
                 <ClaudeResetActions
                   vm={vm}
                   now={now}
@@ -411,7 +415,9 @@ export function VmStatusBoard(props: Props) {
           <h3 className='text-sm font-medium'>运行</h3>
           <div className='mt-3 grid grid-cols-2 gap-3'>
             <div>
-              <div className='text-xs text-muted-foreground'>今日</div>
+              <div className='text-xs text-muted-foreground'>
+                今日 · 北京时间
+              </div>
               <div className='mt-0.5 text-lg font-semibold tabular-nums'>
                 {fmtUsd(
                   Number(acc.today_cost ?? vm.today_cost ?? cost.today),

@@ -14,10 +14,25 @@ import {
 import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
+import { resolveKernelDataplane } from '../vm/slot-engine.mjs'
 
-function licenseCheck(opts) {
+function licenseCheck(opts, liveCrag = cragV2KernelActive({ health: opts.exec?.workerStatus })) {
   const root = opts.exec?.projectRoot || (opts.exec?.homeDir ? path.resolve(opts.exec.homeDir, '../../..') : '')
-  return checkCragLicense(root, opts.exec?.vm, opts.routing)
+  // A live CRAG process remains licensed per slot even if the saved selection is stale.
+  const vm = liveCrag ? { ...opts.exec?.vm, dataplane: 'crag', crag_kernel_version: 'v2' } : opts.exec?.vm
+  const licensed = checkCragLicense(root, vm, opts.routing)
+  return licensed.ok ? null : cragLicenseDeniedResult(licensed)
+}
+
+export async function checkRustInferenceAdmission(opts) {
+  const { vm, workerStatus: health } = opts.exec || {}
+  const liveCrag = cragV2KernelActive({ health })
+  if (liveCrag || resolveKernelDataplane(vm, opts.routing) === 'crag') {
+    const rejection = await opts.admitCragInference?.({ vm, routing: opts.routing, health })
+    if (rejection) return rejection
+    return licenseCheck(opts, liveCrag)
+  }
+  return null
 }
 
 export function rustKernelPaths(exec = {}) {
@@ -55,20 +70,104 @@ function remapVia(result) {
   }
 }
 
-export async function callRustKernel(opts = {}) {
-  const licensed = licenseCheck(opts)
-  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
-  return remapVia(await callGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+async function sendRustInference(send, opts) {
+  const { admitCragInference, ...sendOpts } = opts
+  if (!admitCragInference) {
+    const rejection = licenseCheck(opts)
+    if (rejection) return rejection
+  }
+  return remapVia(
+    await send({
+      ...sendOpts,
+      exec: withRustKernelExec(opts.exec),
+      beforeInferencePost: admitCragInference ? () => checkRustInferenceAdmission(opts) : undefined,
+    }),
+  )
 }
 
-export async function streamRustKernel(opts = {}) {
-  const licensed = licenseCheck(opts)
-  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
-  return remapVia(await streamGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+export function callRustKernel(opts = {}) {
+  return sendRustInference(callGoWorker, opts)
+}
+
+export function streamRustKernel(opts = {}) {
+  return sendRustInference(streamGoWorker, opts)
 }
 
 export async function postRustKernelTelemetryEvent(exec, event, options = {}) {
   return remapVia(await callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/events', event, options))
+}
+
+export function supportsCragTelemetryApply(health) {
+  return health?.ok === true && health.crag_telemetry_apply_v1 === true && cragV2KernelActive({ health })
+}
+
+const CRAG_TELEMETRY_ERRORS = {
+  telemetry_policy_not_published: 'CRAG 未读到已发布的槽内设置',
+  telemetry_native_settings_blocked: 'Claude Code 槽内设置或 OS 特征阻止开启遥测',
+  telemetry_restart_required: '槽内设置已发布；需排空并重启 CRAG 内核',
+}
+
+function cleanUpstreamTelemetryField(value, maxLen) {
+  if (typeof value !== 'string') return ''
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxLen)
+}
+
+function formatTelemetryErrorMessage(summary, reason, upstreamMessage) {
+  let detail = ''
+  if (reason && upstreamMessage) {
+    detail = upstreamMessage.includes(reason) ? upstreamMessage : `${reason}: ${upstreamMessage}`
+  } else {
+    detail = reason || upstreamMessage
+  }
+  return detail ? `${summary} (${detail})` : summary
+}
+
+export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
+  const { status, body } = await callWorkerPost(
+    withRustKernelExec(exec),
+    '/internal/v1/telemetry/apply',
+    { enabled },
+    { timeoutMs, requireInternalToken: true },
+  )
+  if (
+    status === 200 &&
+    body?.ok === true &&
+    body.applied === true &&
+    body.enabled === enabled &&
+    body.scope === 'native_claude_launch' &&
+    body.upload_confirmed === false
+  ) {
+    return { ok: true, applied: true, action: 'applied', enabled, scope: body.scope, upload_confirmed: false }
+  }
+  const code = body?.error?.type
+  const reason = cleanUpstreamTelemetryField(body?.error?.reason, 120)
+  const upstreamMessage = cleanUpstreamTelemetryField(body?.error?.message, 300)
+  const upstreamMeta = {
+    ...(reason ? { reason } : {}),
+    ...(upstreamMessage ? { upstream_message: upstreamMessage } : {}),
+  }
+  if (status === 409 && Object.hasOwn(CRAG_TELEMETRY_ERRORS, code)) {
+    return {
+      ok: false,
+      code,
+      error: formatTelemetryErrorMessage(CRAG_TELEMETRY_ERRORS[code], reason, upstreamMessage),
+      ...upstreamMeta,
+    }
+  }
+  if (status === 409 && typeof code === 'string' && /^telemetry_[a-z0-9_]{1,64}$/.test(code)) {
+    return {
+      ok: false,
+      code,
+      error: formatTelemetryErrorMessage('CRAG 拒绝应用遥测策略', reason, upstreamMessage),
+      ...upstreamMeta,
+    }
+  }
+  return {
+    ok: false,
+    code: 'telemetry_observation_unavailable',
+    error: formatTelemetryErrorMessage('CRAG 未确认原生遥测启动策略', reason, upstreamMessage),
+    ...upstreamMeta,
+  }
 }
 
 export function withCragCredential(exec, health) {

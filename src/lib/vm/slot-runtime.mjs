@@ -23,14 +23,18 @@ import {
   containerHasKernelMount,
   containerName,
   inspectContainer,
+  inspectInstalledCragEntry,
   startVmRuntime,
   reloadSlotWorker,
+  resolveSlotRouting,
 } from './vm-runtime.mjs'
 import { inspectWrapCliDir, materializeSlotDataplane, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
 import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
 import { checkCragLicense } from './crag-license.mjs'
+import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
+import { destroySlotDesktop, followSlotDesktop, stopSlotDesktop } from './slot-desktop.mjs'
 
 export { runtimeKind }
 
@@ -52,29 +56,50 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
-  if (isCodexVm(vm)) {
-    if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
-    const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
-    if (!boot?.ok) return boot
-    persistNodeRuntime(vm, projectRoot, boot)
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(
+    vm,
+    projectRoot,
+    { routing, action: 'start', bindSubscription: opts.bindSubscription === true },
+    () => startSlotReadyAdmitted(vm, projectRoot, { ...opts, routing }),
+  )
+}
+
+async function startSlotReadyAdmitted(vm, projectRoot, opts) {
+  const codex = isCodexVm(vm)
+  if (codex && !slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
+  const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
+  if (!boot?.ok) return boot
+  persistNodeRuntime(vm, projectRoot, boot)
+  followSlotDesktop(getVm(projectRoot, vm.id) || vm)
+  if (codex) {
     const kernel = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
     if (!kernel.ok) return kernel
     return { ok: true, engine: 'codex', docker: boot, kernel }
   }
-  const boot = await startSlot(vm, projectRoot, opts)
-  if (!boot?.ok) return boot
-  persistNodeRuntime(vm, projectRoot, boot)
   return attachInferenceRuntime(boot, vm, projectRoot, opts)
 }
 
 export async function stopSlot(vm) {
   if (isCodexVm(vm)) stopCodexKernel(vm.id)
+  if (vm?.desktop?.enabled === true) await quietDesktop(vm, stopSlotDesktop)
   return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
-export async function destroySlot(vm) {
-  return slotHost(vm).destroy(vm)
+export async function destroySlot(vm, opts) {
+  // Any slot that ever had a desktop may still own its browser-profile volume.
+  if (vm?.desktop) await quietDesktop(vm, destroySlotDesktop)
+  return slotHost(vm).destroy(vm, opts)
+}
+
+/** The desktop companion is best-effort: its cleanup never blocks a slot stop / destroy. */
+async function quietDesktop(vm, fn) {
+  try {
+    await fn(vm)
+  } catch (e) {
+    console.warn('[slot-desktop]', vm?.id, e?.message || e)
+  }
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
@@ -83,9 +108,17 @@ export async function reloadSlot(vm, projectRoot, opts = {}) {
 }
 
 export async function reloadSlotReady(vm, projectRoot, opts = {}) {
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'reload' }, () =>
+    reloadSlotReadyAdmitted(vm, projectRoot, { ...opts, routing }),
+  )
+}
+
+async function reloadSlotReadyAdmitted(vm, projectRoot, opts) {
   const boot = await (opts.ops?.reloadSlot || reloadSlot)(vm, projectRoot, opts)
   if (!boot?.ok) return boot
   persistVmRuntime(projectRoot, vm.id, boot.runtime)
+  followSlotDesktop(getVm(projectRoot, vm.id) || vm)
   if (isCodexVm(vm)) {
     // The GPT container holds identity/egress; the actual inference process is
     // in the control plane. Reusing its health would keep the old proxy/client.
@@ -128,7 +161,14 @@ function wrapUsesSlotKernel(wrap) {
 }
 
 export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
-  const routing = opts.routing || {}
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'start' }, () =>
+    ensureSlotInferenceRuntimeAdmitted(vm, projectRoot, { ...opts, routing }),
+  )
+}
+
+async function ensureSlotInferenceRuntimeAdmitted(vm, projectRoot, opts) {
+  const { routing } = opts
   const licensed = checkCragLicense(projectRoot, vm, routing)
   if (!licensed.ok) return licensed
   const eager = routing?.inference?.eager_start !== false
@@ -170,7 +210,9 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
     const dest = wrapCliHomeDir(projectRoot, vm.id)
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
     let wrap = dataplane === 'crag' ? null : inspectWrapCliDir(dest)
-    if (!wrap?.ok) {
+    if (dataplane === 'crag' && (opts.useInstalledCrag === true || vm.kernel_installation?.kernel === 'crag')) {
+      wrap = inspectInstalledCragEntry(projectRoot, vm)
+    } else if (!wrap?.ok) {
       wrap =
         dataplane === 'crag'
           ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing })
@@ -278,7 +320,13 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   if (engine !== 'rust') {
     return { ok: false, code: 'invalid_inference_engine', error: 'inference engine must be rust' }
   }
+  const routing = resolveSlotRouting(projectRoot, ops.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'switch' }, () =>
+    switchSlotInferenceEngineAdmitted(vm, projectRoot, engine, { timeoutMs, ops: { ...ops, routing } }),
+  )
+}
 
+async function switchSlotInferenceEngineAdmitted(vm, projectRoot, engine, { timeoutMs, ops }) {
   const inspect = ops.inspectContainer || inspectContainer
   const hasKernelMount = ops.containerHasKernelMount || containerHasKernelMount
   const start = ops.startVmRuntime || startVmRuntime
@@ -288,10 +336,16 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   let wrap = null
   if (engine === 'rust') {
     const dataplane = resolveKernelDataplane(vm, ops.routing) || 'wrap'
-    wrap =
-      dataplane === 'crag'
-        ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing: ops.routing })
-        : (ops.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+    if (dataplane === 'crag' && vm.kernel_installation?.kernel === 'crag') {
+      const licensed = checkCragLicense(projectRoot, vm, ops.routing)
+      if (!licensed.ok) return licensed
+      wrap = inspectInstalledCragEntry(projectRoot, vm)
+    } else {
+      wrap =
+        dataplane === 'crag'
+          ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing: ops.routing })
+          : (ops.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+    }
     if (!wrap?.ok) {
       return {
         ok: false,

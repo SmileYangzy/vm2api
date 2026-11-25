@@ -6,6 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const MESSAGE = {
   model: 'claude-haiku-4-5',
@@ -105,11 +106,15 @@ function createHandler({ root, routing, run, stream = true }) {
   })
 }
 
-async function invoke(handler, res) {
+async function invoke(handler, res, extraHeaders = {}) {
   const req = {
     method: 'POST',
     url: '/v1/messages',
-    headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.187 (external, cli)' },
+    headers: {
+      authorization: 'Bearer master',
+      'user-agent': 'claude-cli/2.1.187 (external, cli)',
+      ...extraHeaders,
+    },
     apiKeyKind: 'master',
     once() {},
     off() {},
@@ -118,7 +123,7 @@ async function invoke(handler, res) {
   res.finish?.()
 }
 
-async function activeAttemptFailure({ block, delta }) {
+async function activeAttemptFailure({ block, delta, clusterDisconnect = false }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-active-keepalive-'))
   const socketPath = path.join(root, 'kernel.sock')
   const tokenPath = path.join(root, 'internal.token')
@@ -178,6 +183,7 @@ async function activeAttemptFailure({ block, delta }) {
       failFirstAttempt = () => {
         clearTimeout(pingTimer)
         firstAttemptActive = false
+        if (clusterDisconnect) return response.destroy()
         writeEvents(response, [failure])
         response.end()
       }
@@ -195,13 +201,15 @@ async function activeAttemptFailure({ block, delta }) {
     const written = write(chunk)
     if (firstAttemptActive && String(chunk).includes('event: ping')) {
       sawActivePing = true
-      failFirstAttempt()
+      if (!clusterDisconnect) failFirstAttempt()
     }
+    if (firstAttemptActive && clusterDisconnect && String(chunk).includes('already delivered text')) failFirstAttempt()
     return written
   }
   const candidates = [1, 2].map((number) => {
     const vm = {
       id: `active-keepalive-${number}`,
+      ...(clusterDisconnect ? { node_id: 'cluster-node' } : {}),
       runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
     }
     return {
@@ -342,6 +350,24 @@ for (const scenario of [
   })
 }
 
+test('a cluster disconnect after visible SSE output reports delivery uncertainty without replay', async () => {
+  const h = await activeAttemptFailure({
+    block: { type: 'text', text: '' },
+    delta: { type: 'text_delta', text: 'already delivered text' },
+    clusterDisconnect: true,
+  })
+  assert.equal(h.upstreamRequests, 1)
+  assert.equal(h.result.committed, true)
+  assert.equal(h.result.status, 502)
+  assert.deepEqual(h.released, ['account-1'])
+  assert.equal(h.res.statusCode, 200)
+  assert.equal(h.res.writableEnded, true)
+  const output = h.events.filter((event) => event.type !== 'ping')
+  assert.deepEqual(output.slice(0, -1), h.firstEvents)
+  assert.equal(output.at(-1).type, 'error')
+  assert.equal(output.at(-1).error.code, 'cluster_delivery_unconfirmed')
+})
+
 test('a Claude stream pings during the queue and reports a later failure as SSE error', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-keepalive-'))
   const res = createResponse()
@@ -399,6 +425,123 @@ test('a Claude stream that fails before the queue delay keeps the HTTP status', 
     assert.equal(res.statusCode, 529)
     assert.equal(res.body.error.type, 'overloaded_error')
     assert.equal(res.body.error.code, 'pool_overloaded')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('x-kin-queue: off reaches the runner as allowQueue:false; without it the request may queue', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-hint-'))
+  const seen = []
+  const handler = createHandler({
+    root,
+    routing: { compatibility: {}, failover: { stream_keepalive_ms: 1000, queue_keepalive_delay_ms: 5_000 } },
+    run: async (opts) => {
+      seen.push(opts.allowQueue)
+      return overloaded()
+    },
+  })
+  try {
+    const off = createResponse()
+    await invoke(handler, off, { 'x-kin-queue': 'off' })
+    assert.equal(off.statusCode, 529)
+    assert.equal(off.body.error.code, 'pool_overloaded')
+    assert.equal(off.chunks.length, 0)
+    await invoke(handler, createResponse())
+    assert.deepEqual(seen, [false, true])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('zero-execution session_home_slot_busy 529 logs attribution without ingesting quota or billing key requests', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-home-slot-busy-no-bill-'))
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {}, failover: {} }))
+  let ingested = 0
+  let recorded = 0
+  let finished = null
+  const handler = createHandleProtocol({
+    json(res, status, body) {
+      res.statusCode = status
+      res.body = body
+      res.headersSent = true
+      return body
+    },
+    writeSSEHeaders(res) {
+      res.writeHead(200)
+    },
+    readBody: async () => ({ ...MESSAGE, stream: false }),
+    requireAuth(req) {
+      req.apiKeyKind = 'managed'
+      req.apiKeyRecord = { id: 'key_1', group_id: 1, group_type: 'all' }
+      return true
+    },
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: {
+      start: () => ({ request_id: 'home-slot-busy', mode: 'normal', t0: Date.now() }),
+      finish(_ctx, bag) {
+        finished = bag
+      },
+    },
+    stickyRouter: {},
+    accountQuota: {
+      ingestHeaders() {
+        ingested++
+      },
+    },
+    apiKeyStore: {
+      acquire: () => ({ ok: true }),
+      release() {},
+      recordUsage() {
+        recorded++
+      },
+    },
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: {}, failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+    failoverRunner: {
+      run: async () => ({
+        ok: false,
+        status: 529,
+        via: 'pool-failover',
+        terminalState: 'exhausted',
+        retryAfterSec: 1,
+        accountId: 'account-1',
+        vmId: 'vm-01',
+        attemptCount: 0,
+        body: {
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            code: 'pool_overloaded',
+            message: '号池负载过高，稍后再试',
+            details: { reason: 'session_home_slot_busy', attempt_count: 0 },
+          },
+        },
+      }),
+    },
+  })
+  try {
+    const res = createResponse()
+    await invoke(handler, res, { 'x-kin-queue': 'off' })
+    assert.equal(res.statusCode, 529)
+    assert.equal(res.body.error.code, 'pool_overloaded')
+    assert.equal(ingested, 0)
+    assert.equal(recorded, 0)
+    assert.equal(finished.account_id, 'account-1')
+    assert.equal(finished.vm_id, 'vm-01')
+    assert.equal(finished.attempt_count, 0)
+    assert.equal(finished.upstream_status, null)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -469,6 +612,9 @@ test('an incomplete native handoff never becomes a successful output-limit termi
       runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
     },
   }
+  // Live CRAG health is license-checked before the inference POST.
+  seedEncryptedPackage(root)
+  activateFixture(root, exec.vm)
   const res = createResponse()
   const handler = createHandler({
     root,

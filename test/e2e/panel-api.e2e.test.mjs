@@ -270,6 +270,65 @@ test('DNS 64/65 suppression is visible in proxy config and can be toggled', asyn
   }
 })
 
+test('the SVCB/HTTPS override is per proxy, and the pool switch writes through to every row', async () => {
+  const gw = await startGateway()
+  try {
+    const added = await api(gw, 'POST', '/api/panel/proxies/import', {
+      body: { text: '10.9.8.1:1080\n10.9.8.2:1080' },
+    })
+    assert.equal(added.status, 200, added.text)
+    const [first, second] = (added.json.data || added.json).items
+    assert.equal(first.dns_disable_svcb_https, false)
+
+    const listed = async () => {
+      const get = await api(gw, 'GET', '/api/panel/proxies')
+      const rows = (get.json.data || get.json).proxies
+      return new Map(rows.map((p) => [p.id, p.dns_disable_svcb_https]))
+    }
+
+    // The pool switch is a bulk action over the rows, not an inherited value.
+    const all = await api(gw, 'PUT', '/api/panel/proxies/config', {
+      body: { dns_disable_svcb_https: true },
+    })
+    assert.equal(all.status, 200, all.text)
+    const afterBulk = await listed()
+    assert.equal(afterBulk.get(first.id), true)
+    assert.equal(afterBulk.get(second.id), true)
+
+    // One outlet can differ from the pool, and the pool key keeps its value.
+    const one = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, {
+      body: { dns_disable_svcb_https: false },
+    })
+    assert.equal(one.status, 200, one.text)
+    assert.equal((one.json.data || one.json).proxy.dns_disable_svcb_https, false)
+    const afterOne = await listed()
+    assert.equal(afterOne.get(first.id), false)
+    assert.equal(afterOne.get(second.id), true)
+    const cfg = await api(gw, 'GET', '/api/panel/proxies/config')
+    assert.equal((cfg.json.data || cfg.json).dns_disable_svcb_https, true)
+
+    // A rename must not disturb the override.
+    const renamed = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, { body: { label: 'tokyo-1' } })
+    assert.equal(renamed.status, 200, renamed.text)
+    assert.equal((renamed.json.data || renamed.json).proxy.dns_disable_svcb_https, false)
+
+    const bad = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, {
+      body: { dns_disable_svcb_https: 'yes' },
+    })
+    assert.equal(bad.status, 400, bad.text)
+    assert.equal(bad.json.error.code, 'invalid_dns_disable_svcb_https')
+
+    // The local row has no helper of its own to carry the override.
+    const local = await api(gw, 'PUT', '/api/panel/proxies/px-local', {
+      body: { dns_disable_svcb_https: true },
+    })
+    assert.equal(local.status, 400, local.text)
+    assert.equal(local.json.error.code, 'dns_disable_svcb_https_unsupported')
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('generate-auth-url requires bound SOCKS5', async () => {
   const gw = await startGateway()
   try {
@@ -389,11 +448,11 @@ test('pasted setup token survives identity enrichment and persists inference cre
   }
 })
 
-test('panel Claude Code exchange automatically syncs native credentials and supports manual sync', async () => {
+test('panel import syncs credentials while Claude Code OAuth requires a native terminal', async () => {
   const gw = await startGateway({ oauth: false, readyMs: 30000 })
   try {
     const gen = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
-      body: { flavor: 'claude_code' },
+      body: { flavor: 'cai' },
     })
     assert.equal(gen.status, 200, gen.text)
     const generated = gen.json.data || gen.json
@@ -418,7 +477,7 @@ test('panel Claude Code exchange automatically syncs native credentials and supp
     assert.equal(failed.json.error.code, 'client_credential_sync_failed')
     assert.equal(failed.text.includes(claudeDir), false)
     const retryLink = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
-      body: { flavor: 'claude_code' },
+      body: { flavor: 'cai' },
     })
     assert.equal(retryLink.status, 200, retryLink.text)
     const syncFailure = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
@@ -432,9 +491,14 @@ test('panel Claude Code exchange automatically syncs native credentials and supp
     const repaired = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
     assert.equal(repaired.status, 200, repaired.text)
     assert.equal(fs.readlinkSync(official), 'credentials.json')
+    const native = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
+      body: { flavor: 'claude_code' },
+    })
+    assert.equal(native.status, 409, native.text)
+    assert.equal(native.json.error.code, 'native_login_required')
     const ticket = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/shell-ticket', { body: { login: true } })
-    assert.equal(ticket.status, 409, ticket.text)
-    assert.equal(ticket.json.error.code, 'panel_login_required')
+    assert.equal(ticket.status, 200, ticket.text)
+    assert.match(ticket.json.data.cli_bin, /crag-v2\/claude-code-[^/]+\/claude$/)
   } finally {
     await gw.stop()
   }

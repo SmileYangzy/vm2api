@@ -4,6 +4,7 @@ import type { AuthScheme, Vm } from '@/types/panel-vm'
 import { Copy, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import {
   authSchemeLabel,
   defaultAuthScheme,
@@ -19,6 +20,7 @@ import {
   type ImportMethod,
 } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
+import type { LoginCommit } from '@/lib/login-terminal'
 import { proxyNamedLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -32,12 +34,12 @@ import {
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { ClaudeLogin } from '@/features/vm/claude-login'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { vmQueryOptions } from '@/features/vm/queries'
 
-export type CommitResult = {
-  official_cc_bootstrap?: { scheduled?: boolean; reason?: string } | null
+export type CommitResult = LoginCommit & {
   oauth_email?: string
 }
 
@@ -371,6 +373,17 @@ function ClaudeCredentialPanel({
             <Hint>需要 sk-ant-api03- 开头的 Console API Key。</Hint>
           ) : null}
         </div>
+      ) : activeMethod === 'cc' ? (
+        <ClaudeLogin
+          vm={vm}
+          disabled={busy}
+          onLogin={async (result) => {
+            await invalidate()
+            const message = 'Claude Code 授权已保存并同步'
+            toast.success(message)
+            onCommitted?.(result, vmId, message)
+          }}
+        />
       ) : activeMethod === 'session' ? (
         <div className='space-y-2'>
           <Label htmlFor='cred-session-key'>sessionKey / access token</Label>
@@ -409,13 +422,15 @@ function ClaudeCredentialPanel({
         <div className='space-y-2'>
           <div className='flex flex-wrap items-center gap-2'>
             <Button
+              type='button'
               size='sm'
               variant='outline'
-              onClick={() => {
-                void navigator.clipboard
-                  ?.writeText(link.authUrl)
-                  .then(() => toast.success('已复制授权链接'))
-                  .catch(() => toast.error('复制失败，请手动选中链接'))
+              onClick={async () => {
+                if (await copyText(link.authUrl)) {
+                  toast.success('已复制授权链接')
+                } else {
+                  toast.error('复制失败，请手动选中链接')
+                }
               }}
             >
               <Copy className='size-3.5' aria-hidden='true' />

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { setTimeout as delay } from 'node:timers/promises'
 import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
@@ -8,7 +9,9 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { WebSocket } from 'ws'
 import { createSlotShell } from '../../src/lib/vm/slot-shell.mjs'
+import { writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { LOCAL_CRAG_CLAUDE } from '../../src/lib/vm/slot-engine.mjs'
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 for (const runtime of ['kvm', 'docker']) {
   test(`${runtime} panel shell sends its home and working directory to the correct runtime`, async (t) => {
@@ -18,6 +21,11 @@ for (const runtime of ['kvm', 'docker']) {
     const client = path.join(root, 'vms', 'vm-01', 'cli-home', path.posix.relative('/home/kincli', LOCAL_CRAG_CLAUDE))
     fs.mkdirSync(path.dirname(client), { recursive: true })
     fs.writeFileSync(client, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    writeWorkerCredentialFile(path.join(root, 'vms', 'vm-01', 'cli-home'), {
+      access_token: 'fixture-access',
+      refresh_token: 'fixture-refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+    })
     const binDir = path.join(root, 'bin')
     fs.mkdirSync(binDir)
     fs.writeFileSync(
@@ -27,9 +35,17 @@ for (const runtime of ['kvm', 'docker']) {
     )
     const previousPath = process.env.PATH
     process.env.PATH = `${binDir}:${previousPath}`
+    const previousCragRoot = process.env.KIN_CRAG_V2_ROOT
     t.after(() => {
       process.env.PATH = previousPath
+      if (previousCragRoot === undefined) delete process.env.KIN_CRAG_V2_ROOT
+      else process.env.KIN_CRAG_V2_ROOT = previousCragRoot
     })
+    // Opening the terminal resolves the CRAG v2 package, which is a payload
+    // asset and never in the checkout. Seed the fixture tree under this test's
+    // own project root so the manual full sweep does not need a staged payload.
+    delete process.env.KIN_CRAG_V2_ROOT
+    seedEncryptedPackage(root)
     const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
     const sockets = new Set()
     const shellId = 'a'.repeat(64)
@@ -99,16 +115,17 @@ for (const runtime of ['kvm', 'docker']) {
       } else {
         assert.deepEqual(execBody.Cmd.slice(0, 2), ['/bin/sh', '-c'])
         assert.ok(execBody.Env.includes('TERM=xterm-256color'))
-        assert.equal(
-          execBody.Env.some((value) => /^(HOME|CLAUDE_CONFIG_DIR)=/.test(value)),
-          false,
-        )
+        assert.ok(execBody.Env.includes('HOME=/home/kincli'))
+        assert.ok(execBody.Env.includes('CLAUDE_CONFIG_DIR=/home/kincli/.claude'))
       }
-      assert.equal(Object.hasOwn(execBody, 'WorkingDir'), false)
+      if (runtime === 'kvm') assert.equal(Object.hasOwn(execBody, 'WorkingDir'), false)
+      else assert.equal(execBody.WorkingDir, '/home/kincli')
       const closed = once(ws, 'close', { signal: AbortSignal.timeout(5_000) })
       const reaped = once(engine, 'reaped', { signal: AbortSignal.timeout(5_000) })
       ws.close()
       await Promise.all([closed, reaped])
+      // The engine receives the reap request before closeExec processes its response and releases the token.
+      for (let i = 0; i < 100 && shell.liveShellTokens().length; i++) await delay(10)
       assert.deepEqual(shell.liveShellTokens(), [])
     } finally {
       ws?.terminate()

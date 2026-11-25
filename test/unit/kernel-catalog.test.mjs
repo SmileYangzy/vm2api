@@ -1,10 +1,16 @@
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { gzipSync } from 'node:zlib'
-import { describeKernelCatalog, pullKernelRelease } from '../../src/lib/admin/kernel-catalog.mjs'
+import {
+  describeKernelCatalog,
+  listKernelReleases,
+  pullKernelRelease,
+  selectKernelRelease,
+} from '../../src/lib/admin/kernel-catalog.mjs'
 import { CRAG_V2_RELEASE_ASSET } from '../../src/lib/admin/release-kernel.mjs'
 import {
   cragV2Arch,
@@ -52,23 +58,26 @@ function elf(revision = '') {
   data.write(revision, 96)
   return data
 }
-function transport(files, { tag = 'v1.2.3', size, redirect } = {}) {
+function transport(files, { tag = 'v1.2.3', size, redirect, digest } = {}) {
   const seen = []
   const entries = Object.entries(files)
   const fetchImpl = async (url, options) => {
     seen.push(String(url))
     assert.equal(options.redirect, 'manual')
-    if (String(url).includes('/releases/latest') || String(url).includes('/releases/tags/'))
-      return new Response(
-        JSON.stringify({
-          tag_name: tag,
-          assets: entries.map(([name, body], index) => ({
-            name,
-            size: size ?? body.length,
-            url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
-          })),
-        }),
+    const endpoint = new URL(url).pathname
+    if (!endpoint.includes('/assets/')) {
+      const assets = entries.map(([name, body], index) => ({
+        name,
+        size: size ?? body.length,
+        ...(digest && { digest }),
+        url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
+      }))
+      return Response.json(
+        endpoint.endsWith('/releases')
+          ? [{ tag_name: `payload-2026.11.15-crag-${tag.slice(1)}`, draft: false, assets }]
+          : { tag_name: tag, assets },
       )
+    }
     const index = Number(String(url).split('/').at(-1)) - 1
     assert.ok(entries[index], `unexpected asset request ${url}`)
     if (redirect) return new Response(null, { status: 302, headers: { location: redirect } })
@@ -127,6 +136,20 @@ function snapshot(root) {
   }
   visit(root)
   return rows
+}
+
+function issuerPin(packageRoot) {
+  return {
+    path: `share/crag/kernels/v2/${cragV2Arch()}/crag-license-public.pem`,
+    sha256: createHash('sha256')
+      .update(fs.readFileSync(path.join(packageRoot, 'crag-license-public.pem')))
+      .digest('hex'),
+  }
+}
+
+function writeIssuerPins(root, files) {
+  fs.mkdirSync(path.join(root, 'deploy'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'deploy/payload.json'), JSON.stringify({ crag_release: 'v1.2.3', files }))
 }
 
 test('catalog exposes exactly two products with honest versions and no paths or license initialization', (t) => {
@@ -248,6 +271,180 @@ test('native pull atomically selects an immutable sibling without touching the r
   assert.equal(describeKernelCatalog(root)[1].ready, true)
 })
 
+test('native pull can restore a missing factory only with the shipped issuer pin', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const supplier = seedEncryptedPackage(fixture(t))
+  const attacker = seedEncryptedPackage(fixture(t))
+  const note = '官方发行解包说明\n'
+  const manifestPath = path.join(supplier, 'manifest.json')
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  manifest.sha256['unpack-note.md'] = createHash('sha256').update(note).digest('hex')
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+  fs.writeFileSync(path.join(supplier, 'unpack-note.md'), note)
+  const pull = (pkg) =>
+    pullKernelRelease(root, { kernel: 'crag' }, transport({ [CRAG_V2_RELEASE_ASSET]: archive(pkg) }))
+  assert.equal((await pull(supplier)).code, 'crag_v2_authority_missing')
+  const issuer = 'crag-license-public.pem'
+  const sha256 = createHash('sha256')
+    .update(fs.readFileSync(path.join(supplier, issuer)))
+    .digest('hex')
+  fs.mkdirSync(path.join(root, 'deploy'))
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({
+      crag_release: 'v1.2.3',
+      files: [{ path: `share/crag/kernels/v2/amd64/${issuer}`, sha256 }],
+    }),
+  )
+  assert.equal((await pull(attacker)).code, 'crag_v2_authority_mismatch')
+  assert.equal(cragV2PackageRoot(root), '')
+  const result = await pull(supplier)
+  assert.equal(result.ok, true, result.error)
+  assert.equal(describeKernelCatalog(root)[1].version, '1.2.3')
+  const selected = cragV2PackageRoot(root)
+  assert.equal(fs.readFileSync(path.join(selected, 'unpack-note.md'), 'utf8'), note)
+  assert.equal((await pull(attacker)).code, 'crag_v2_authority_mismatch')
+  fs.appendFileSync(path.join(supplier, 'unpack-note.md'), 'tampered')
+  assert.equal((await pull(supplier)).code, 'crag_v2_hash_mismatch')
+  assert.equal(cragV2PackageRoot(root), selected)
+})
+
+for (const [label, pins, expectedCode] of [
+  ['duplicate issuer paths', (pin) => [pin, pin], 'crag_v2_authority_missing'],
+  [
+    'a different architecture only',
+    (pin) => [{ ...pin, path: pin.path.replace('/amd64/', '/arm64/') }],
+    'crag_v2_authority_missing',
+  ],
+  ['a malformed digest', (pin) => [{ ...pin, sha256: 'not-a-sha256' }], 'crag_v2_authority_missing'],
+  ['an incorrect digest', (pin) => [{ ...pin, sha256: '0'.repeat(64) }], 'crag_v2_authority_mismatch'],
+]) {
+  test(`native first pull rejects ${label} without publishing a package`, {
+    skip: cragV2Arch() !== 'amd64',
+  }, async (t) => {
+    const root = fixture(t)
+    const supplier = seedEncryptedPackage(fixture(t))
+    writeIssuerPins(root, pins(issuerPin(supplier)))
+    const before = snapshot(path.join(root, 'deploy'))
+    const http = transport({ [CRAG_V2_RELEASE_ASSET]: archive(supplier) })
+    const result = await pullKernelRelease(root, { kernel: 'crag' }, http)
+    assert.equal(result.ok, false)
+    assert.equal(result.code, expectedCode)
+    assert.equal(cragV2PackageRoot(root), '')
+    assert.equal(fs.existsSync(path.join(root, 'share/crag/kernels/v2/current-amd64.json')), false)
+    assert.deepEqual(snapshot(path.join(root, 'deploy')), before)
+    if (expectedCode === 'crag_v2_authority_missing') {
+      assert.equal(
+        http.seen.some((url) => url.includes('/assets/')),
+        false,
+      )
+    }
+  })
+}
+
+test('native pull keeps a valid factory issuer authoritative over a conflicting shipped pin', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root, { revision: 'new' })
+  const trustedBytes = archive(factory)
+  seedEncryptedPackage(root, { revision: 'factory' })
+  const attacker = seedEncryptedPackage(fixture(t))
+  writeIssuerPins(root, [issuerPin(attacker)])
+  const before = snapshot(factory)
+
+  const rejected = await pullKernelRelease(
+    root,
+    { kernel: 'crag' },
+    transport({ [CRAG_V2_RELEASE_ASSET]: archive(attacker) }),
+  )
+  assert.equal(rejected.code, 'crag_v2_authority_mismatch')
+  assert.equal(cragV2PackageRoot(root), factory)
+  assert.deepEqual(snapshot(factory), before)
+
+  const accepted = await pullKernelRelease(
+    root,
+    { kernel: 'crag' },
+    transport({ [CRAG_V2_RELEASE_ASSET]: trustedBytes }),
+  )
+  assert.equal(accepted.ok, true, accepted.error)
+  assert.notEqual(cragV2PackageRoot(root), factory)
+  assert.equal(describeKernelCatalog(root)[1].ready, true)
+  assert.deepEqual(snapshot(factory), before)
+})
+
+test('native pull restores a damaged factory using its shipped issuer pin without rewriting the factory', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root)
+  const bytes = archive(factory)
+  writeIssuerPins(root, [issuerPin(factory)])
+  fs.appendFileSync(path.join(factory, 'crag-v2.payload.enc'), 'damaged')
+  const before = snapshot(factory)
+  assert.equal(describeKernelCatalog(root)[1].ready, false)
+
+  const result = await pullKernelRelease(root, { kernel: 'crag' }, transport({ [CRAG_V2_RELEASE_ASSET]: bytes }))
+  assert.equal(result.ok, true, result.error)
+  assert.notEqual(cragV2PackageRoot(root), factory)
+  assert.equal(describeKernelCatalog(root)[1].ready, true)
+  assert.deepEqual(snapshot(factory), before)
+})
+
+test('a future CRAG download cannot switch the standard payload key under the same issuer', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root)
+  const manifest = JSON.parse(fs.readFileSync(path.join(factory, 'manifest.json'), 'utf8'))
+  const bytes = archive(factory)
+  fs.mkdirSync(path.join(root, 'deploy'))
+  const identity = {
+    family: manifest.family,
+    product: manifest.authorization.product,
+    issuer_public_key_id: manifest.authorization.public_key_id,
+    payload_key_id: manifest.payload.key_id,
+  }
+  fs.writeFileSync(path.join(root, 'deploy/payload.json'), JSON.stringify({ crag_authorization: identity }))
+  const pull = (archiveBytes, digest = `sha256:${createHash('sha256').update(archiveBytes).digest('hex')}`) =>
+    pullKernelRelease(root, { kernel: 'crag' }, transport({ [CRAG_V2_RELEASE_ASSET]: archiveBytes }, { digest }))
+  assert.equal((await pull(bytes, null)).code, 'crag_v2_digest_missing')
+  assert.equal((await pull(bytes, `sha256:${'0'.repeat(64)}`)).code, 'crag_v2_digest_mismatch')
+  assert.equal((await pull(bytes)).ok, true)
+  const selected = cragV2PackageRoot(root)
+  const other = seedEncryptedPackage(root, { payloadKey: Buffer.alloc(32, 1) })
+  assert.equal((await pull(archive(other))).code, 'crag_v2_identity_mismatch')
+  assert.equal(cragV2PackageRoot(root), selected)
+})
+
+test('native pull reports a body timeout without replacing its package', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root)
+  const http = transport({ [CRAG_V2_RELEASE_ASSET]: archive(factory) })
+  const result = await pullKernelRelease(
+    root,
+    { kernel: 'crag' },
+    {
+      fetchImpl: async (url, options) => {
+        if (!url.includes('/assets/')) return http.fetchImpl(url, options)
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new DOMException('timed out', 'TimeoutError'))
+            },
+          }),
+        )
+      },
+    },
+  )
+  assert.equal(result.code, 'kernel_pull_timeout')
+  assert.equal(cragV2PackageRoot(root), factory)
+})
+
 for (const [label, tag, standalone, expected] of [
   ['standalone latest', '', true, 'v2.0.2'],
   ['standalone explicit version', 'v2.0.1', true, 'v2.0.1'],
@@ -276,19 +473,19 @@ for (const [label, tag, standalone, expected] of [
         const version = versions[Number(endpoint.split('/').at(-1)) - 1]
         return new Response(releases.get(version).bytes)
       }
-      const version = endpoint.endsWith('/latest') ? 'v2.0.2' : endpoint.split('/').at(-1)
-      const release = releases.get(version)
-      return new Response(
-        JSON.stringify({
-          tag_name: version,
+      assert.equal(endpoint, '/repos/dofastted/vm2api/releases')
+      return Response.json(
+        versions.map((version, index) => ({
+          tag_name: `payload-2026.11.15-crag-${version.slice(1)}`,
+          draft: false,
           assets: [
             {
               name: CRAG_V2_RELEASE_ASSET,
-              size: release.bytes.length,
-              url: `https://api.github.com/repos/dofastted/claude-code/releases/assets/${versions.indexOf(version) + 1}`,
+              size: releases.get(version).bytes.length,
+              url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
             },
           ],
-        }),
+        })),
       )
     }
     const pull = (projectRoot, options) => pullKernelRelease(projectRoot, options, { fetchImpl })
@@ -391,7 +588,7 @@ test('missing native release is explicit and never fetches the legacy ELF', asyn
   const root = fixture(t)
   const factory = seedEncryptedPackage(root)
   const http = transport({ 'kin-kernel-crag': elf() })
-  const result = await pullKernelRelease(root, { kernel: 'crag' }, http)
+  const result = await pullKernelRelease(root, { kernel: 'crag', tag: 'v1.2.3' }, http)
   assert.equal(result.code, 'crag_v2_asset_missing')
   assert.equal(http.seen.length, 1)
   assert.equal(cragV2PackageRoot(root), factory)
@@ -451,7 +648,7 @@ test('publication failure preserves the pointer and prior package byte-for-byte'
   assert.equal(fs.readdirSync(path.join(root, 'share/wrap-cli-releases/packages')).length, 1)
 })
 
-test('cache retains only current and previous immutable snapshots', async (t) => {
+test('re-pulling the same release keeps only its newest immutable snapshot', async (t) => {
   const root = fixture(t)
   const selected = []
   for (const revision of ['one', 'two', 'three']) {
@@ -464,7 +661,7 @@ test('cache retains only current and previous immutable snapshots', async (t) =>
     selected.push(wrapCliTemplateDir(root))
   }
   assert.equal(fs.existsSync(selected[0]), false)
-  assert.equal(fs.existsSync(selected[1]), true)
+  assert.equal(fs.existsSync(selected[1]), false)
   assert.equal(fs.existsSync(selected[2]), true)
 })
 
@@ -504,7 +701,7 @@ test('archive download honors declared bounds before reading a body', { skip: cr
     { kernel: 'crag' },
     {
       fetchImpl: async (url, options) => {
-        if (String(url).includes('/releases/latest')) return http.fetchImpl(url, options)
+        if (new URL(url).pathname.endsWith('/releases')) return http.fetchImpl(url, options)
         return {
           status: 200,
           ok: true,
@@ -684,5 +881,118 @@ test('incomplete selected CLI cache cannot silently reuse the factory kernel', a
     assert.equal(fs.existsSync(path.join(root, 'vms/vm-no-fallback')), false)
   } finally {
     delete process.env.KIN_KERNEL_BIN
+  }
+})
+
+test('CRAG cache keeps several releases and switches between them without downloading', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root, { revision: 'new' })
+  const bytes = archive(factory)
+  seedEncryptedPackage(root, { revision: 'factory' })
+  const pull = async (tag) => {
+    const result = await pullKernelRelease(
+      root,
+      { kernel: 'crag' },
+      transport({ [CRAG_V2_RELEASE_ASSET]: bytes }, { tag }),
+    )
+    assert.equal(result.ok, true, result.error)
+    return cragV2PackageRoot(root)
+  }
+  const first = await pull('v1.2.3')
+  const second = await pull('v1.2.4')
+  const third = await pull('v1.2.5')
+  assert.notEqual(first, second)
+  for (const dir of [first, second, third]) assert.equal(fs.existsSync(dir), true)
+  assert.deepEqual(
+    listKernelReleases(root, 'crag').releases.map((row) => [row.tag, row.current]),
+    [
+      ['v1.2.5', true],
+      ['v1.2.4', false],
+      ['v1.2.3', false],
+    ],
+  )
+  const selected = selectKernelRelease(root, {
+    kernel: 'crag',
+    tag: 'v1.2.3',
+  })
+  assert.equal(selected.ok, true, selected.error)
+  assert.equal(cragV2PackageRoot(root), first)
+  assert.equal(describeKernelCatalog(root)[1].release_tag, 'v1.2.3')
+  assert.equal(selectKernelRelease(root, { kernel: 'crag', tag: 'v9.9.9' }).code, 'kernel_release_not_cached')
+  // Re-pulling a cached release replaces only that release's package.
+  const again = await pull('v1.2.4')
+  assert.notEqual(again, second)
+  assert.equal(fs.existsSync(second), false)
+  assert.equal(fs.existsSync(first), true)
+  assert.equal(listKernelReleases(root, 'crag').releases.length, 3)
+})
+
+test('ARM64 control plane with x86_64 slot runtime pulls, indexes and stages amd64 CRAG packages', async (t) => {
+  const supplier = seedEncryptedPackage(fixture(t), { arch: 'amd64', revision: 'arm64-host-amd64-slot' })
+  const bytes = archive(supplier)
+  const issuerSha = createHash('sha256')
+    .update(fs.readFileSync(path.join(supplier, 'crag-license-public.pem')))
+    .digest('hex')
+
+  // Case 1: Official ARM64 container layout (DOCKER_DEFAULT_PLATFORM=linux/amd64), even with an empty fleet.
+  {
+    const root = fixture(t)
+    writeIssuerPins(root, [{ path: 'share/crag/kernels/v2/amd64/crag-license-public.pem', sha256: issuerSha }])
+    const arm64DockerSlotEnv = { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' }
+    const pulled = await pullKernelRelease(
+      root,
+      { kernel: 'crag' },
+      { ...transport({ [CRAG_V2_RELEASE_ASSET]: bytes }), ...arm64DockerSlotEnv },
+    )
+    assert.equal(pulled.ok, true, pulled.error)
+    assert.equal(fs.existsSync(path.join(root, 'share/crag/kernels/v2/current-amd64.json')), true)
+    assert.equal(describeKernelCatalog(root, arm64DockerSlotEnv)[1].ready, true)
+    assert.equal(listKernelReleases(root, 'crag', arm64DockerSlotEnv).releases.length, 1)
+
+    const materialized = materializeCragV2(
+      root,
+      { id: 'vm-01', dataplane: 'wrap' },
+      { select: false, ...arm64DockerSlotEnv },
+    )
+    assert.equal(materialized.ok, true, materialized.error)
+    assert.equal(fs.existsSync(path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')), true)
+  }
+
+  // Case 2: ARM64 host without DOCKER_DEFAULT_PLATFORM, but existing Docker slot has an x86-64 staged cc-node ELF.
+  {
+    const root = fixture(t)
+    writeIssuerPins(root, [{ path: 'share/crag/kernels/v2/amd64/crag-license-public.pem', sha256: issuerSha }])
+    fs.mkdirSync(path.join(root, 'vms/vm-01/cli-home/.kin'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms/vm-01.json'), JSON.stringify({ id: 'vm-01', dataplane: 'wrap' }))
+    fs.writeFileSync(path.join(root, 'vms/vm-01/cli-home/.kin/cc-node'), elf('slot-x64'), { mode: 0o755 })
+    const bareArm64Env = { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' }
+    const pulled = await pullKernelRelease(
+      root,
+      { kernel: 'crag' },
+      { ...transport({ [CRAG_V2_RELEASE_ASSET]: bytes }), ...bareArm64Env },
+    )
+    assert.equal(pulled.ok, true, pulled.error)
+    assert.equal(describeKernelCatalog(root, bareArm64Env)[1].ready, true)
+    const staged = materializeCragV2(root, { id: 'vm-01', dataplane: 'wrap' }, { select: false, ...bareArm64Env })
+    assert.equal(staged.ok, true, staged.error)
+  }
+
+  // Case 3: Legitimate mismatch protection remains when slots are arm64 / non-amd64.
+  for (const runtimeEnv of [
+    { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' },
+    { arch: 'x64', platform: 'linux', dockerDefaultPlatform: 'linux/arm64' },
+  ]) {
+    const root = fixture(t)
+    writeIssuerPins(root, [{ path: 'share/crag/kernels/v2/amd64/crag-license-public.pem', sha256: issuerSha }])
+    const http = transport({ [CRAG_V2_RELEASE_ASSET]: bytes })
+    const rejected = await pullKernelRelease(root, { kernel: 'crag' }, { ...http, ...runtimeEnv })
+    assert.equal(rejected.ok, false)
+    assert.equal(rejected.code, 'crag_v2_arch_mismatch')
+    assert.equal(
+      http.seen.some((url) => url.includes('/assets/')),
+      false,
+    )
   }
 })

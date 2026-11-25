@@ -1,10 +1,11 @@
-import { repairAutoModeReminders } from './auto-mode-reminder.mjs'
+import { mayRepairAutoModeReminder, repairAutoModeReminders } from './auto-mode-reminder.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
 /**
  * Sanitize Anthropic Messages body for official API.
  *
- * Credential-forwarding (sub2api-style): drop client-private / OpenAI leftover
+ * Credential forwarding: drop client-private and leftover OpenAI
  * keys, pass through unknown official fields such as output_config.
  */
 const DROP_TOP = new Set([
@@ -117,6 +118,21 @@ export function applyStructuredOutput(out, source = {}) {
 
 /** OpenAI / client leftovers Anthropic TextBlock rejects as Extra inputs. */
 const DROP_CONTENT_KEYS = new Set(['annotations'])
+const SMALL_TEXT_TURN_CHARS = 4096
+
+export function isSmallTextTurn(body) {
+  if (body?.messages?.length !== 1 || body.tools?.length) return false
+  const message = body.messages[0]
+  if (message?.role !== 'user') return false
+  const content = message.content
+  const text =
+    typeof content === 'string'
+      ? content
+      : Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
+        ? content[0].text
+        : null
+  return typeof text === 'string' && text.length <= SMALL_TEXT_TURN_CHARS
+}
 
 /** Drop content-block fields the public Messages schema rejects (annotations, …). */
 export function stripIllegalContentFields(content) {
@@ -162,8 +178,22 @@ export function promoteContentToBlocks(content) {
 export function promoteSystemToBlocks(system) {
   if (system == null || system === '') return system
   if (typeof system === 'string') return [{ type: 'text', text: system }]
-  if (!Array.isArray(system)) return system
+  if (!Array.isArray(system)) return [canonicalSystemBlock(system, 'system')]
   return system.map((block) => (typeof block === 'string' ? { type: 'text', text: block } : block))
+}
+
+function canonicalSystemBlock(block, param) {
+  if (typeof block === 'string') return { type: 'text', text: block }
+  if ((block?.type === 'text' || block?.type === undefined) && typeof block?.text === 'string') {
+    return block.type === 'text' ? block : { ...block, type: 'text' }
+  }
+  const code = 'invalid_system_block'
+  const message = `${param}: must be a text block with a string text field`
+  throw Object.assign(new Error(message), {
+    status: 400,
+    code,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, param, message } },
+  })
 }
 
 /**
@@ -193,35 +223,141 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
-export function sanitizeAnthropicBody(body, { preserveContentShape = false, onSystemBlock } = {}) {
+export function reusableContentBlock(block) {
+  if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
+  for (const key of DROP_CONTENT_KEYS) {
+    if (Object.hasOwn(block, key)) return false
+  }
+  return (
+    block.type !== 'text' ||
+    (typeof block.text === 'string' && !!block.text.trim() && !mayRepairAutoModeReminder(block.text))
+  )
+}
+
+function reusableContent(content) {
+  for (const block of content) {
+    if (!reusableContentBlock(block)) return false
+    if (block.type === 'tool_result' && Array.isArray(block.content) && !reusableContent(block.content)) return false
+  }
+  return true
+}
+
+function hasEmptyEffortKey(config) {
+  return (
+    config != null &&
+    typeof config === 'object' &&
+    !Array.isArray(config) &&
+    Object.prototype.hasOwnProperty.call(config, 'effort') &&
+    isEmptyEffortValue(config.effort)
+  )
+}
+
+function withoutEmptyEffort(config) {
+  if (!hasEmptyEffortKey(config)) return { value: config, changed: false }
+  const next = { ...config }
+  delete next.effort
+  return { value: Object.keys(next).length ? next : undefined, changed: true }
+}
+
+/**
+ * Treat empty / null / whitespace-only effort as omitted across top-level
+ * output_config, CRAG effort aliases, and per-message output_config so every
+ * downstream hop fills the model default instead of forwarding an empty value.
+ */
+export function stripEmptyEffort(body) {
+  if (!body || typeof body !== 'object') return body
+  let out = body
+  const ensureCopy = () => {
+    if (out === body) out = { ...body }
+    return out
+  }
+  const topConfig = withoutEmptyEffort(body.output_config)
+  if (topConfig.changed) {
+    const target = ensureCopy()
+    if (topConfig.value === undefined) delete target.output_config
+    else target.output_config = topConfig.value
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'effort') && isEmptyEffortValue(body.effort)) {
+    delete ensureCopy().effort
+  }
+  const cragOptions = withoutEmptyEffort(body.crag_options)
+  if (cragOptions.changed) {
+    const target = ensureCopy()
+    if (cragOptions.value === undefined) delete target.crag_options
+    else target.crag_options = cragOptions.value
+  }
+  if (Array.isArray(body.messages)) {
+    let messagesChanged = false
+    const messages = body.messages.map((message) => {
+      if (!message || typeof message !== 'object') return message
+      const msgConfig = withoutEmptyEffort(message.output_config)
+      if (!msgConfig.changed) return message
+      messagesChanged = true
+      const next = { ...message }
+      if (msgConfig.value === undefined) delete next.output_config
+      else next.output_config = msgConfig.value
+      return next
+    })
+    if (messagesChanged) ensureCopy().messages = messages
+  }
+  return out
+}
+
+export function canReuseCanonicalHistory(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false
+  let previousRole = 'assistant'
+  for (const message of messages) {
+    const role = message?.role
+    if ((role !== 'user' && role !== 'assistant') || role === previousRole) return false
+    if (hasEmptyEffortKey(message.output_config)) return false
+    if (!Array.isArray(message.content) || !message.content.length || !reusableContent(message.content)) return false
+    previousRole = role
+  }
+  return true
+}
+
+export function sanitizeAnthropicBody(
+  body,
+  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {},
+) {
   if (!body || typeof body !== 'object') return body
 
-  const out = copyOfficialAnthropicFields(body)
+  let out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
+  out = stripEmptyEffort(out)
 
-  if (!preserveContentShape && Array.isArray(out.system)) {
-    out.system = out.system
-      .map((b, index) => {
-        let block = b && typeof b === 'object' ? b : null
-        if (typeof b === 'string') block = { type: 'text', text: b }
-        else if (typeof b?.text === 'string') {
-          block = { type: 'text', text: b.text }
-          if (b.cache_control) block.cache_control = b.cache_control
-        }
-        onSystemBlock?.(block, index)
-        return block
-      })
-      .filter(Boolean)
+  if (!preserveContentShape && out.system != null && typeof out.system !== 'string') {
+    const list = Array.isArray(out.system)
+    out.system = (list ? out.system : [out.system]).map((value, index) => {
+      const source = canonicalSystemBlock(value, list ? `system[${index}]` : 'system')
+      const block = { type: 'text', text: source.text }
+      if (source.cache_control) block.cache_control = source.cache_control
+      onSystemBlock?.(block, index)
+      return block
+    })
   }
 
-  normalizeAnthropicMessages(out)
-  stripIllegalBodyContentFields(out)
+  const reuseHistory =
+    !preserveContentShape &&
+    (typeof reuseCanonicalHistory === 'function'
+      ? reuseCanonicalHistory(out.messages)
+      : reuseCanonicalHistory && canReuseCanonicalHistory(out.messages))
+  if (reuseHistory) {
+    if (Array.isArray(out.system)) out.system = stripIllegalContentFields(out.system)
+  } else {
+    if (reuseCanonicalHistory && Array.isArray(out.messages)) {
+      out.messages = out.messages.map((message) => (message && typeof message === 'object' ? { ...message } : message))
+    }
+    normalizeAnthropicMessages(out, { preserveConsecutiveUser })
+    stripIllegalBodyContentFields(out)
+  }
 
   if (Array.isArray(out.tools) && out.tools.length === 0) delete out.tools
   // Do not overwrite caller max_tokens (thinking budget). Only fill if missing.
   if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
   normalizeStop(out)
-  const normalized = canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  const normalized = reuseHistory ? out : canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  if (reuseHistory && out.system != null) out.system = promoteSystemToBlocks(out.system)
   // A nonempty source string becomes the first block; lifted history only appends.
   if (!preserveContentShape && onSystemBlock && typeof body.system === 'string') {
     onSystemBlock(normalized.system?.[0], 0)
@@ -230,7 +366,7 @@ export function sanitizeAnthropicBody(body, { preserveContentShape = false, onSy
 }
 
 /**
- * Sub2API-style Messages repair before the Anthropic hop:
+ * Messages repair before the Anthropic hop:
  *   - leading system / developer turns (before the first user) lift into top-level system
  *   - mid-conversation role:system after a user turn is kept when the model/beta allow it
  *   - unknown roles (admin, tool, function, …) become user
@@ -248,7 +384,10 @@ export function sanitizeAnthropicBody(body, { preserveContentShape = false, onSy
  *     control which the per-message effort beta allows as the first entry
  *   - a system turn that cannot be kept still contributes its effort the same way
  */
-export function normalizeAnthropicMessages(body, { keepMidConversationSystem = true } = {}) {
+export function normalizeAnthropicMessages(
+  body,
+  { keepMidConversationSystem = true, preserveConsecutiveUser = false } = {},
+) {
   if (!body || !Array.isArray(body.messages)) return body
   repairAutoModeReminders(body)
 
@@ -293,7 +432,7 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
     mapped.push(keptAnthropicMessage(message, nextRole))
   }
 
-  const merged = mergeConsecutiveAnthropicMessages(mapped)
+  const merged = mergeConsecutiveAnthropicMessages(mapped, { preserveConsecutiveUser })
   if (merged.length && merged[0].role !== 'user' && !isEmptyEffortControl(merged[0])) {
     merged.unshift({ role: 'user', content: '.' })
   }
@@ -458,11 +597,17 @@ export function anthropicContentIsEmpty(content) {
   })
 }
 
-export function mergeConsecutiveAnthropicMessages(messages) {
+export function mergeConsecutiveAnthropicMessages(messages, { preserveConsecutiveUser = false } = {}) {
   const out = []
   for (const message of messages) {
     const last = out[out.length - 1]
-    if (!last || last.role !== message.role || messageHasTurnControls(last) || messageHasTurnControls(message)) {
+    if (
+      !last ||
+      last.role !== message.role ||
+      (preserveConsecutiveUser && message.role === 'user') ||
+      messageHasTurnControls(last) ||
+      messageHasTurnControls(message)
+    ) {
       out.push({ ...message })
       continue
     }

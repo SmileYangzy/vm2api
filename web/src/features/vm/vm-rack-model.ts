@@ -2,6 +2,7 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { usedPctOf } from '@/lib/format'
 import { windowProbed } from '@/lib/pool-quota'
+import { isCodexVm } from '@/lib/vm-kind'
 import { fleetGroup, type FleetGroup } from '@/lib/vm-status'
 import { vmCostLedger, type VmLedgerRow } from '@/lib/vm-usage'
 import { fableRow } from '@/features/vm/usage-meter'
@@ -11,7 +12,15 @@ import { fableRow } from '@/features/vm/usage-meter'
  * `bad`、`revoke` 与其余「不可调度」合成一区：都要人工处理后再调度开，
  * 分开只会让运维多扫一段。
  */
-export type VmZone = 'pool' | 'restricted' | 'off' | 'none' | 'dead'
+export type VmZone =
+  | 'pool'
+  | 'host_verified'
+  | 'pending'
+  | 'host_failed'
+  | 'restricted'
+  | 'off'
+  | 'none'
+  | 'dead'
 export type VmZoneFilter = VmZone | 'all'
 
 export type ZoneDef = {
@@ -23,6 +32,30 @@ export type ZoneDef = {
   color: string
 }
 
+export const GEMINI_EVIDENCE_ZONES = [
+  {
+    key: 'host_verified',
+    label: '宿主推理成功',
+    hint: '最近一次宿主推理成功，不代表公共 API 端到端验证',
+    tone: 'ok',
+    color: 'var(--status-ok-solid)',
+  },
+  {
+    key: 'pending',
+    label: '待验证',
+    hint: '授权中，或候选条件已满足但未观察到宿主推理成功',
+    tone: 'none',
+    color: 'var(--status-none)',
+  },
+  {
+    key: 'host_failed',
+    label: '宿主推理失败',
+    hint: '最近一次宿主推理失败，不代表已配置凭证失效',
+    tone: 'warn',
+    color: 'var(--status-warn-solid)',
+  },
+] as const satisfies readonly ZoneDef[]
+
 export const ZONES: readonly ZoneDef[] = [
   {
     key: 'pool',
@@ -31,6 +64,7 @@ export const ZONES: readonly ZoneDef[] = [
     tone: 'ok',
     color: 'var(--status-ok-solid)',
   },
+  ...GEMINI_EVIDENCE_ZONES,
   {
     key: 'restricted',
     label: '受限',
@@ -71,21 +105,28 @@ export function zoneOf(vm: Vm): VmZone {
   return zoneOfGroup(fleetGroup(vm))
 }
 
-export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
-  const c: Record<VmZone, number> = {
+export function emptyZoneCounts(): Record<VmZone, number> {
+  return {
     pool: 0,
     restricted: 0,
     off: 0,
     none: 0,
     dead: 0,
+    host_verified: 0,
+    pending: 0,
+    host_failed: 0,
   }
+}
+
+export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
+  const c = emptyZoneCounts()
   for (const vm of vms) c[zoneOf(vm)] += 1
   return c
 }
 
 // ---------- 单台额度窗口 ----------
 
-export type WindowKey = '5h' | '7d' | 'fable'
+export type WindowKey = '5h' | '7d' | 'fable' | (string & {})
 
 /** 只描述额度占用；费用与 token 走 `vmCostLedger`，两处不重复。 */
 export type WindowReadout = {
@@ -95,10 +136,65 @@ export type WindowReadout = {
   pct: number | null
   note: string | null
   reset: unknown
+  windowMinutes?: number | null
 }
 
-/** 5H → 7D → Fable；无读数的 Fable 窗口展示探测状态。 */
+function clampCodexPercent(value: unknown): number | null {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  return Math.max(0, Math.min(100, n))
+}
+
+function hasCustomCodexWindows(vm: Vm): boolean {
+  const rows = vm.codex_usage?.windows
+  return Boolean(
+    isCodexVm(vm) &&
+    Array.isArray(rows) &&
+    rows.length > 0 &&
+    rows.some((w) => w?.id && w.id !== '5h' && w.id !== '7d')
+  )
+}
+
+/** 5H → 7D → Fable；Codex 若含非 5h/7d 实际周期（如 24h）则按实际窗口展示；Gemini API Key 无订阅窗口。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
+  if (vm.gemini) {
+    if (vm.gemini.auth_method === 'api_key') return []
+    const probed = (w: '5h' | '7d') =>
+      vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null
+    return [
+      {
+        key: '5h',
+        label: '5H',
+        pct: probed('5h'),
+        note: null,
+        reset: vm.reset_5h,
+      },
+      {
+        key: '7d',
+        label: '7D',
+        pct: probed('7d'),
+        note: null,
+        reset: vm.reset_7d,
+      },
+    ]
+  }
+  if (hasCustomCodexWindows(vm)) {
+    return (vm.codex_usage?.windows || []).map((w) => {
+      const id = String(w.id || w.label || 'window')
+      const pct = vm.has_token ? clampCodexPercent(w.used_percent) : null
+      return {
+        key: id,
+        label: String(w.label || id).toUpperCase(),
+        pct,
+        note: null,
+        reset:
+          w.reset_at ??
+          (id === '5h' ? vm.reset_5h : id === '7d' ? vm.reset_7d : null),
+        windowMinutes: w.window_minutes ?? null,
+      }
+    })
+  }
   const probed = (w: '5h' | '7d') =>
     vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null
   const windows: WindowReadout[] = [
@@ -132,7 +228,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
 
 /**
  * 刀片主体画什么：读数表，或一句说明加一步动作。
- * `unprobed` = 有凭证但 5h / 7d 都没有实测值——画 0% 会冒充「还很空」。
+ * `unprobed` = 有凭证但没有任何窗口实测值——画 0% 会冒充「还很空」。
  */
 export type BladeState = 'live' | 'dead' | 'vacant' | 'unprobed'
 
@@ -140,7 +236,19 @@ export function bladeState(vm: Vm): BladeState {
   const zone = zoneOf(vm)
   if (zone === 'dead') return 'dead'
   if (zone === 'none' || !vm.has_token) return 'vacant'
-  if (!windowProbed(vm, '5h') && !windowProbed(vm, '7d')) return 'unprobed'
+  if (vm.gemini) {
+    if (vm.gemini.auth_method === 'api_key') return 'live'
+    return windowProbed(vm, '5h') || windowProbed(vm, '7d')
+      ? 'live'
+      : 'unprobed'
+  }
+  const anyCodex = Boolean(
+    vm.codex_usage?.windows?.some(
+      (w) => clampCodexPercent(w.used_percent) != null
+    )
+  )
+  if (!windowProbed(vm, '5h') && !windowProbed(vm, '7d') && !anyCodex)
+    return 'unprobed'
   return 'live'
 }
 
@@ -214,11 +322,15 @@ export function rackTotals(
       bad: 0,
       revoke: 0,
       unschedulable: 0,
+      host_verified: 0,
+      pending: 0,
+      host_failed: 0,
     },
     seatsUsed: 0,
     seatsMax: 0,
     ledger: [],
   }
+  const seenAccounts = new Set<string>()
   for (const vm of vms) {
     t.groups[fleetGroup(vm)] += 1
     if (vm.seats_max != null) {
@@ -226,13 +338,22 @@ export function rackTotals(
       t.seatsMax += Number(vm.seats_max) || 0
     }
     const rows = vmCostLedger(vm, accounts)
+    const accountKey = isCodexVm(vm)
+      ? `openai:${vm.org_uuid || vm.id}`
+      : vm.account_uuid || vm.id
+    const countTotal = !vm.lifetime_usage || !seenAccounts.has(accountKey)
+    if (vm.lifetime_usage) seenAccounts.add(accountKey)
+    const mixed = rows.map(({ note: _note, ...r }) =>
+      r.key === 'total' ? { ...r, label: '总费用' } : r
+    )
     t.ledger = t.ledger.length
       ? t.ledger.map((r, i) => ({
           ...r,
-          cost: r.cost + rows[i].cost,
-          tokens: r.tokens + rows[i].tokens,
+          cost: r.cost + (r.key === 'total' && !countTotal ? 0 : mixed[i].cost),
+          tokens:
+            r.tokens + (r.key === 'total' && !countTotal ? 0 : mixed[i].tokens),
         }))
-      : rows
+      : mixed
   }
   return t
 }

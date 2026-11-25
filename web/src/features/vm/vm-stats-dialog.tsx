@@ -56,9 +56,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
-import { vmQueryOptions } from '@/features/vm/queries'
+import { vmStatsDetailQueryOptions } from '@/features/vm/queries'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
-import { VmQuotaActions } from '@/features/vm/usage-windows'
+import {
+  ClaudeQuotaObservations,
+  VmQuotaActions,
+} from '@/features/vm/usage-windows'
 import { vmWindows } from '@/features/vm/vm-rack-model'
 import {
   projectionView,
@@ -608,7 +611,7 @@ function QuotaWindows({
         w.key === 'fable'
           ? Number(vm.window_fable_cost) || 0
           : (period?.total_cost ??
-            (w.key === '5h' ? fallback.h5 : fallback.d7)),
+            (w.key === '5h' ? fallback.h5 : w.key === '7d' ? fallback.d7 : 0)),
       requests: period ? period.requests : null,
       tokens: period ? periodTokens(period) : null,
     }
@@ -658,10 +661,15 @@ function QuotaWindows({
         title='当前窗口'
         meta='官方价'
       >
-        {current.map((cell) => (
-          <WindowLine key={cell.key} cell={cell} />
-        ))}
+        {current.length ? (
+          current.map((cell) => <WindowLine key={cell.key} cell={cell} />)
+        ) : (
+          <p className='text-xs text-muted-foreground'>
+            API Key 按量计费 · 无订阅窗口
+          </p>
+        )}
         <div className='mt-auto'>
+          <ClaudeQuotaObservations vm={vm} now={now} />
           <VmQuotaActions vm={vm} now={now} />
         </div>
       </WindowCard>
@@ -711,7 +719,7 @@ function QuotaWindows({
 }
 
 function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
-  const detail = useQuery(vmQueryOptions(vm.id))
+  const detail = useQuery(vmStatsDetailQueryOptions(vm.id, Boolean(vm.gemini)))
   const billing = detail.data?.billing
   const usage = billing?.usage_stats ?? null
   const view = summarizeUsageStats(usage)
@@ -737,7 +745,13 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         <div className='flex shrink-0 items-center gap-1.5'>
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           <span className='text-xs text-muted-foreground'>
-            {vmRunning(vm) ? '运行' : '停止'}
+            {vm.gemini
+              ? vm.gemini.runtime_ready
+                ? '已预热'
+                : '宿主机'
+              : vmRunning(vm)
+                ? '运行'
+                : '停止'}
           </span>
         </div>
       </div>
@@ -757,6 +771,10 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             ))}
           </div>
           <Skeleton className='h-64 rounded-xl' />
+        </div>
+      ) : detail.isError && !view ? (
+        <div className='grid h-40 place-items-center rounded-xl border text-sm text-destructive'>
+          VM 统计加载失败
         </div>
       ) : !view ? (
         <div className='grid h-40 place-items-center rounded-xl border text-sm text-muted-foreground'>
@@ -778,9 +796,11 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
               label={`${view.summary.days} 天请求`}
               value={fmtNum(view.summary.requests)}
               hint={
-                view.summary.errors > 0
-                  ? `含 ${fmtNum(view.summary.errors)} 次失败`
-                  : '全部成功'
+                view.summary.requests === 0
+                  ? '窗口内无请求'
+                  : view.summary.errors > 0
+                    ? `含 ${fmtNum(view.summary.errors)} 次失败`
+                    : '全部成功'
               }
             />
             <MetricCard
@@ -835,7 +855,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <InfoCard
               tone='bg-lime-500/15 text-lime-600 dark:text-lime-400'
               icon={<ClipboardList />}
-              title='7D 请求'
+              title='7 天额度窗口请求'
               rows={[
                 {
                   label: '成功',
@@ -875,7 +895,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   )
 }
 
-/** 查看统计：近 30 天用量的可视化面板，版式参照 sub2api 的 AccountStatsModal。 */
+/** 查看近 30 天用量的可视化面板。 */
 export function VmStatsDialog({
   vm,
   accounts,

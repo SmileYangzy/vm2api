@@ -14,9 +14,10 @@ const serverSrc = [
   fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/server.mjs'), 'utf8'),
 ].join('\n')
 
-test('user sees vm / keys / billing / logs / statistics', () => {
-  assert.deepEqual(viewsForRole('user'), ['vm', 'keys', 'billing', 'logs', 'statistics'])
-  assert.deepEqual(viewsForRole('super'), ['overview', 'cluster', 'logs', 'statistics', 'vm'])
+test('signed-in buyers of every panel role can open CRAG subscriptions', () => {
+  for (const role of ['user', 'super', 'admin']) assert.equal(canViewPage(role, 'crag-subscription'), true)
+  assert.deepEqual(viewsForRole('user'), ['vm', 'keys', 'billing', 'logs', 'statistics', 'crag-subscription'])
+  assert.deepEqual(viewsForRole('super'), ['overview', 'cluster', 'logs', 'statistics', 'vm', 'crag-subscription'])
   assert.equal(canViewPage('admin', 'statistics'), true)
   assert.equal(canViewPage('user', 'vm'), true)
   assert.equal(canViewPage('user', 'overview'), false)
@@ -50,6 +51,9 @@ test('user can view owned vms and manage keys, not proxies or reauth', () => {
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/credentials/sync', 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/credentials/sync', 'super').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/credentials/sync', 'admin').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/shell-ticket', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/shell-ticket', 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/shell-ticket', 'admin').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/refresh', 'user').ok, false)
   assert.equal(authorizePanelRoute('PUT', '/api/panel/vms/vm-01/oauth/credential', 'user').ok, false)
   assert.equal(authorizePanelRoute('GET', '/api/panel/api-keys', 'user').ok, true)
@@ -71,6 +75,7 @@ test('user can view owned vms and manage keys, not proxies or reauth', () => {
 
 test('user can query quota and redeem reset credits on owned vms and keys', () => {
   const allowed = [
+    '/api/panel/vms/vm-01/usage/query',
     '/api/panel/vms/vm-01/openai-quota/refresh',
     '/api/panel/vms/vm-01/openai-quota/reset',
     '/api/panel/vms/vm-01/claude-reset/query',
@@ -246,4 +251,12 @@ test('ACL schedule POSTs have matching server handlers', () => {
   assert.match(serverSrc, /clearVmCooldown/)
   assert.match(serverSrc, /cooldown\\\/clear/)
   assert.match(serverSrc, /\/schedulable\$/)
+})
+
+test('resetting another account 2FA is admin-only', () => {
+  // Self-service /api/panel/2fa runs before this gate (every role manages its
+  // own); clearing someone else's second factor is user administration.
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'admin').ok, true)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'super').ok, false)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'user').ok, false)
 })

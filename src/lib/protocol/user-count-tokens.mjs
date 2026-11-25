@@ -3,9 +3,10 @@
  * Peek only — never bind/unbind sticky or bill tokens_in.
  */
 import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, ErrorCode } from '../core/errors.mjs'
-import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
+import { refusalAuditIdentity, refusalGuardPolicy, riskPrincipal } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
@@ -22,7 +23,7 @@ import {
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
-import { getUsageCache } from '../oauth/usage-cache.mjs'
+import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs-usage-probe.mjs'
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
@@ -32,11 +33,25 @@ import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-ow
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { validateImageDimensions } from './images.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
+
+/** routing.compatibility.count_tokens — whether the count_tokens entries are served.
+ *
+ * Both entries (public `/v1/messages/count_tokens` and the panel's per-VM probe) were
+ * stubbed to 404 by 94b6f728 with the implementations left in place. Default off keeps
+ * that: these are a public API surface and a panel route, so turning them on is the
+ * operator's decision, not something a routing file gains by omission.
+ */
+export function countTokensEnabled(routing) {
+  return routing?.compatibility?.count_tokens === true
+}
+
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -207,6 +222,15 @@ function deviceRepo(deps) {
   }
 }
 
+function sessionRepo(deps) {
+  if (deps.refusalSessions) return deps.refusalSessions
+  try {
+    return new RefusalSessionBlocksRepo()
+  } catch {
+    return null
+  }
+}
+
 /** Distill, hard regex, refusal cache, and jev. `wait` means the slot is required before a verdict. */
 export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
   let jev
@@ -220,31 +244,35 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     inbound,
     body: inbound,
     headers: req?.headers,
+    identity: refusalAuditIdentity({
+      inbound: deps.rawInbound || inbound,
+      headers: req?.headers,
+      principal: riskPrincipal(req),
+    }),
     ...distillContext(req, inbound),
     distillRules: deps.cfg?.distill,
     policy: refusalPolicy(deps),
     jev,
     repo: refusalRepo(deps),
     devices: deviceRepo(deps),
+    sessions: sessionRepo(deps),
     account: deps.account || null,
   })
-  let wait = false
-  if (decision?.action !== 'block' && decision?.intercept) {
-    try {
-      wait = JSON.parse(decision.intercept).by === 'scope-wait'
-    } catch {
-      wait = false
-    }
-  }
-  return { error: decision?.action === 'block' ? decision.error : null, wait }
+  return { error: decision?.action === 'block' ? decision.error : null, wait: decision.wait === true }
 }
 
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
+  const routing =
+    typeof deps.getRoutingConfig === 'function'
+      ? deps.getRoutingConfig()
+      : typeof deps.getRouting === 'function'
+        ? deps.getRouting()
+        : null
   let inbound
   try {
-    inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
+    inbound = await deps.readBody(req, inboundBodyLimit(routing, deps.cfg.limits.max_body_bytes))
   } catch (error) {
     if (error?.body?.error) return json(res, error.status || 400, error.body)
     return json(
@@ -262,7 +290,6 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
   const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
   if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
-  const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&
     detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
@@ -271,7 +298,21 @@ export async function handleUserCountTokens(req, res, deps) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const gate = await blockCountTokensBeforeHop(req, parsed.body, deps)
+  const blockedClient =
+    detectInboundPlatform(parsed.body.model).platform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  if (blockedClient) {
+    const err = blockedClientError(blockedClient)
+    return json(res, err.status, err.body)
+  }
+  if (detectInboundPlatform(parsed.body.model).platform === 'anthropic') {
+    try {
+      validateImageDimensions(parsed.body)
+    } catch (error) {
+      if (!error.body?.error) throw error
+      return json(res, error.status, error.body)
+    }
+  }
+  const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
   if (gate?.error) return json(res, gate.error.status, gate.error.body)
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
@@ -285,6 +326,7 @@ export async function handleUserCountTokens(req, res, deps) {
   if (gate.wait) {
     const again = await blockCountTokensBeforeHop(req, parsed.body, {
       ...deps,
+      rawInbound: inbound,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
     if (again?.error) return json(res, again.error.status, again.error.body)
@@ -354,13 +396,22 @@ export async function resolveUsageWindows({
   const cache = usageCache || getUsageCache()
   let result
   try {
-    result = await cache.load(accountId, () => probe({ exec, vm, includeFable: false }))
+    result = await cache.load(accountId, async () => {
+      const startedAt = Date.now()
+      const resetGenerations = accountQuota?.resetGenerations?.(accountId) || null
+      const probed = await probe({ exec, vm, includeFable: false })
+      return attachUsageFetchMeta(probed, { startedAt, resetGenerations })
+    })
   } catch {
     return { listed, source }
   }
   if (!result || isOfficialUsageRateLimited(result)) return { listed, source }
   try {
-    accountQuota?.ingestOAuthUsage?.(accountId, result)
+    const fetchMeta = getUsageFetchMeta(result)
+    accountQuota?.ingestOAuthUsage?.(accountId, result, {
+      ...(fetchMeta?.startedAt != null ? { startedAt: fetchMeta.startedAt } : {}),
+      ...(fetchMeta?.resetGenerations ? { resetGenerations: fetchMeta.resetGenerations } : {}),
+    })
   } catch {}
   const next = accountQuota?.repo?.get?.(accountId) || acc
   listed = listQuotaFromHeaders(next?.unified || {})

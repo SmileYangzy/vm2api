@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import vmContext from 'node:vm'
 import test from 'node:test'
-import { clusterCragContainerReady, clusterDockerCommandReady } from '../../src/lib/cluster/remote-slot.mjs'
+import {
+  clusterCragContainerReady,
+  clusterDockerCommandReady,
+  slotContainerBody,
+} from '../../src/lib/cluster/remote-slot.mjs'
+import { hasClusterSubscriptionBinds } from '../../src/lib/cluster/crag-subscription-files.mjs'
 import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete } from '../../src/lib/vm/kvm-machine.mjs'
@@ -15,6 +20,14 @@ const source = fs.readFileSync(new URL('../../src/lib/cluster/remote-slot.mjs', 
 const start = source.slice(
   source.indexOf('export async function startRemoteSlot('),
   source.indexOf('/** Remote twin of reloadSlotWorker'),
+)
+const reload = source.slice(
+  source.indexOf('export async function reloadRemoteSlot('),
+  source.indexOf('/** Update a node slot'),
+)
+const restartPolicy = source.slice(
+  source.indexOf('function remoteSlotRestartPolicy('),
+  source.indexOf('/** Reconcile an existing node slot'),
 )
 
 test('remote CRAG KVM preparation resolves guest and egress images instead of rejecting placement', async () => {
@@ -82,6 +95,9 @@ function fixture({
   kind = 'docker',
   removeFails = false,
   cragReady = false,
+  subscription = false,
+  computerRequired = false,
+  computerBinds = true,
   cpuWrapped = false,
 } = {}) {
   const calls = []
@@ -93,12 +109,13 @@ function fixture({
   }
   const kvmEnv = kind === 'kvm' ? ['KIN_KVM_MAC=52:54:00:11:22:33', 'KIN_KVM_DISK_SERIAL=KINfixture01'] : undefined
   const base = {
+    Id: 'fixture-cid',
     Config: {
       Image: mismatch ? 'old-image' : 'image',
       Labels: { 'kin.vm.layout': '2' },
       ...(kvmEnv ? { Env: kvmEnv } : {}),
     },
-    HostConfig: { NetworkMode: 'network' },
+    HostConfig: { NetworkMode: 'network', RestartPolicy: { Name: 'unless-stopped' } },
     State: { Running: running, Restarting: restarting },
   }
   let info = missing
@@ -109,9 +126,17 @@ function fixture({
         ? cragReadyContainer(base)
         : kernelContainer(base, cpuWrapped)
   const io = {
+    resolveSlotRouting: (_root, routing) => routing || {},
+    withCragRuntimeAdmission: (_vm, _root, _options, run) => run(),
+    dockerJson: async (_docker, request) => {
+      assert.equal(request.method, 'POST')
+      assert.equal(request.path, '/containers/fixture-cid/update')
+      assert.equal(request.body.RestartPolicy.Name, 'no')
+      calls.push('disable-autorestart')
+    },
     prepare: async () => ({
       nodeId: target.node_id,
-      session: { docker: {}, client: {} },
+      session: { docker: {}, client: {}, host: { uid: 1000 } },
       image: 'image',
       user: 'fixture',
       remoteDir: '/fixture',
@@ -163,10 +188,68 @@ function fixture({
     clusterDockerClaude: (vm) => kind === 'docker' && Boolean(vm?.node_id),
     resolveKernelDataplane: (vm) => vm?.dataplane || 'kernel',
     projectCragUniversalVm: async () => {},
+    readCragClusterSubscription: () => subscription,
+    hasClusterSubscriptionBinds,
+    publishClusterSubscription: async () => calls.push('publish-subscription'),
+    clusterComputerPolicy: () => ({ computer: computerRequired, required: computerRequired }),
+    hasClusterComputerBinds: () => computerBinds,
+    pushClusterComputer: async () => computerRequired,
   }
-  const boot = vmContext.runInNewContext(`${start.replace('export ', '')}; startRemoteSlot`, io)
-  return { calls, target, boot: () => boot(target, '/fixture'), state: () => info?.State }
+  const fns = vmContext.runInNewContext(
+    `${restartPolicy}; ${start.replace('export ', '')}; ${reload.replace('export ', '')}; ({ startRemoteSlot, reloadRemoteSlot })`,
+    io,
+  )
+  return {
+    calls,
+    target,
+    boot: () => fns.startRemoteSlot(target, '/fixture'),
+    reload: () => fns.reloadRemoteSlot(target, '/fixture'),
+    state: () => info?.State,
+  }
 }
+
+test('a telemetry-on cluster Docker slot without computer binds is recreated on start and reload; telemetry-off is left alone', async () => {
+  const legacyStart = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
+  legacyStart.target.dataplane = 'crag'
+  assert.equal((await legacyStart.boot()).action, 'created')
+  assert.deepEqual(legacyStart.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+
+  const legacyReload = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
+  legacyReload.target.dataplane = 'crag'
+  assert.equal((await legacyReload.reload()).action, 'created')
+  assert.deepEqual(legacyReload.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+
+  const telemetryOff = fixture({ cragReady: true, computerBinds: false })
+  telemetryOff.target.dataplane = 'crag'
+  assert.equal((await telemetryOff.boot()).action, 'already-running')
+  assert.deepEqual(telemetryOff.calls, ['disable-autorestart', 'runtime'])
+})
+
+test('a subscribed cluster Docker slot replaces the old container before starting with read-only license mounts', async () => {
+  const f = fixture({ cragReady: true, subscription: true })
+  f.target.dataplane = 'crag'
+  f.target.crag_kernel_version = 'v2'
+  assert.equal((await f.boot()).action, 'created')
+  assert.deepEqual(f.calls, ['remove', 'files', 'publish-subscription', 'create', 'start', 'runtime'])
+  const body = slotContainerBody(f.target, {
+    image: 'fixture',
+    network: 'fixture',
+    remoteDir: '/fixture',
+    user: '1000:1000',
+    routing: {},
+    subscription: true,
+  })
+  assert.equal(hasClusterSubscriptionBinds(body, '/fixture'), true)
+  assert.ok(body.HostConfig.Binds.includes('/fixture/subscription-host:/run/kin/crag-host:ro'))
+  assert.ok(body.HostConfig.Binds.includes('/fixture/subscription-license:/run/kin/crag-license:ro'))
+})
+
+test('an already running CRAG slot is not bounced to disable legacy Docker autorestart', async () => {
+  const f = fixture({ cragReady: true })
+  f.target.dataplane = 'crag'
+  assert.equal((await f.boot()).action, 'already-running')
+  assert.deepEqual(f.calls, ['disable-autorestart', 'runtime'])
+})
 
 for (const kind of ['docker', 'kvm']) {
   for (const running of [true, false]) {

@@ -1,29 +1,44 @@
 export const DEFAULT_URL = 'https://api.anthropic.com'
 export const DIRECT = '__direct__'
-export type ApiProtocol = 'anthropic' | 'openai'
+export type ApiProtocol = 'anthropic' | 'openai' | 'gemini'
 export const API_DEFAULTS = {
   anthropic: { baseUrl: DEFAULT_URL, authScheme: 'x_api_key' },
   openai: {
     baseUrl: 'https://api.openai.com',
     authScheme: 'authorization_bearer',
   },
+  gemini: {
+    baseUrl: 'https://generativelanguage.googleapis.com',
+    authScheme: 'x_goog_api_key',
+  },
 } as const
 
-export type AuthScheme = 'x_api_key' | 'authorization_bearer'
+export type AuthScheme = 'x_api_key' | 'authorization_bearer' | 'x_goog_api_key'
+
+/** 地址如何处理调用方正文：`persona` 套用配置的人设，`caller` 原样转发。 */
+export type BodyPolicy = 'persona' | 'caller'
+
+export function asBodyPolicy(value: unknown): BodyPolicy {
+  return value === 'caller' ? 'caller' : 'persona'
+}
 
 /** 载入时的服务端值；保存已存地址只发和它不同的字段。 */
 export type StoredSnapshot = {
   protocol?: ApiProtocol
   riskReviewEnabled?: boolean
+  bodyPolicy?: BodyPolicy
   baseUrl: string
   authScheme: AuthScheme
   proxyId: string
+  headers?: Record<string, string>
 }
 
 export type EndpointDraft = {
   protocol?: ApiProtocol
   riskReviewEnabled?: boolean
+  bodyPolicy?: BodyPolicy
   fetchedModels?: string[]
+  savedModels?: string[]
   id: string
   storedId?: string
   keyId?: string
@@ -38,23 +53,40 @@ type StoredItem = {
   id: string
   protocol?: ApiProtocol
   risk_review_enabled?: boolean
+  body_policy?: string
   base_url?: string
   auth_scheme?: string
-  api_key_entries?: { id?: string; proxy_id?: string }[]
+  headers?: Record<string, string>
+  api_key_entries?: { id?: string; proxy_id?: string; disabled?: boolean }[]
   models?: { id?: string; name?: string; alias?: string }[]
 }
 export function draftFromStored(item: StoredItem): EndpointDraft {
-  const key = item.api_key_entries?.[0]
+  const key =
+    item.api_key_entries?.find((entry) => !entry.disabled) ||
+    item.api_key_entries?.[0]
+  const protocol: ApiProtocol =
+    item.protocol === 'openai' || item.protocol === 'gemini'
+      ? item.protocol
+      : 'anthropic'
+  const authScheme: AuthScheme =
+    protocol === 'openai'
+      ? 'authorization_bearer'
+      : protocol === 'gemini'
+        ? item.auth_scheme === 'authorization_bearer' ||
+          item.auth_scheme === 'x_api_key'
+          ? item.auth_scheme
+          : 'x_goog_api_key'
+        : item.auth_scheme === 'authorization_bearer'
+          ? 'authorization_bearer'
+          : 'x_api_key'
   const stored: StoredSnapshot = {
-    protocol: item.protocol || 'anthropic',
+    protocol,
     riskReviewEnabled: item.risk_review_enabled === true,
-    baseUrl:
-      item.base_url || API_DEFAULTS[item.protocol || 'anthropic'].baseUrl,
-    authScheme:
-      item.protocol === 'openai' || item.auth_scheme === 'authorization_bearer'
-        ? 'authorization_bearer'
-        : 'x_api_key',
+    bodyPolicy: asBodyPolicy(item.body_policy),
+    baseUrl: item.base_url || API_DEFAULTS[protocol].baseUrl,
+    authScheme,
     proxyId: key?.proxy_id || DIRECT,
+    headers: item.headers,
   }
   const existingModels = (item.models || [])
     .map((m) => (m.alias || m.name || m.id || '').trim())
@@ -64,7 +96,7 @@ export function draftFromStored(item: StoredItem): EndpointDraft {
     storedId: item.id,
     keyId: key?.id || '',
     apiKey: '',
-    fetchedModels: existingModels.length ? existingModels : undefined,
+    savedModels: existingModels,
     ...stored,
     stored,
   }
@@ -74,7 +106,46 @@ function kindOf(baseUrl: string, protocol: ApiProtocol) {
   if (protocol === 'anthropic' && baseUrl === DEFAULT_URL) return 'claude'
   if (protocol === 'openai' && baseUrl === API_DEFAULTS.openai.baseUrl)
     return 'openai'
+  if (protocol === 'gemini' && baseUrl === API_DEFAULTS.gemini.baseUrl)
+    return 'gemini'
   return 'custom'
+}
+
+export function endpointModelRequest(item: EndpointDraft) {
+  const protocol = item.protocol || 'anthropic'
+  const baseUrl = item.baseUrl.trim() || API_DEFAULTS[protocol].baseUrl
+  const saved = item.stored
+  const apiKey = item.apiKey.trim()
+  const proxyChanged = item.proxyId !== saved?.proxyId
+  const apply =
+    !!item.storedId &&
+    !!saved &&
+    !apiKey &&
+    !proxyChanged &&
+    baseUrl === saved.baseUrl &&
+    protocol === saved.protocol &&
+    item.authScheme === saved.authScheme
+  const path = '/api/panel/api-endpoints'
+  return {
+    apply,
+    path: apply
+      ? `${path}/${encodeURIComponent(item.storedId!)}/fetch-models`
+      : `${path}/fetch-models`,
+    body: apply
+      ? { key_id: item.keyId }
+      : {
+          kind: kindOf(baseUrl, protocol),
+          protocol,
+          base_url: baseUrl,
+          api_key: apiKey,
+          key_id: item.keyId,
+          auth_scheme: item.authScheme,
+          headers: saved?.headers,
+          ...(proxyChanged
+            ? { proxy_id: item.proxyId === DIRECT ? '' : item.proxyId }
+            : {}),
+        },
+  }
 }
 
 /**
@@ -103,7 +174,10 @@ export function endpointSaveRequest(
         kind: kindOf(baseUrl, protocol),
         protocol,
         ...(protocol === 'anthropic'
-          ? { risk_review_enabled: item.riskReviewEnabled === true }
+          ? {
+              risk_review_enabled: item.riskReviewEnabled === true,
+              body_policy: asBodyPolicy(item.bodyPolicy),
+            }
           : {}),
         name: baseUrl,
         base_url: baseUrl,
@@ -125,6 +199,12 @@ export function endpointSaveRequest(
     (!was || item.riskReviewEnabled !== (was.riskReviewEnabled === true))
   )
     body.risk_review_enabled = item.riskReviewEnabled
+  if (
+    protocol === 'anthropic' &&
+    item.bodyPolicy !== undefined &&
+    (!was || asBodyPolicy(item.bodyPolicy) !== asBodyPolicy(was.bodyPolicy))
+  )
+    body.body_policy = asBodyPolicy(item.bodyPolicy)
   if (!was || item.proxyId !== was.proxyId) body.proxy_id = proxyId
   if (!was || item.authScheme !== was.authScheme)
     body.auth_scheme = item.authScheme

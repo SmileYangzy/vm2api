@@ -1,14 +1,39 @@
-import { useMemo, useState } from 'react'
+import { lazy, Suspense, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
+import { BarChart3 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { poolStatus } from '@/lib/vm-status'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { PlatformChip } from '@/components/platform-chip'
+import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
+import {
+  GeminiEnvironments,
+  type GeminiEnvironment,
+} from '@/features/import/gemini-environments'
+import {
+  GEMINI_INVENTORY_KEY,
+  geminiResource,
+  syncGeminiEnvironment,
+} from '@/features/import/gemini-operations'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { clearVmRestriction } from '@/features/vm/clear-restriction'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
+import {
+  SchedulableSwitch,
+  vmSchedulableProps,
+} from '@/features/vm/schedulable-switch'
 import {
   VmActionsContext,
   type VmActions,
@@ -16,21 +41,30 @@ import {
 import { VmAssignOwnerDialog } from '@/features/vm/vm-assign-owner-dialog'
 import { VmDetailCard } from '@/features/vm/vm-detail-card'
 import { canReclaimVm, patchVmOwner } from '@/features/vm/vm-owner'
+import { VmSeats } from '@/features/vm/vm-rack-blade'
 import { VmReauthDialog } from '@/features/vm/vm-reauth-dialog'
 import { VmRecoveryDialog } from '@/features/vm/vm-recovery-dialog'
-import { VmStatsDialog } from '@/features/vm/vm-stats-dialog'
 import { VmTestDialog } from '@/features/vm/vm-test-dialog'
+
+// 统计弹窗带 recharts（约 100 KB gzip），只在点开时加载，不拖慢虚拟机列表和密钥页首屏。
+const VmStatsDialog = lazy(() =>
+  import('@/features/vm/vm-stats-dialog').then((m) => ({
+    default: m.VmStatsDialog,
+  }))
+)
 
 /**
  * 持有详情卡与测试 / 统计 / 重新授权 / 恢复服务弹窗的开关，行与卡片只发「打开哪台」。
  * 弹窗内的 Vm 始终从列表缓存里按 id 取，轮询刷新后卡面数据同步更新。
  */
 export function VmActionsProvider({
+  slots,
   accounts,
   onReset,
   onDelete,
   children,
 }: {
+  slots?: Vm[]
   accounts?: UsageAccountRow[]
   onReset?: (vm: Vm) => void
   onDelete?: (vm: Vm) => void
@@ -41,21 +75,34 @@ export function VmActionsProvider({
   const isAdmin = me.data?.role === 'admin'
   const list = useQuery(vmsListQueryOptions())
   const [detailId, setDetailId] = useState<string | null>(null)
+  const [geminiTarget, setGeminiTarget] = useState<{
+    vm: Vm
+    tab: 'account' | 'proxy' | 'test'
+  } | null>(null)
   const [testId, setTestId] = useState<string | null>(null)
   const [statsId, setStatsId] = useState<string | null>(null)
+  // 首次打开后保持挂载，关闭动画照常播放。
+  const [statsOpened, setStatsOpened] = useState(false)
+  if (statsId != null && !statsOpened) setStatsOpened(true)
   const [reauthId, setReauthId] = useState<string | null>(null)
   const [recoveryId, setRecoveryId] = useState<string | null>(null)
   const [assignId, setAssignId] = useState<string | null>(null)
   const [reclaimTarget, setReclaimTarget] = useState<Vm | null>(null)
   const items = list.data?.items
   const byId = (id: string | null) =>
-    (id && items?.find((vm) => vm.id === id)) || null
+    (id &&
+      (slots?.find((vm) => vm.id === id) ||
+        items?.find((vm) => vm.id === id))) ||
+    null
 
   const invalidate = (vm: Vm) =>
     Promise.all([
       qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
       qc.invalidateQueries({ queryKey: vmQueryOptions(vm.id).queryKey }),
       qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      ...(vm.gemini
+        ? [qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })]
+        : []),
     ])
 
   const {
@@ -64,13 +111,54 @@ export function VmActionsProvider({
     variables: refreshVars,
   } = useMutation({
     mutationFn: (vm: Vm) =>
-      api(`/api/panel/vms/${encodeURIComponent(vm.id)}/oauth/refresh`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      }),
-    onSuccess: async (_data, vm) => {
+      vm.gemini
+        ? api<GeminiEnvironment>(`${geminiResource(vm.id)}/refresh`, {
+            method: 'POST',
+          })
+        : api(`/api/panel/vms/${encodeURIComponent(vm.id)}/oauth/refresh`, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          }),
+    onSuccess: async (data, vm) => {
+      if (vm.gemini) {
+        if (data && typeof data === 'object' && 'id' in data) {
+          await syncGeminiEnvironment(qc, data as GeminiEnvironment)
+        } else {
+          await qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })
+        }
+        toast.success(`已刷新 Gemini 数据 ${vm.name || vm.id}`)
+        return
+      }
       toast.success(`已刷新令牌 ${vm.id}`)
       await invalidate(vm)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const {
+    mutate: pullModels,
+    isPending: pullModelsPending,
+    variables: pullModelsVars,
+  } = useMutation({
+    mutationFn: (vm: Vm) =>
+      api<GeminiEnvironment>(`${geminiResource(vm.id)}/models`, {
+        method: 'POST',
+      }),
+    onSuccess: async (data, vm) => {
+      await syncGeminiEnvironment(qc, data)
+      toast.success(`已拉取模型 ${vm.name || vm.id}`)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const {
+    mutate: disableGemini,
+    isPending: disablePending,
+    variables: disableVars,
+  } = useMutation({
+    mutationFn: (vm: Vm) =>
+      api(`${geminiResource(vm.id)}/disable`, { method: 'POST' }),
+    onSuccess: async (_data, vm) => {
+      await qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })
+      toast.success(`已停用 ${vm.name || vm.id}`)
     },
     onError: (error: Error) => toast.error(error.message),
   })
@@ -122,7 +210,7 @@ export function VmActionsProvider({
     variables: ownerVars,
   } = useMutation({
     mutationFn: ({ vm, user_id }: { vm: Vm; user_id: string | null }) =>
-      patchVmOwner(vm.id, user_id),
+      patchVmOwner(vm.id, user_id, Boolean(vm.gemini)),
     onSuccess: async (_data, { vm, user_id }) => {
       toast.success(user_id ? '已分配给租户' : '已收回进平台池')
       setAssignId(null)
@@ -136,14 +224,30 @@ export function VmActionsProvider({
 
   const actions = useMemo<VmActions>(
     () => ({
-      openDetail: (vm) => setDetailId(vm.id),
-      openTest: (vm) => setTestId(vm.id),
+      openDetail: (vm) => {
+        if (vm.gemini) setGeminiTarget({ vm, tab: 'account' })
+        else setDetailId(vm.id)
+      },
+      openTest: (vm) => {
+        if (vm.gemini) setGeminiTarget({ vm, tab: 'test' })
+        else setTestId(vm.id)
+      },
+      openProxy: (vm) => {
+        if (vm.gemini) setGeminiTarget({ vm, tab: 'proxy' })
+      },
       openStats: (vm) => setStatsId(vm.id),
-      openReauth: (vm) => setReauthId(vm.id),
+      openReauth: (vm) => {
+        if (vm.gemini) setGeminiTarget({ vm, tab: 'account' })
+        else setReauthId(vm.id)
+      },
       openRecovery: (vm) => setRecoveryId(vm.id),
       refreshToken,
+      pullModels,
+      disableGemini,
       recover: recoverState,
       refreshingId: refreshPending ? (refreshVars?.id ?? null) : null,
+      pullingModelsId: pullModelsPending ? (pullModelsVars?.id ?? null) : null,
+      disablingId: disablePending ? (disableVars?.id ?? null) : null,
       recoveringId: recoverPending ? (recoverVars?.id ?? null) : null,
       reset: onReset,
       remove: onDelete,
@@ -164,9 +268,15 @@ export function VmActionsProvider({
     }),
     [
       refreshToken,
+      pullModels,
+      disableGemini,
       recoverState,
       refreshPending,
       refreshVars,
+      pullModelsPending,
+      pullModelsVars,
+      disablePending,
+      disableVars,
       recoverPending,
       recoverVars,
       onReset,
@@ -182,9 +292,55 @@ export function VmActionsProvider({
     ]
   )
 
+  const liveGeminiTarget = geminiTarget
+    ? (byId(geminiTarget.vm.id) ?? geminiTarget.vm)
+    : null
+
   return (
     <VmActionsContext.Provider value={actions}>
       {children}
+      {isAdmin && geminiTarget && liveGeminiTarget ? (
+        <Dialog open onOpenChange={(open) => !open && setGeminiTarget(null)}>
+          <DialogContent className='max-h-[85dvh] overflow-y-auto sm:max-w-2xl'>
+            <DialogHeader className='space-y-2'>
+              <div className='flex flex-wrap items-center gap-2 pr-8'>
+                <PlatformChip kind='gemini' />
+                <DialogTitle className='font-mono'>
+                  {liveGeminiTarget.name || liveGeminiTarget.id}
+                </DialogTitle>
+                <StatusMark
+                  variant='pill'
+                  tone={poolStatus(liveGeminiTarget)}
+                />
+                <div className='ms-auto flex items-center gap-2'>
+                  <VmSeats vm={liveGeminiTarget} compact />
+                  <SchedulableSwitch
+                    {...vmSchedulableProps(liveGeminiTarget)}
+                  />
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    className='h-7 gap-1 px-2 text-xs'
+                    onClick={() => setStatsId(liveGeminiTarget.id)}
+                  >
+                    <BarChart3 className='size-3.5' />
+                    查看统计
+                  </Button>
+                </div>
+              </div>
+              <DialogDescription>
+                Gemini 宿主环境 · {liveGeminiTarget.id}
+              </DialogDescription>
+            </DialogHeader>
+            <GeminiEnvironments
+              key={`${liveGeminiTarget.id}:${geminiTarget.tab}`}
+              environmentId={liveGeminiTarget.id}
+              initialTab={geminiTarget.tab}
+            />
+          </DialogContent>
+        </Dialog>
+      ) : null}
       <VmDetailCard
         vm={byId(detailId)}
         accounts={accounts}
@@ -194,11 +350,15 @@ export function VmActionsProvider({
         vm={byId(testId)}
         onOpenChange={(open) => !open && setTestId(null)}
       />
-      <VmStatsDialog
-        vm={byId(statsId)}
-        accounts={accounts}
-        onOpenChange={(open) => !open && setStatsId(null)}
-      />
+      {statsOpened ? (
+        <Suspense fallback={null}>
+          <VmStatsDialog
+            vm={byId(statsId)}
+            accounts={accounts}
+            onOpenChange={(open) => !open && setStatsId(null)}
+          />
+        </Suspense>
+      ) : null}
       <VmReauthDialog
         vm={byId(reauthId)}
         onOpenChange={(open) => !open && setReauthId(null)}

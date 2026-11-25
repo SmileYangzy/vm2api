@@ -1,0 +1,101 @@
+import { createHash } from 'node:crypto'
+import { CRAG_HOST_MOUNT } from '../vm/crag-subscription-paths.mjs'
+import { readCragClusterSubscription } from '../vm/crag-license.mjs'
+import { nodeSession, remoteSlotDir, remoteSlotOwner } from './placement.mjs'
+import { openSftp, privateDirectoriesScript, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
+
+const publications = new WeakMap()
+
+export function clusterSubscriptionBinds(remoteDir) {
+  return [
+    `${remoteDir}/subscription-host:${CRAG_HOST_MOUNT}:ro`,
+    `${remoteDir}/subscription-license:/run/kin/crag-license:ro`,
+  ]
+}
+
+export function hasClusterSubscriptionBinds(container, remoteDir) {
+  return clusterSubscriptionBinds(remoteDir).every((bind) => container?.HostConfig?.Binds?.includes(bind))
+}
+
+const SEP = '--kin-subscription-file--'
+
+/** The node already holds exactly these files and no sync is pending. Any read failure means "no". */
+export async function publishedMatches(client, hostDir, licenseDir, files, { run = runRemote } = {}) {
+  const paths = [
+    `${licenseDir}/device.json`,
+    `${licenseDir}/registration.code`,
+    `${hostDir}/host_id`,
+    `${hostDir}/entitlement.code`,
+  ]
+  const script = [
+    `test ! -e ${shellQuote(`${hostDir}/sync-pending`)}`,
+    ...paths.map((file) => `printf '%s\\n' ${shellQuote(SEP)} && cat ${shellQuote(file)}`),
+  ].join(' && ')
+  let out
+  try {
+    out = await run(client, script, { timeoutMs: 8000 })
+  } catch {
+    return false
+  }
+  const expected = [files.device, files.permit, files.hostId, files.entitlement].map((data) => `${SEP}\n${data}\n`).join('')
+  return out === expected
+}
+
+export async function publishClusterSubscription(projectRoot, vm, session = null, { force = false } = {}) {
+  session ??= await nodeSession(vm.node_id)
+  const root = remoteSlotDir(session.host, vm.id)
+  const hostDir = `${root}/subscription-host`
+  const licenseDir = `${root}/subscription-license`
+  const marker = `${hostDir}/sync-pending`
+  const owner = session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null
+  let records = publications.get(session.client)
+  if (!records) publications.set(session.client, (records = new Map()))
+  const record = records.get(root) ?? {}
+  records.set(root, record)
+  const pending = (record.pending ?? Promise.resolve())
+    .catch(() => {})
+    .then(async () => {
+      const files = readCragClusterSubscription(projectRoot, vm)
+      if (!files) return false
+      const digest = createHash('sha256').update(JSON.stringify(files)).digest('hex')
+      if (!force && record.digest === digest) return true
+      // A controller that just started (restart, or a blue/green handover) has no record yet. Rewriting
+      // unchanged files raises sync-pending on the slot, and a stream finishing in that window fails
+      // with a license 403, so first check what the node already holds.
+      if (!force && record.digest === undefined && (await publishedMatches(session.client, hostDir, licenseDir, files))) {
+        record.digest = digest
+        return true
+      }
+      record.digest = undefined
+      await runRemote(
+        session.client,
+        `umask 077 && ${privateDirectoriesScript([licenseDir], owner)} ${privateDirectoriesScript([hostDir])} chmod 755 ${shellQuote(hostDir)}`,
+        { timeoutMs: 8000 },
+      )
+      // Stage every file next to its target, then swap all four in one remote command: the slot sees
+      // sync-pending (and a mixed set) for milliseconds instead of four SFTP round trips.
+      const sftp = await openSftp(session.client)
+      const targets = [
+        [`${licenseDir}/device.json`, files.device, 0o600, owner],
+        [`${licenseDir}/registration.code`, files.permit, 0o600, owner],
+        [`${hostDir}/host_id`, files.hostId, 0o644, null],
+        [`${hostDir}/entitlement.code`, files.entitlement, 0o644, null],
+      ]
+      for (const [file, data, mode, fileOwner] of targets)
+        await writeRemoteFile(sftp, `${file}.new`, `${data}\n`, { mode, owner: fileOwner, timeoutMs: 8000 })
+      const swap = targets.map(([file]) => `mv -f ${shellQuote(`${file}.new`)} ${shellQuote(file)}`).join(' && ')
+      await runRemote(
+        session.client,
+        `printf 'pending\\n' > ${shellQuote(marker)} && chmod 644 ${shellQuote(marker)} && ${swap} && rm -f ${shellQuote(marker)}`,
+        { timeoutMs: 8000 },
+      )
+      record.digest = digest
+      return true
+    })
+  record.pending = pending
+  try {
+    return await pending
+  } finally {
+    if (record.pending === pending) record.pending = undefined
+  }
+}

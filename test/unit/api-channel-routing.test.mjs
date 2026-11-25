@@ -27,6 +27,15 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     { model: true, enabled: true, block: true, scoped: true },
   ],
   ['anthropic.messages', 'claude-review', 'anthropic', false, { model: true, enabled: true, scoped: true }],
+  ...['endpoint', 'model', 'unavailable', 'standard'].map((route) => [
+    'anthropic.messages',
+    'claude-review',
+    'anthropic',
+    false,
+    { model: true, enabled: true, scoped: true, route },
+  ]),
+  ['anthropic.messages', 'claude-review', 'anthropic', false, { upstream: 'policy' }],
+  ['anthropic.messages', 'claude-review', 'anthropic', false, { upstream: 'invalid' }],
   ['anthropic.messages', 'claude-opus-5-5', 'anthropic', false, { invalid: 'thinking' }],
   ['anthropic.messages', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
   ['openai.chat', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
@@ -46,7 +55,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
   ].map((unsafe) => ['openai.responses', 'gpt-5.4', 'openai', false, { invalid: 'shared', unsafe }]),
   ['openai.responses', 'gpt-5.4', 'openai', false, { stateless: true }],
 ]) {
-  test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}, input=${JSON.stringify(review.unsafe || review.stateless || null)}`, async () => {
+  test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}, route=${review.route || '-'}, upstream=${review.upstream || '-'}, input=${JSON.stringify(review.unsafe || review.stateless || null)}`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-'))
     fs.mkdirSync(path.join(root, 'run'))
     const routingFile = path.join(root, 'routing.json')
@@ -61,7 +70,14 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       for await (const chunk of req) chunks.push(chunk)
       audited.push(JSON.parse(Buffer.concat(chunks)))
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ answers: { safety: { noul: review.block ? 0.1 : 0.99 } } }))
+      const score = review.block
+        ? 0.1
+        : review.route === 'model'
+          ? 0.52
+          : ['endpoint', 'unavailable'].includes(review.route)
+            ? 0.6
+            : 0.99
+      res.end(JSON.stringify({ answers: { safety: { noul: score } } }))
     })
     if (review.model) {
       await new Promise((resolve) => audit.listen(0, '127.0.0.1', resolve))
@@ -72,6 +88,21 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       const chunks = []
       for await (const chunk of req) chunks.push(chunk)
       captured.push(JSON.parse(Buffer.concat(chunks)))
+      if (review.upstream) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            error: {
+              type: 'api_error',
+              message:
+                review.upstream === 'policy'
+                  ? 'API Error: request rejected under the Usage Policy.'
+                  : 'API Error: invalid max_tokens.',
+            },
+          }),
+        )
+        return
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       const events =
         upstreamProtocol === 'openai'
@@ -100,17 +131,25 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     })
     await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
     const scheduler = new ApiScheduler()
-    scheduler.reload([
-      {
-        id: 'ep',
-        kind: 'custom',
-        protocol: upstreamProtocol,
-        risk_review_enabled: review.enabled,
-        base_url: 'https://relay.invalid',
-        models: [{ name: 'upstream-model', alias: modelOverride ? 'routed-model' : model }],
-        api_key_entries: [{ id: 'ek', api_key: 'sk-upstream', proxy_url: 'socks5://proxy.invalid:1080' }],
-      },
-    ])
+    const primary = {
+      id: 'ep',
+      kind: 'custom',
+      protocol: upstreamProtocol,
+      risk_review_enabled: review.enabled,
+      base_url: 'https://relay.invalid',
+      models: [{ name: 'upstream-model', alias: modelOverride ? 'routed-model' : model }],
+      api_key_entries: [{ id: 'ek', api_key: 'sk-upstream', proxy_url: 'socks5://proxy.invalid:1080' }],
+    }
+    const secondary = {
+      ...primary,
+      id: 'ep-alt',
+      base_url: 'https://alt.invalid',
+      models: [
+        { name: 'upstream-model', alias: model },
+        { name: 'upstream-light', alias: 'claude-light' },
+      ],
+    }
+    scheduler.reload(review.route ? [primary, secondary] : [primary])
     const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
     const body =
       protocol === 'openai.responses'
@@ -160,6 +199,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     }
     let acquired = 0
     let released = 0
+    const refusalCache = new Map()
     const handler = createHandleProtocol({
       json: (_res, status, body) => {
         response.status = status
@@ -193,6 +233,10 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       },
       apiScheduler: scheduler,
       apiEndpointStore: {},
+      refusalGuards: {
+        get: (fingerprint) => refusalCache.get(fingerprint),
+        remember: (entry) => refusalCache.set(entry.fingerprint, entry),
+      },
       settings: {
         get: (key, fallback) =>
           key === 'jev_intercept'
@@ -206,7 +250,12 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
                 fail_open: false,
                 questions: [{ id: 'safety', instructions: 'Is this content safe?', enabled: true }],
               }
-            : fallback,
+            : key === 'risk_audit_policy' && review.route
+              ? {
+                  downgrade_endpoint: review.route === 'unavailable' ? 'missing' : 'ep-alt',
+                  downgrade_model: 'claude-light',
+                }
+              : fallback,
       },
       stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
       routingConfigPath: routingFile,
@@ -229,6 +278,25 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     }
     try {
       await handler.handleProtocol(req, response, protocol, req.url)
+      if (review.upstream) {
+        assert.equal(response.status, 400, JSON.stringify(response.body))
+        assert.equal(captured.length, 1)
+        assert.equal(refusalCache.size, review.upstream === 'policy' ? 1 : 0)
+        if (review.upstream === 'policy') {
+          assert.equal(response.body.error.details.retryable, false)
+          await handler.handleProtocol(req, response, protocol, req.url)
+          assert.equal(response.body.error.details.reason, 'exact')
+          assert.equal(captured.length, 1, 'a cached upstream refusal blocks even on an opt-out endpoint')
+        }
+        return
+      }
+      if (review.route === 'unavailable') {
+        assert.equal(response.status, 503)
+        assert.equal(response.body.error.code, 'risk_route_unavailable')
+        assert.equal(captured.length, 0)
+        assert.equal(acquired, 0)
+        return
+      }
       if (review.invalid) {
         assert.equal(response.status, 400, JSON.stringify(response.body))
         assert.equal(
@@ -257,10 +325,10 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       assert.equal(captured[0].proxy_url, 'socks5://proxy.invalid:1080')
       assert.equal(
         captured[0].url,
-        `https://relay.invalid/v1/${upstreamProtocol === 'openai' ? 'responses' : 'messages?beta=true'}`,
+        `https://${['endpoint', 'model'].includes(review.route) ? 'alt' : 'relay'}.invalid/v1/${upstreamProtocol === 'openai' ? 'responses' : 'messages?beta=true'}`,
       )
       const outbound = JSON.parse(captured[0].body)
-      assert.equal(outbound.model, 'upstream-model')
+      assert.equal(outbound.model, review.route === 'model' ? 'upstream-light' : 'upstream-model')
       assert.equal(acquired, 1)
       assert.equal(released, 1)
       if (upstreamProtocol === 'openai') {
@@ -285,6 +353,130 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       }
     } finally {
       if (audit.listening) await new Promise((resolve) => audit.close(resolve))
+      await new Promise((resolve) => kernel.close(resolve))
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+}
+
+for (const [protocol, inboundBody, routeMeta, assertOutput] of [
+  [
+    'google.gemini',
+    { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    { routeModel: 'gemini-4-neon-low', routeStream: false },
+    (out) => assert.equal(out.candidates[0].content.parts[0].text, 'gemini-pong'),
+  ],
+  [
+    'openai.chat',
+    { model: 'gemini-4-neon-low', messages: [{ role: 'user', content: 'hello' }], stream: false },
+    null,
+    (out) => assert.equal(out.choices[0].message.content, 'gemini-pong'),
+  ],
+  [
+    'openai.responses',
+    { model: 'gemini-4-neon-low', input: 'hello', stream: false },
+    null,
+    (out) => assert.equal(out.output[0].content[0].text, 'gemini-pong'),
+  ],
+  [
+    'anthropic.messages',
+    { model: 'gemini-4-neon-low', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }], stream: false },
+    null,
+    (out) => assert.equal(out.content[0].text, 'gemini-pong'),
+  ],
+]) {
+  test(`Gemini API channel routes ${protocol} to native Gemini upstream with /v1beta -> /v1 fallback`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-gemini-channel-'))
+    fs.mkdirSync(path.join(root, 'run'))
+    const routingFile = path.join(root, 'routing.json')
+    fs.writeFileSync(routingFile, JSON.stringify({}))
+    const captured = []
+    const kernel = http.createServer(async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const env = JSON.parse(Buffer.concat(chunks))
+      captured.push(env)
+      // Simulate a split nginx rejecting /v1beta with 405 on the first attempt for google.gemini
+      if (protocol === 'google.gemini' && env.url.includes('/v1beta/')) {
+        res.writeHead(405, { 'content-type': 'text/html' })
+        res.end('<html>405 Not Allowed</html>')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'gemini-pong' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
+        })}\n\n`,
+      )
+    })
+    await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
+    const scheduler = new ApiScheduler()
+    scheduler.reload([
+      {
+        id: 'ep-gem',
+        kind: 'custom',
+        protocol: 'gemini',
+        base_url: 'https://gem-relay.invalid',
+        models: [{ name: 'gemini-upstream', alias: 'gemini-4-neon-low' }],
+        api_key_entries: [{ id: 'ek-gem', api_key: 'sk-gem-upstream', proxy_url: '' }],
+      },
+    ])
+    const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
+    const handler = createHandleProtocol({
+      json: (_res, status, out) => {
+        response.status = status
+        response.body = out
+      },
+      writeSSEHeaders() {},
+      readBody: async () => inboundBody,
+      requireAuth: () => true,
+      cfg: {
+        rewrite: { enabled: false },
+        intercept: { rules: [] },
+        distill: { enabled: false },
+        limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+        paths: { data: root, project: root },
+      },
+      requestLog: { start: () => ({ request_id: 'api-gem', t0: Date.now() }), finish() {} },
+      stickyRouter: {},
+      accountQuota: {},
+      apiKeyStore: { acquire: () => ({ ok: true }), release: () => {}, recordUsage() {} },
+      apiScheduler: scheduler,
+      apiEndpointStore: { listRaw: () => scheduler.endpoints },
+      groupsRepo: { rateMultiplier: () => 1 },
+      getRoutingConfig: () => ({}),
+      routingConfigPath: routingFile,
+      stats: { requests: 0, errors: 0, passthrough: 0, rewrite: 0, convert: 0, by_route: {} },
+    })
+    try {
+      await handler.handleProtocol(
+        {
+          headers: {},
+          apiKeyKind: 'managed',
+          apiKeyRecord: { id: 'key-gem', category: 'api', api_endpoint_id: 'ep-gem', group_type: 'all' },
+          on() {},
+          once() {},
+          off() {},
+        },
+        response,
+        protocol,
+        protocol === 'google.gemini' ? '/v1beta/models/gemini-4-neon-low:generateContent' : '/v1/messages',
+        routeMeta,
+      )
+      assert.equal(response.status, 200, JSON.stringify(response.body))
+      assertOutput(response.body)
+      const lastCall = captured[captured.length - 1]
+      assert.equal(lastCall.headers['x-goog-api-key'], 'sk-gem-upstream')
+      assert.equal(
+        lastCall.url,
+        protocol === 'google.gemini'
+          ? 'https://gem-relay.invalid/v1/models/gemini-upstream:streamGenerateContent?alt=sse'
+          : 'https://gem-relay.invalid/v1beta/models/gemini-upstream:streamGenerateContent?alt=sse',
+      )
+      const outbound = JSON.parse(lastCall.body)
+      assert.equal(outbound.contents[0].parts[0].text, 'hello')
+    } finally {
       await new Promise((resolve) => kernel.close(resolve))
       fs.rmSync(root, { recursive: true, force: true })
     }

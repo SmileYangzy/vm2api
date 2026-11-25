@@ -4,7 +4,7 @@ import { api } from '@/lib/api'
 import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { type SlashCommand, WsTerminal } from '@/components/ws-terminal'
+import { type SlashCommand, WsTerminal } from '@/components/ws-terminal-lazy'
 import { probeSourceLabel } from '@/features/vm/probe-status'
 
 const RED = '\x1b[31m'
@@ -137,8 +137,8 @@ export function VmShellCard({
       },
       {
         name: '/usage',
-        desc: '打开原生 Claude Code 的用量',
-        input: 'claude /usage',
+        desc: '打开本槽 CRAG 原生 Claude Code 的用量',
+        input: 'usage',
       },
       {
         name: '/probe',
@@ -220,8 +220,8 @@ export function VmShellCard({
             </Button>
             <span className='text-xs text-muted-foreground'>
               进入 <span className='font-mono'>{container || id}</span>{' '}
-              容器，终端使用原生 CC；换票在账号面板完成，输入 /sync
-              可重新同步凭证。空行输入 <span className='font-mono'>/help</span>{' '}
+              容器，终端使用 CRAG 包内原生 CC。凭证自动同步，也可输入 /sync
+              手动修复链接。空行输入 <span className='font-mono'>/help</span>{' '}
               查看快捷指令
             </span>
           </div>

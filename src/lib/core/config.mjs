@@ -198,6 +198,12 @@ function snapshotVm(vm, project) {
   }
 }
 
+function parseNonNegativeEnv(raw, fallback) {
+  if (raw == null || String(raw).trim() === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+
 export function loadConfig() {
   const keyFile = path.join(ROOT, 'config', 'test.key')
   const apiKey =
@@ -232,14 +238,15 @@ export function loadConfig() {
     distill: loadDistillRules(path.join(ROOT, 'config', 'distill-rules.json')),
     limits: {
       max_body_bytes: Number(process.env.KIN_MAX_BODY || 128 * 1024 * 1024),
-      // First-byte wait for worker HTTP headers. Matches sub2api
-      // gateway.response_header_timeout (600s). Idle is stream_idle_timeout_ms.
+      // Wait for the worker's HTTP response headers (default 600s).
+      // stream_idle_timeout_ms limits idle time during streaming separately.
       upstream_timeout_ms: Number(process.env.KIN_UPSTREAM_TIMEOUT || 600000),
       stream_idle_timeout_ms: streamIdleTimeoutMs(),
       stream_keepalive_ms: Number(process.env.KIN_STREAM_KEEPALIVE || 10000),
       queue_keepalive_delay_ms: queueKeepaliveDelayMs(null),
-      rate_capacity: Number(process.env.KIN_RATE_CAP || 60),
-      rate_refill: Number(process.env.KIN_RATE_REFILL || 1),
+      rate_capacity: parseNonNegativeEnv(process.env.KIN_RATE_CAP, 60),
+      rate_refill: parseNonNegativeEnv(process.env.KIN_RATE_REFILL, 1),
+      rate_capacity_explicit: process.env.KIN_RATE_CAP != null && String(process.env.KIN_RATE_CAP).trim() !== '',
     },
     // Admin/status snapshot of the *active* VM only.
     // Inference must use buildExecutionContext() — never this object.

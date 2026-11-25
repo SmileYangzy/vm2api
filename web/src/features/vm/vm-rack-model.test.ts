@@ -7,6 +7,7 @@ import {
   vmWindows,
   zoneCounts,
 } from './vm-rack-model'
+import { windowTiming } from './window-timing'
 
 function vm(over: Partial<Vm> = {}): Vm {
   return {
@@ -77,6 +78,9 @@ describe('zones', () => {
       off: 1,
       none: 0,
       dead: 2,
+      host_verified: 0,
+      pending: 0,
+      host_failed: 0,
     })
   })
 })
@@ -159,6 +163,31 @@ describe('rackTotals', () => {
     )
     expect(t.ledger[0].tokens).toBe(70)
   })
+
+  it('keeps the mixed total label and amount stable across row order', () => {
+    const archived = vm({
+      id: 'archived',
+      account_uuid: 'acct-1',
+      lifetime_usage: { cost: 30, tokens: 300 },
+      total_cost: 8,
+      total_tokens: 80,
+    })
+    const retained = vm({
+      id: 'retained',
+      account_uuid: 'acct-2',
+      total_cost: 12,
+      total_tokens: 120,
+    })
+    const forward = rackTotals([archived, retained])
+    const reverse = rackTotals([retained, archived])
+    expect(forward.ledger[2]).toMatchObject({
+      key: 'total',
+      label: '总费用',
+      cost: 42,
+      tokens: 420,
+    })
+    expect(reverse.ledger[2]).toEqual(forward.ledger[2])
+  })
 })
 
 describe('vmWindows', () => {
@@ -215,5 +244,43 @@ describe('bladeState', () => {
       bladeState(vm({ utilization_5h: undefined, utilization_7d: undefined }))
     ).toBe('unprobed')
     expect(bladeState(vm({ utilization_5h: undefined }))).toBe('live')
+  })
+})
+
+describe('Codex custom 24h window (#1744)', () => {
+  it('renders 24H window as live with 24h timing instead of 5H/7D', () => {
+    const now = Date.parse('2026-11-24T12:00:00Z')
+    const resetAt = new Date(now + 12 * 3600_000).toISOString()
+    const slot = vm({
+      platform: 'openai',
+      family: 'codex',
+      utilization_5h: null,
+      utilization_7d: null,
+      codex_usage: {
+        windows: [
+          {
+            id: '24h',
+            label: '24h',
+            used_percent: 1,
+            window_minutes: 1440,
+            reset_at: resetAt,
+          },
+        ],
+      },
+    })
+    const rows = vmWindows(slot)
+    expect(rows).toEqual([
+      {
+        key: '24h',
+        label: '24H',
+        pct: 1,
+        note: null,
+        reset: resetAt,
+        windowMinutes: 1440,
+      },
+    ])
+    expect(bladeState(slot)).toBe('live')
+    const timing = windowTiming(rows[0], now)
+    expect(timing.elapsedPct).toBeCloseTo(50, 5)
   })
 })

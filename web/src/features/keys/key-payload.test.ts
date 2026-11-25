@@ -19,6 +19,28 @@ const draft: KeyLimitsDraft = {
 }
 
 describe('API key limit payload', () => {
+  it('saves Gemini as admin-only OAuth without a VM scope', () => {
+    const gemini = {
+      ...draft,
+      category: 'oauth',
+      group_type: 'gemini',
+      vm_pool_id: '',
+    } as const
+    for (const mode of ['create', 'edit'] as const) {
+      expect(keyLimitsPayload(gemini, mode)).toMatchObject({
+        group_type: 'gemini',
+        category: 'oauth',
+        allowed_vms: [],
+        vm_pool_id: null,
+      })
+    }
+    expect(() =>
+      keyLimitsPayload(gemini, 'create', { isAdmin: false })
+    ).toThrow('只允许管理员')
+    expect(() =>
+      keyLimitsPayload({ ...gemini, category: 'api' }, 'create')
+    ).toThrow('宿主机 OAuth')
+  })
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',
@@ -107,6 +129,40 @@ describe('API key limit payload', () => {
     ).toMatchObject({
       category: 'api',
       group_type: 'openai',
+      allowed_vms: [],
+    })
+    expect(
+      keyLimitsPayload(
+        {
+          ...draft,
+          category: 'all',
+          api_endpoint_id: 'ep_tenant',
+          group_type: 'anthropic',
+          allowed_vms: [],
+        },
+        'edit'
+      )
+    ).toMatchObject({
+      category: 'all',
+      api_endpoint_id: 'ep_tenant',
+      group_type: 'anthropic',
+      allowed_vms: [],
+    })
+    expect(
+      keyLimitsPayload(
+        {
+          ...draft,
+          category: 'oauth',
+          permission_tier: 'tenant',
+          owner_id: 'u_alice',
+          group_type: 'anthropic',
+          allowed_vms: [],
+        },
+        'edit'
+      )
+    ).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
       allowed_vms: [],
     })
   })

@@ -617,7 +617,7 @@ test('request log first_token_ms falls back to hop ttftMs without firstTokenAt',
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('incomplete Responses stream still bills tokens from the completed event', async () => {
+test('Codex billing uses the completed event when hop usage has only zero totals', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-bill-'))
   writeGptVm(root, 'vm-gpt-a')
   const res = {
@@ -658,9 +658,9 @@ test('incomplete Responses stream still bills tokens from the completed event', 
           'data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"input_tokens":40,"output_tokens":2,"input_tokens_details":{"cached_tokens":5}}}}',
         )
         return {
-          ok: false,
+          ok: true,
           status: 200,
-          terminalState: 'incomplete',
+          terminalState: 'verified',
           usage: { input_tokens: 0, output_tokens: 0 },
         }
       },
@@ -1022,7 +1022,7 @@ test('transient GPT failures retry the same account three times before switching
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('same-account retry never replays after the first SSE event', async () => {
+test('buffered Responses JSON returns the hop error without replaying after the first SSE event', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-same-emitted-'))
@@ -1038,7 +1038,7 @@ test('same-account retry never replays after the first SSE event', async () => {
       },
     }),
   )
-  assert.equal(out, undefined)
+  assert.deepEqual(out, { status: 500, body: { error: { code: 'server_error' } } })
   assert.deepEqual(seen, ['vm-gpt-a'])
   rt.resetOpenAIAccountRuntime()
   fs.rmSync(root, { recursive: true, force: true })
@@ -1269,27 +1269,126 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('codex rebuild outbound session is stable on the same slot', async () => {
+test('Codex follow-ups keep their VM and outbound session after another VM gains priority', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stable-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   writeGptVm(root, 'vm-gpt-a')
+  const seen = []
+  const onHop = ({ exec }) => {
+    seen.push(exec.vmId)
+    return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_ok' } }
+  }
   const inbound = 'sess-stable'
   const first = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi', stream: false },
+    onHop,
   })
+  writeGptVm(root, 'vm-gpt-b')
+  const otherVmFile = path.join(root, 'vms', 'vm-gpt-b.json')
+  const otherVm = JSON.parse(fs.readFileSync(otherVmFile, 'utf8'))
+  otherVm.policy = { priority: 10, weight: 10 }
+  fs.writeFileSync(otherVmFile, JSON.stringify(otherVm))
   const second = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi again', stream: false },
+    onHop,
   })
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-a'])
   assert.equal(first.envelopes[0].session.session_id, second.envelopes[0].session.session_id)
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
 })
+
+for (const mode of ['rebuild', 'passthrough']) {
+  test(`codex ${mode} keeps borrowed sessions stable without moving home (#1771)`, async (t) => {
+    const { tryAcquireOpenAISlot } = await import('../../src/lib/pool/openai-account-runtime.mjs')
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-borrow-'))
+    const config = { sticky: { enabled: true, mode: 'conversation', outbound_session: mode } }
+    const dataDir = path.join(root, 'data')
+    let sticky = new StickyRouter({ dataDir, config })
+    const leases = []
+    t.after(() => {
+      for (const lease of leases) lease.release()
+      sticky.db.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+    let clock = Date.now()
+    t.mock.method(Date, 'now', () => clock)
+    const headers = { 'x-session-id': 'synthetic-borrow-conversation' }
+    const body = { model: 'gpt-5.4', input: 'synthetic input', stream: false, prompt_cache_key: 'caller-cache' }
+    const routing = { ...config, codex: { quota: { max_concurrency: 1, max_rpm: 0 } } }
+    const request = async (vmId, requestHeaders = headers) => {
+      clock += 100
+      const result = await hopCodex({
+        root,
+        stickyRouter: sticky,
+        routing,
+        headers: requestHeaders,
+        body,
+        onHop: ({ exec }) => {
+          assert.equal(exec.vmId, vmId)
+          return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_synthetic' } }
+        },
+      })
+      assert.equal(result.res.statusCode, 200)
+      assert.equal(result.envelopes.length, 1)
+      const envelope = result.envelopes[0]
+      assert.equal(envelope.body.prompt_cache_key, mode === 'rebuild' ? envelope.session.session_id : 'caller-cache')
+      return envelope.session.session_id
+    }
+    const occupy = (vmId) => {
+      const lease = tryAcquireOpenAISlot(vmId, { concurrency: 1, maxRpm: 0 })
+      assert.ok(lease)
+      leases.push(lease)
+      return lease
+    }
+    writeGptVm(root, 'vm-gpt-a')
+    const homeSession = await request('vm-gpt-a')
+    const key = sticky.extractPoolKey({ headers, apiKeyKind: 'user' }, body, { platform: 'openai' })
+    const home = sticky.resolve(key)
+    assert.equal(home.vmId, 'vm-gpt-a')
+    assert.equal(home.sessionId, homeSession)
+    const homeLease = occupy('vm-gpt-a')
+    writeGptVm(root, 'vm-gpt-b')
+    const borrowed = await request('vm-gpt-b')
+    assert.deepEqual(sticky.resolve(key), home, 'borrowing must preserve home identity and generation')
+    assert.equal(await request('vm-gpt-b'), borrowed, 'repeat borrowing must reuse the outbound session')
+    // Persistence, not a process-local borrower cache, supplies the stable epoch.
+    sticky.db.close()
+    sticky = new StickyRouter({ dataDir, config })
+    assert.equal(await request('vm-gpt-b'), borrowed, 'reopening the router must preserve borrower identity')
+    const borrowerLease = occupy('vm-gpt-b')
+    writeGptVm(root, 'vm-gpt-c')
+    const otherBorrower = await request('vm-gpt-c')
+    assert.deepEqual(sticky.resolve(key), home)
+    if (mode === 'rebuild') {
+      assert.notEqual(borrowed, homeSession)
+      assert.notEqual(otherBorrower, borrowed, 'different borrowers must not share cache identity')
+    } else {
+      assert.equal(borrowed, headers['x-session-id'])
+      assert.equal(otherBorrower, borrowed)
+    }
+    borrowerLease.release()
+    occupy('vm-gpt-c')
+    homeLease.release()
+    assert.equal(await request('vm-gpt-a'), homeSession, 'returning home must reuse the original session')
+    // Explicit migration and return may preserve the session but must change its generation.
+    sticky.bind(key, { vmId: 'vm-gpt-c', accountId: 'vm-gpt-c', sessionId: homeSession }, { allowMove: true })
+    sticky.bind(key, { vmId: 'vm-gpt-a', accountId: 'vm-gpt-a', sessionId: homeSession }, { allowMove: true })
+    assert.ok(sticky.resolve(key).generation > home.generation)
+    occupy('vm-gpt-a')
+    const newGeneration = await request('vm-gpt-b')
+    if (mode === 'rebuild') assert.notEqual(newGeneration, borrowed, 'a new home generation must remint')
+    assert.equal(await request('vm-gpt-b'), newGeneration)
+  })
+}
 
 test('codex rebuild remints session after failover to another slot', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
