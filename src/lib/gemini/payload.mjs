@@ -7,6 +7,13 @@ import { pipeline } from 'node:stream/promises'
 
 export const AGY_SHA256 = '39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43'
 export const CRAG_GEMINI_PRODUCT = 'craggemini'
+export function supportsGeminiRuntime(
+  platform = process.platform,
+  arch = process.arch,
+  emulation = process.env.VM2API_GEMINI_AMD64_EMULATION,
+) {
+  return platform === 'linux' && (arch === 'x64' || (arch === 'arm64' && emulation === '1'))
+}
 const PAYLOAD_DOMAIN = Buffer.from('CRAG-PAYLOAD-V1\0')
 const GEMINI_PAYLOAD_VERSIONS = new Set(['0.3.0-rc.1', '0.3.0-rc.2', '0.3.0-rc.3', '0.3.0'])
 const LEGACY_FILES = new Map([
@@ -295,8 +302,9 @@ export async function verifyGeminiPayload(source, publicKey) {
 }
 
 export async function installGeminiPayload(source, destination, publicKey) {
-  if (process.platform !== 'linux' || process.arch !== 'x64') reject('gemini_payload_unsupported_host')
+  if (!supportsGeminiRuntime()) reject('gemini_payload_unsupported_host')
   const parsed = await readSignedGeminiManifest(source, publicKey)
+  if (process.arch === 'arm64' && parsed.mode !== 'crag_subscription') reject('gemini_payload_unsupported_host')
   if (parsed.mode === 'crag_subscription') {
     const bundledPem = await readSmall(path.join(source, 'crag-license-public.pem'), 4096)
     if (!rawEd25519Bytes(createPublicKey(bundledPem)).equals(parsed.authority.publicKeyBytes)) {

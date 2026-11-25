@@ -11,7 +11,7 @@ import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { dispatchGeminiNativeTurn, prepareGeminiNativeTurn } from '../../src/lib/gemini/native-turn.mjs'
-import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest } from '../../src/lib/gemini/payload.mjs'
+import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest, verifyGeminiPayload } from '../../src/lib/gemini/payload.mjs'
 import {
   createGeminiPanelHandler,
   callGeminiHost,
@@ -1391,7 +1391,11 @@ test('host installer refuses an unsigned manifest and never activates damaged pa
   assert.equal((await readSignedGeminiManifest(source, verificationKey)).manifest.version, '0.3.0-rc.1')
   await writeFile(path.join(source, 'craggemini'), 'elf')
   await writeFile(path.join(source, 'libagy_bridge.so'), 'bad')
-  await assert.rejects(installGeminiPayload(source, destination, verificationKey), /gemini_payload_member_mismatch/)
+  await assert.rejects(verifyGeminiPayload(source, verificationKey), /gemini_payload_member_mismatch/)
+  const installError = process.platform === 'linux' && process.arch === 'x64'
+    ? /gemini_payload_member_mismatch/
+    : /gemini_payload_unsupported_host/
+  await assert.rejects(installGeminiPayload(source, destination, verificationKey), installError)
   await assert.rejects(writeFile(path.join(destination, 'unexpected'), 'no'), { code: 'ENOENT' })
   for (const version of ['0.3.0-rc.2', '0.3.0-rc.3', '0.3.0-rc.4']) {
     const bytes = Buffer.from(JSON.stringify({ ...manifest, version }))

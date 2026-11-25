@@ -381,8 +381,10 @@ def main():
     parser.add_argument("--reuse-agy", type=Path, default=None)
     args = parser.parse_args()
     try:
-        if sys.platform != "linux" or platform.machine() not in ("x86_64", "amd64"):
-            raise RuntimeError("default Gemini payload requires Linux amd64")
+        machine = platform.machine()
+        emulated = machine in ("aarch64", "arm64") and os.environ.get("VM2API_GEMINI_AMD64_EMULATION") == "1"
+        if sys.platform != "linux" or (machine not in ("x86_64", "amd64") and not emulated):
+            raise RuntimeError("default Gemini payload requires Linux amd64 or opt-in ARM64 emulation")
         os.umask(0o077)
         pins = read_pins(args.manifest)
         if args.tag and args.tag != pins["tag"]:

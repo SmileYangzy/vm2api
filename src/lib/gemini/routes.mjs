@@ -19,6 +19,7 @@ import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini
 import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
+import { supportsGeminiRuntime } from './payload.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
@@ -129,6 +130,7 @@ const PAYLOAD_ISSUES = new Set([
   'gemini_payload_source_missing',
   'gemini_payload_incomplete',
   'gemini_payload_invalid',
+  'gemini_emulation_not_ready',
   'gemini_payload_not_installed',
   'gemini_release_not_configured',
   'gemini_release_invalid',
@@ -150,7 +152,7 @@ const HOST_ERRORS = {
   gemini_host_socket_refused: [503, 'Gemini 控制 socket 拒绝连接，请检查宿主服务状态'],
   gemini_host_socket_denied: [503, '控制面无权访问 Gemini 控制 socket，请检查 vm2api 组和目录权限'],
   gemini_host_timeout: [503, 'Gemini 宿主服务响应超时，请检查宿主服务日志'],
-  gemini_host_unsupported_platform: [503, 'Gemini 宿主服务只支持 Linux amd64'],
+  gemini_host_unsupported_platform: [503, 'Gemini 需要 Linux amd64，或显式启用并通过宿主检查的 ARM64 仿真模式'],
   gemini_host_invalid_socket: [503, 'Gemini 控制 socket 必须使用绝对路径'],
   [PROTOCOL_ERROR]: [503, 'Gemini 宿主服务响应格式不兼容，请对齐控制面和宿主服务版本'],
   gemini_payload_not_configured: [503, '未找到 Gemini 签名载荷或发行公钥，请先配置宿主安装源'],
@@ -158,6 +160,7 @@ const HOST_ERRORS = {
   gemini_payload_source_missing: [503, '缺少 Gemini 签名载荷，请配置已解包的安装源'],
   gemini_payload_incomplete: [503, 'Gemini 签名载荷不完整，请检查 agy、CRAGGemini 和清单文件'],
   gemini_payload_invalid: [503, 'Gemini 载荷安装或校验失败，请检查宿主服务日志'],
+  gemini_emulation_not_ready: [503, 'ARM64 Gemini 沙箱运行检查未通过，请查看宿主服务日志；未就绪前不要兑换'],
   gemini_payload_not_installed: [503, '请先在宿主机安装 Gemini 签名载荷，再兑换内核'],
   gemini_release_not_configured: [503, '此宿主机尚未配置当前版本的 CRAGGemini 授权'],
   gemini_release_invalid: [503, '宿主机的 CRAGGemini 授权配置无效，请联系部署管理员'],
@@ -326,7 +329,7 @@ export function officialGeminiAuthUrl(value) {
 }
 
 function hostRequest(socketPath, operation, payload) {
-  if (process.platform !== 'linux' || process.arch !== 'x64') throw hostError('gemini_host_unsupported_platform')
+  if (!supportsGeminiRuntime()) throw hostError('gemini_host_unsupported_platform')
   if (!path.isAbsolute(socketPath || '')) throw hostError('gemini_host_invalid_socket')
   const terminal = operation.startsWith('terminal-')
   const timeout =
@@ -790,7 +793,7 @@ function boundProxy(proxyPool, environment, options) {
 }
 
 function hostStreamRequest(socketPath, operation, payload, { signal, timeoutMs = 300_000 } = {}) {
-  if (process.platform !== 'linux' || process.arch !== 'x64') throw hostError('gemini_host_unsupported_platform')
+  if (!supportsGeminiRuntime()) throw hostError('gemini_host_unsupported_platform')
   if (!path.isAbsolute(socketPath || '')) throw hostError('gemini_host_invalid_socket')
   const body = JSON.stringify(payload)
   const deadline = AbortSignal.timeout(timeoutMs)
@@ -1018,6 +1021,12 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/redeem`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (process.platform === 'linux' && process.arch === 'arm64') {
+          const host = await callHost('list', {})
+          if (host?.amd64_emulation_ready !== true) {
+            return fail(503, 'gemini_emulation_not_ready', 'ARM64 宿主尚未通过签名载荷和沙箱运行检查，未提交兑换码')
+          }
+        }
         const body = await readBody(req, 2048)
         return ok(await cragSubscription.redeem(body?.redemption_code))
       }

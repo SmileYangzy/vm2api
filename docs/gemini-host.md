@@ -1,6 +1,15 @@
 # Gemini 宿主机候选
 
-Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CLI）。管理员在「导入 → Gemini」激活并创建宿主环境，再从「虚拟机」页管理账号。该组件不创建 VM、Docker 槽或 VM 调度记录。Docker 控制面通过只读挂载的 Unix socket 目录连接宿主服务；不支持 ARM64 或远端集群。
+Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CLI）。管理员在「导入 → Gemini」激活并创建宿主环境，再从「虚拟机」页管理账号。该组件不创建 VM、Docker 槽或 VM 调度记录。Docker 控制面通过只读挂载的 Unix socket 目录连接宿主服务；不支持远端集群。本 fork 的本机 Linux ARM64 实验模式见下。
+
+### ARM64 宿主 + 官方 amd64 载荷（实验）
+
+不是 ARM 原生发行版。只接受默认的官方 CRAG 加密包，保留文件摘要、发行方签名、宿主订阅、Google OAuth 与代理隔离。默认关闭；普通升级不会在 ARM 上自动安装或重启 Gemini。Web 维护服务本版不支持 ARM：其 `kin-egress` 安装流程钉选的是 amd64 二进制，不得用它覆盖 ARM 主机的 helper。
+
+1. 先从经审核的补丁源码执行只读检查：`sudo python3 -IB scripts/gemini-host.py --check-amd64-emulation`。需要启用带 `F` 标志的 `qemu-x86_64` binfmt、宿主上的标准 amd64 动态加载器和 libc，以及 Gemini 专用非特权 UID 能使用的 Bubblewrap PID/IPC/UTS 沙箱。检测使用独立断网命名空间。只在 Docker 中有 x86 库，或只跑通 `agy --version`，都不等于满足条件；检查失败即停，不要关闭 AppArmor 或取消隔离。
+2. 确认使用**含本补丁的控制面**，且宿主安装目录、源码及祖先符合上游 root 所有、不可由其他用户写入的要求。不要给正在使用的 Git 工作树递归改属主。核对宿主 `share/gemini/current` 与控制面看到的目录为同一个，`--crag-host-dir` 指向实际宿主数据挂载内的 `crag-gemini-subscription/public`，`bin/kin-egress` 为本机配套的原生版本。不要把容器内路径直接当成宿主路径。
+3. 在该部署的 `.env` 设置 `VM2API_GEMINI_AMD64_EMULATION=1`，确保控制面收到这个环境变量；在已准备好的源码部署目录执行 `sudo bash deploy/install.sh prepare-gemini --dir /实际安装目录`。安装器先检查宿主隔离，再安装本机服务，并在独立的空授权目录内验证 `agy` 版本和签名启动器的 `license_required` 回应；不使用兑换码。关闭实验时，撤去控制面开关并停止此实验创建的 Gemini 宿主服务；保留授权、数据和原有 Claude 槽。
+4. 在 ARM 控制面，兑换 API 先通过本机 socket 检查宿主是否实际验过签名载荷、沙箱内的 `agy` 和空许可证响应。旧宿主或未就绪时不提交兑换码。只有通过后才在预定长期使用的宿主兑换。面板可访问、空许可证检查、授权后 worker 的健康 socket 和真实 Gemini 推理是四项不同的验收。
 
 ## 默认安装与激活
 

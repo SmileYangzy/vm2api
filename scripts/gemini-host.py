@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler
 import ipaddress
 import json
 import os
+import platform
 from pathlib import Path
 import pty
 import pwd
@@ -102,6 +103,69 @@ AUTH_FAILURE = re.compile(
     rb"(invalid authorization code|failed to exchange|authentication failed)", re.I
 )
 SYSTEM_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
+EMULATION_FLAG = "VM2API_GEMINI_AMD64_EMULATION"
+
+
+def is_arm_host():
+    return sys.platform == "linux" and platform.machine() in ("aarch64", "arm64")
+
+
+def check_amd64_emulation(uid, payload=None):
+    if not is_arm_host() or os.geteuid() != 0:
+        raise RuntimeError("Gemini emulation preflight requires a Linux ARM64 host and root to test the sandbox UID")
+    problems = []
+    handler = Path("/proc/sys/fs/binfmt_misc/qemu-x86_64")
+    try:
+        fields = handler.read_text().splitlines()
+        if "enabled" not in fields or not any(line.startswith("flags:") and "F" in line[6:] for line in fields):
+            problems.append("enable a persistent qemu-x86_64 binfmt handler with the F flag")
+    except OSError:
+        problems.append("qemu-x86_64 binfmt handler is missing")
+    loader = "/lib64/ld-linux-x86-64.so.2"
+    multiarch = "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    has_loader = os.access(loader, os.X_OK) and os.path.isfile(multiarch)
+    if not has_loader:
+        problems.append("missing host amd64 loader or libc; the Docker image's private libraries do not count")
+    sandbox = [
+        "unshare", "--net", "--", "setpriv", "--reuid", str(uid), "--regid", str(uid),
+        "--clear-groups", "--no-new-privs", "--inh-caps=-all", "--ambient-caps=-all",
+        "--bounding-set=-all", "bwrap", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+        "--die-with-parent", "--clearenv", "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64",
+        "--ro-bind-try", "/bin", "/bin", "--dev", "/dev", "--proc", "/proc",
+        "--tmpfs", "/tmp", "--chdir", "/tmp", "--setenv", "HOME", "/tmp",
+    ]
+    probes = [(["/usr/bin/true"], None)]
+    if has_loader:
+        probes.append(([loader, "--version"], None))
+    if payload is not None:
+        check_root_owned(payload)
+        sandbox.extend(["--dir", "/opt", "--perms", "0700", "--dir", "/tmp/license", "--dir", "/tmp/host-license"])
+        for name in ("agy", "craggemini", "craggemini.payload.enc", "manifest.json",
+                     "crag-license-public.pem", "libagy_bridge.so"):
+            check_root_owned(payload / name)
+            sandbox.extend(["--ro-bind", str(payload / name), "/opt/" + name])
+        probes.extend([(["/opt/agy", "--version"], "1.5.9"),
+                       (["/opt/craggemini", "--license-status", "--license-dir", "/tmp/license",
+                         "--host-license-dir", "/tmp/host-license"], "license_required")])
+    for executable, expected in probes:
+        try:
+            result = subprocess.run(sandbox + ["--", *executable], stdin=subprocess.DEVNULL, capture_output=True,
+                                    env=SYSTEM_ENV, cwd="/", timeout=10, text=True)
+            if result.returncode:
+                problems.append(f"sandbox {executable[0]}: {result.stderr.strip()[:240] or result.returncode}")
+                break
+            if expected == "license_required":
+                status = json.loads(result.stdout)
+                if status.get("code") != expected or status.get("valid") is not False:
+                    problems.append("unexpected empty-license status from the emulated launcher")
+            elif expected is not None and result.stdout.strip() != expected:
+                problems.append("unexpected emulated agy version")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            problems.append(f"sandbox: {exc}")
+            break
+    if problems:
+        raise RuntimeError("; ".join(problems))
 PAYLOAD_FILES = (
     "manifest.json",
     "manifest.sig",
@@ -3416,11 +3480,10 @@ class Host:
     def verify_payload(self, source, public_key, install=False):
         check_root_owned(source)
         check_root_owned(public_key)
-        members = (
-            CRAG_PAYLOAD_FILES
-            if self.is_crag_encrypted_payload(source)
-            else PAYLOAD_FILES
-        )
+        crag = self.is_crag_encrypted_payload(source)
+        if is_arm_host() and not crag:
+            raise RuntimeError("ARM64 emulation requires a signed CRAGGemini subscription payload")
+        members = CRAG_PAYLOAD_FILES if crag else PAYLOAD_FILES
         for name in members:
             check_root_owned(source / name)
         output = subprocess.run(
@@ -3435,7 +3498,7 @@ class Host:
             ],
             check=True,
             timeout=35,
-            env=SYSTEM_ENV,
+            env={**SYSTEM_ENV, EMULATION_FLAG: "1"} if is_arm_host() and os.environ.get(EMULATION_FLAG) == "1" else SYSTEM_ENV,
             capture_output=True,
             text=True,
         ).stdout
@@ -3444,6 +3507,13 @@ class Host:
         )
         if not version:
             raise RuntimeError("Unexpected Gemini installer response")
+        if is_arm_host():
+            try:
+                check_amd64_emulation(self.uid_base, self.payload if install else source)
+            except RuntimeError as error:
+                if self.payload_issue != "gemini_emulation_not_ready":
+                    print(f"Gemini ARM64 sandbox: {error}", file=sys.stderr)
+                raise Failure(503, "gemini_emulation_not_ready") from None
         return version[1]
 
     def release_verifier(self, path, optional=False):
@@ -3473,6 +3543,8 @@ class Host:
             read_root_file(source / "manifest.json", 65536 if encrypted else 8192)
         ).hexdigest()
         if encrypted:
+            if is_arm_host() and not self.public_key.is_file():
+                raise Failure(503, "gemini_public_key_missing")
             public_key = (
                 self.public_key
                 if self.public_key.is_file()
@@ -5918,6 +5990,10 @@ class Host:
             self.inspect_payload()
             return {
                 "payload_state": self.payload_state,
+                "amd64_emulation_ready": (
+                    is_arm_host() and self.payload_state == "installed"
+                    and self.payload_mode == "crag_subscription" and self.verified_payload is not None
+                ),
                 "payload_mode": self.payload_mode,
                 "payload_issue": self.payload_issue,
                 "release_activated": self.payload_state == "installed",
@@ -7050,6 +7126,13 @@ def remove_stale_socket(path):
 
 
 def main():
+    if sys.argv[1:2] == ["--check-amd64-emulation"] and len(sys.argv) in (2, 3):
+        try:
+            check_amd64_emulation(29000, Path(sys.argv[2]) if len(sys.argv) == 3 else None)
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from None
+        print("Gemini ARM64: binfmt, sandbox UID isolation and amd64 loader OK (not an inference test)")
+        return
     parser = argparse.ArgumentParser()
     for name in ("state", "payload", "public-key", "egress", "socket"):
         parser.add_argument(f"--{name}", type=Path, required=True)
@@ -7067,6 +7150,13 @@ def main():
         )
     if os.geteuid() != 0 or not 1024 <= args.uid_base <= 65524:
         raise SystemExit("Gemini host setup requires root and a dedicated UID range")
+    if is_arm_host():
+        if os.environ.get(EMULATION_FLAG) != "1":
+            raise SystemExit("Gemini ARM64 emulation is disabled")
+        try:
+            check_amd64_emulation(args.uid_base)
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from None
     os.umask(0o077)
     for uid in range(args.uid_base, args.uid_base + MAX_NETNS_SLOTS + 1):
         try:

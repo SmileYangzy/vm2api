@@ -649,6 +649,7 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
   const callHost = async (op, body) => {
     if (op === 'list') {
       return {
+        amd64_emulation_ready: true,
         payload_state: 'installed',
         payload_mode: 'crag_subscription',
         release_activated: true,
@@ -881,6 +882,7 @@ test('auto-binds CRAGGemini seats on create, panel inventory reconcile, and sche
   const callHost = async (op, body) => {
     if (op === 'list') {
       return {
+        amd64_emulation_ready: true,
         payload_state: 'installed',
         payload_mode: 'crag_subscription',
         release_activated: true,
@@ -1133,8 +1135,8 @@ test('createGeminiCragSubscription defaults to https://www.vm2api.org/gemini and
   const panel = createGeminiPanelHandler({
     json: (_res, status, payload) => ({ status, payload }),
     readBody: async (req) => req.body,
-    cragSubscription: sub,
-    callHost: async () => ({}),
+      cragSubscription: sub,
+      callHost: async () => ({ amd64_emulation_ready: true }),
   })
   const res = { setHeader() {} }
   const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
