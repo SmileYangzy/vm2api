@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { fmtNum, fmtUsd, usedPctOf } from '@/lib/format'
+import { windowProbed } from '@/lib/pool-quota'
 import { cn } from '@/lib/utils'
 import { vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import {
@@ -11,6 +12,7 @@ import {
 } from '@/components/ui/tooltip'
 import {
   ZONES,
+  emptyZoneCounts,
   zoneOf,
   type VmZone,
   type VmZoneFilter,
@@ -43,13 +45,7 @@ type Pulse = {
 }
 
 function computePulse(vms: Vm[], accounts?: UsageAccountRow[]): Pulse {
-  const counts: Record<VmZone, number> = {
-    pool: 0,
-    restricted: 0,
-    off: 0,
-    none: 0,
-    dead: 0,
-  }
+  const counts = emptyZoneCounts()
   const headroom = [0, 0, 0, 0, 0]
   const remains: number[] = []
   let todayCost = 0
@@ -63,7 +59,7 @@ function computePulse(vms: Vm[], accounts?: UsageAccountRow[]): Pulse {
 
   for (const vm of vms) {
     counts[zoneOf(vm)] += 1
-    if (vm.has_token) {
+    if (vm.has_token && (!vm.gemini || windowProbed(vm, '7d'))) {
       const remain = Math.max(0, 100 - usedPctOf(vm, '7d'))
       remains.push(remain)
       headroom[Math.min(4, Math.floor(remain / 20))] += 1
@@ -225,7 +221,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='7d 余量分布'
+        title='7 天窗口余量'
         className='xl:col-span-2'
         meta={
           <span className='text-[13px] leading-none font-[590] tracking-[-0.01em] tabular-nums'>
@@ -282,11 +278,11 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='今日消耗'
+        title='今日消耗 · 北京时间'
         className='xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>
-            7d {fmtUsd(pulse.weekCost, 2)}
+            7 天窗口 {fmtUsd(pulse.weekCost, 2)}
           </span>
         }
       >
@@ -310,7 +306,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='7D 成败'
+        title='7 天窗口成败'
         className='sm:col-span-2 xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>

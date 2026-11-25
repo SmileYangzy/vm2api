@@ -14,7 +14,12 @@ export type ApiKeyItem = {
   key?: string
   revealable?: boolean
   status?: string
-  category?: 'oauth' | 'api'
+  category?: 'oauth' | 'api' | 'all'
+  api_endpoint_id?: string | null
+  permission_tier?: 'platform' | 'tenant' | 'resource'
+  owner_id?: string | null
+  allowed_endpoints?: string[]
+  allowed_gemini_envs?: string[]
   max_concurrency?: number
   quota_requests?: number
   quota_used?: number
@@ -28,7 +33,7 @@ export type ApiKeyItem = {
   requests?: number
   inflight?: number
   /** all = 全局可调度。anthropic / openai 必须带 allowed_vms。 */
-  group_type?: 'all' | 'anthropic' | 'openai'
+  group_type?: 'all' | 'anthropic' | 'openai' | 'gemini'
   allowed_vms?: string[]
   vm_pool_id?: string | null
   vm_pool_name?: string | null

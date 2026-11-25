@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -13,6 +16,7 @@ import {
   resolveCacheTtl,
   stripIllegalCacheControlFields,
   normalizeCacheTtlToBody,
+  materializeAutomaticCache,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { calculateCost } from '../../src/lib/admin/pricing.mjs'
 
@@ -50,8 +54,23 @@ test('the first explicit TTL in Anthropic wire order controls session resolution
   }
   assert.equal(
     resolveCacheTtl({ headers: {}, body: implicitFirst, routing: { compatibility: { cache_ttl: '1h' } } }),
-    '5m',
+    '1h',
   )
+})
+
+test('resolveCacheTtl falls back to routingFile when routing object omits cache_ttl', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cache-ttl-file-'))
+  try {
+    const file = path.join(dir, 'routing.json')
+    fs.writeFileSync(file, JSON.stringify({ compatibility: { cache_ttl: '5m' } }))
+    assert.equal(resolveCacheTtl({ headers: {}, routing: {}, routingFile: file }), '5m')
+    fs.writeFileSync(file, JSON.stringify({ compatibility: { cache_ttl: '1h' } }))
+    const future = new Date(Date.now() + 2000)
+    fs.utimesSync(file, future, future)
+    assert.equal(resolveCacheTtl({ headers: {}, routing: {}, routingFile: file }), '1h')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('ttl-less callers leave the platform default selection to the settings menu', () => {
@@ -406,4 +425,26 @@ test('default 5m usage stays in the 1.25x bucket', () => {
   assert.equal(out.cache_ttl, '5m')
   const billed = calculateCost(out, 'claude-sonnet-5')
   assert.equal(billed.cache_creation_cost, 0.005)
+})
+
+test('materializeAutomaticCache leaves a body without the field alone', () => {
+  // Hops call it unconditionally, so a body with no automatic cache policy must
+  // come back untouched rather than gaining an empty marker.
+  const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }] }] }
+  assert.equal(materializeAutomaticCache(body), body)
+  const nulled = { ...body, cache_control: null }
+  const out = materializeAutomaticCache(nulled)
+  assert.equal('cache_control' in out, false)
+  assert.equal(out.messages[0].content[0].cache_control, undefined)
+})
+
+test('materializeAutomaticCache defers to an explicit tail marker', () => {
+  const explicit = { type: 'ephemeral', ttl: '1h' }
+  const out = materializeAutomaticCache({
+    cache_control: { type: 'ephemeral' },
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'a', cache_control: explicit }] }],
+  })
+  // The tail already caches the whole eligible prefix; the root marker just goes.
+  assert.equal('cache_control' in out, false)
+  assert.deepEqual(out.messages[0].content[0].cache_control, explicit)
 })

@@ -35,6 +35,7 @@ export const ErrorCode = {
   // body
   INVALID_JSON: 'invalid_json',
   BODY_TOO_LARGE: 'body_too_large',
+  IMAGE_TOO_LARGE: 'image_too_large',
   EMPTY_BODY: 'empty_body',
   MISSING_FIELD: 'missing_field',
   INVALID_FIELD: 'invalid_field',
@@ -59,18 +60,24 @@ export const ErrorCode = {
   VM_POOL_UNAVAILABLE: 'vm_pool_unavailable',
   API_BACKEND_FORBIDDEN: 'api_backend_forbidden',
   CLAUDE_CODE_ONLY: 'claude_code_only',
+  CLIENT_BLOCKED: 'client_blocked',
   // upstream
   UPSTREAM_AUTH: 'upstream_auth_error',
   UPSTREAM_RATE_LIMIT: 'upstream_rate_limit',
   UPSTREAM_INVALID: 'upstream_invalid_request',
   UPSTREAM_OVERLOADED: 'upstream_overloaded',
   UPSTREAM_TIMEOUT: 'upstream_timeout',
+  REQUEST_QUARANTINED: 'request_quarantined',
+  REQUEST_TOO_LARGE_FOR_SLOT: 'request_too_large_for_slot',
   UPSTREAM_ERROR: 'upstream_error',
   UPSTREAM_NETWORK: 'upstream_network_error',
   UPSTREAM_STREAM_INTERRUPTED: 'upstream_stream_interrupted',
   UPSTREAM_EMPTY_STREAM: 'upstream_empty_stream',
   CLI_ERROR: 'cli_error',
   KERNEL_UNAVAILABLE: 'kernel_unavailable',
+  SLOT_OAUTH_UNAVAILABLE: 'slot_oauth_unavailable',
+  CLUSTER_SLOT_RECONNECTING: 'cluster_slot_reconnecting',
+  CLUSTER_DELIVERY_UNCONFIRMED: 'cluster_delivery_unconfirmed',
   KERNEL_ERROR: 'kernel_error',
   FABLE_REQUIRES_MAX: 'fable_requires_max',
   NATIVE_HANDOFF_MISSING: 'native_handoff_missing',
@@ -88,6 +95,7 @@ export const ErrorCode = {
   DISTILL_BLOCKED: 'distill_blocked',
   REFUSAL_GUARD: 'refusal_guard',
   CONTENT_FILTER_REFUSAL: 'content_filter_refusal',
+  THIRD_PARTY_CLIENT: 'third_party_client',
   POLICY_BLOCKED: 'policy_blocked',
   // resource
   VM_NOT_FOUND: 'vm_not_found',
@@ -114,6 +122,8 @@ export const KERNEL_FAILURE_STATUS = Object.freeze({
   [ErrorCode.CLI_ERROR]: 502,
   [ErrorCode.KERNEL_ERROR]: 502,
   [ErrorCode.KERNEL_UNAVAILABLE]: 503,
+  [ErrorCode.CLUSTER_SLOT_RECONNECTING]: 503,
+  [ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED]: 502,
   [ErrorCode.NATIVE_HANDOFF_MISSING]: 502,
   [ErrorCode.NATIVE_HANDOFF_INVALID]: 502,
   [ErrorCode.NATIVE_HANDOFF_CONFLICT]: 502,
@@ -123,6 +133,7 @@ export const KERNEL_FAILURE_STATUS = Object.freeze({
 export const CLIENT_POOL_BUSY_MESSAGE = '号池负载过高，稍后再试'
 export const CLIENT_POOL_UNAVAILABLE_MESSAGE = '号池当前没有可用账号'
 export const CLIENT_POOL_RATE_LIMITED_MESSAGE = '号池账号均被上游限流，稍后再试'
+export const CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE = '号池中暂无可用 Fable 额度，请等待额度重置'
 
 /**
  * Capacity: every eligible seat stayed busy until the bounded wait ran out, the
@@ -138,18 +149,35 @@ const POOL_OVERLOADED_CODES = new Set([
 const POOL_RATE_LIMITED_CODES = new Set(['pool_rate_limited'])
 /** Nothing eligible to wait for: configuration, quota, credentials, or model gates. */
 const POOL_UNAVAILABLE_CODES = new Set([
+  ErrorCode.POOL_UNAVAILABLE,
+  ErrorCode.SLOT_OAUTH_UNAVAILABLE,
   'account_pool_exhausted',
   'api_pool_exhausted',
   'no_available_accounts',
   'no_eligible_accounts',
 ])
 
+export function isClaudeSlotOAuthError(body) {
+  if (!body?.error && body?.type !== 'error') return false
+  const error = body.error
+  if (
+    [body.code, error?.code, error?.upstream_code].some(
+      (code) => code === 'NO_ACCOUNT' || code === ErrorCode.SLOT_OAUTH_UNAVAILABLE,
+    )
+  ) {
+    return true
+  }
+  const message = typeof error === 'string' ? error : error?.message || body.message
+  return typeof message === 'string' && /\bNo signed-in Claude account found\b/i.test(message)
+}
+
 const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没有|无可用账号|eligible claude/i
 const WRAP_CONNECTION_MESSAGE = /provider error:.*connection error/i
 const USAGE_POLICY_MESSAGE =
   /usage policy|legal\/aup|unable to respond to this request|violate our usage|content_filter_refusal/i
-// Billing refusal, not a content violation and not "extra usage required".
-const UNANSWERABLE_PROMPT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
+// Anthropic bills a non-Claude-Code client against extra usage and refuses it
+// when the seat has none. A client/billing rejection, not a content refusal.
+const THIRD_PARTY_CLIENT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
 
 export function isWrapConnectionError(message = '') {
   return WRAP_CONNECTION_MESSAGE.test(String(message || ''))
@@ -159,10 +187,55 @@ export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
 }
 
-/** Usage Policy text, or a 400/503 the upstream will not answer for this prompt. */
+/** Usage Policy text the upstream will not answer for this prompt. */
 export function isUnanswerablePromptMessage(message = '') {
+  return USAGE_POLICY_MESSAGE.test(String(message || ''))
+}
+
+/** "Third-party apps now draw from your extra usage": the caller is not Claude Code. */
+export function isThirdPartyClientMessage(message = '') {
   const text = String(message || '')
-  return USAGE_POLICY_MESSAGE.test(text) || UNANSWERABLE_PROMPT_MESSAGE.test(text)
+  return THIRD_PARTY_CLIENT_MESSAGE.test(text) && !USAGE_POLICY_MESSAGE.test(text)
+}
+
+export const THIRD_PARTY_CLIENT_CLIENT_MESSAGE =
+  '上游将此请求识别为第三方客户端调用，不按订阅额度计费，已拒绝。这不是内容拒答；原样重试会得到同样结果。'
+
+export const IMAGE_TOO_LARGE_MESSAGE = '图片过大,调整上传图片'
+
+const IMAGE_DIMENSIONS_TOO_LARGE_MESSAGE = /image dimensions? exceed max allowed size/i
+
+export function isImageDimensionsTooLargeMessage(message = '') {
+  return IMAGE_DIMENSIONS_TOO_LARGE_MESSAGE.test(String(message || ''))
+}
+
+export function makeImageTooLargeError({ param, details = {}, requestId } = {}) {
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.IMAGE_TOO_LARGE,
+    message: IMAGE_TOO_LARGE_MESSAGE,
+    param,
+    status: 400,
+    details: { ...details, retryable: false },
+    request_id: requestId,
+  })
+}
+
+/** Non-retryable client error that keeps the upstream sentence. */
+export function makeThirdPartyClientError({ requestId, upstreamMessage, upstreamType, upstreamStatus } = {}) {
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.THIRD_PARTY_CLIENT,
+    message: THIRD_PARTY_CLIENT_CLIENT_MESSAGE,
+    status: 400,
+    details: {
+      upstream_message: String(upstreamMessage || '').slice(0, 300),
+      upstream_type: upstreamType,
+      upstream_status: upstreamStatus,
+      retryable: false,
+    },
+    request_id: requestId,
+  })
 }
 
 export const REFUSAL_GUARD_MESSAGE =
@@ -172,6 +245,7 @@ const REFUSAL_GUARD_MESSAGES = Object.freeze({
   exact: REFUSAL_GUARD_MESSAGE,
   similar: `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似。`,
   device: `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁。`,
+  session: `${REFUSAL_GUARD_MESSAGE} 这个会话此前被上游拒答。`,
   upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
 })
 
@@ -207,6 +281,7 @@ export function makeRefusalGuardError({
  */
 export function poolErrorKind(code, message = '') {
   const key = String(code || '').trim()
+  if (key === 'pool_fable_rate_limited') return 'fable_rate_limited'
   if (POOL_OVERLOADED_CODES.has(key)) return 'overloaded'
   if (POOL_RATE_LIMITED_CODES.has(key)) return 'rate_limited'
   if (POOL_UNAVAILABLE_CODES.has(key)) return 'unavailable'
@@ -230,12 +305,13 @@ function poolClientError(kind) {
       retryAfterSec: 1,
     }
   }
-  if (kind === 'rate_limited') {
+  if (kind === 'rate_limited' || kind === 'fable_rate_limited') {
     return {
       ...makeError({
         type: ErrorType.RATE_LIMIT,
         code: ErrorCode.UPSTREAM_RATE_LIMIT,
-        message: CLIENT_POOL_RATE_LIMITED_MESSAGE,
+        message:
+          kind === 'fable_rate_limited' ? CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE : CLIENT_POOL_RATE_LIMITED_MESSAGE,
         status: 429,
       }),
       // The caller raises it to the earliest rate-limit reset.
@@ -359,7 +435,7 @@ export function assistantStopReason(result = {}) {
 }
 
 /**
- * sub2api: message_stop ends the stream even when the body has no visible text.
+ * message_stop ends the stream even when the body has no visible text.
  * Without that terminal event, stop_reason plus visible text/tool/refusal is required.
  * Thinking-only and a bare stop_reason are not complete.
  */
@@ -367,12 +443,17 @@ export function isCompleteAssistantMessage(result = {}) {
   const body = result?.body && typeof result.body === 'object' ? result.body : result
   if (!isAssistantMessageBody(body)) return false
   if (result?.nativeHandoff) {
+    const facts = result.providerResult
+    const complete = facts?.schema_version === 2 ? facts.provider_complete === true : facts?.usage_complete === true
     return (
       result.ok === true &&
-      result.providerResult?.usage_complete === true &&
-      !result.providerResult.error &&
-      result.providerResult.message_id === body.id &&
-      result.providerResult.stop_reason === assistantStopReason(result)
+      complete &&
+      !facts.error &&
+      !facts.delivery_error &&
+      facts.response_valid !== false &&
+      (facts.schema_version !== 2 || facts.stop_reason !== 'tool_use' || facts.handoff_complete === true) &&
+      facts.message_id === body.id &&
+      facts.stop_reason === assistantStopReason(result)
     )
   }
   if (result?.sawMessageStop) return true
@@ -436,6 +517,71 @@ export function incompleteAssistantClientError(result = {}) {
   }
 }
 
+/**
+ * The terminal hint to carry on a relayed upstream error, if any.
+ *
+ * `respond.mjs` turns `details.retryable === false` into `x-should-retry: false`,
+ * which is the only thing that stops an SDK client from retrying. Relaying used to
+ * rebuild `details` from scratch, so a verdict the kernel had already issued never
+ * reached the client (#1215). Capacity errors are excluded on purpose: a 429/529
+ * carries the panel's own Retry-After and a client is meant to come back.
+ */
+const PARTIAL_CONTINUATION_DETAIL_KEYS = [
+  'prior_reason',
+  'interrupted_at',
+  'retry_after_sec',
+  'recovery_attempts',
+  'max_recoveries',
+  'recovery_exhausted',
+]
+
+function partialContinuationRelayDetails(body) {
+  const src = body?.error?.details
+  if (!src || typeof src !== 'object' || Array.isArray(src)) return {}
+  const picked = {}
+  for (const key of PARTIAL_CONTINUATION_DETAIL_KEYS) {
+    const value = src[key]
+    if (
+      typeof value === 'string' ||
+      (typeof value === 'number' && Number.isFinite(value)) ||
+      typeof value === 'boolean'
+    ) {
+      picked[key] = value
+    }
+  }
+  return picked
+}
+
+const CONTINUATION_GONE_REASONS = new Set([
+  'waiting_expired',
+  'handoff_expired',
+  'receipt_expired',
+  'cancelled',
+])
+
+function terminalRelayDetails(status, body) {
+  // CRAG names a submission whose partial output cannot be replayed with this
+  // exact type. The verdict is the kernel's own, so the 409 carrying it is as
+  // terminal as a 410 even when the body omits the flag (#1518). Forward safe
+  // diagnostic metadata (cooldown, prior reason, recovery budget) while keeping
+  // retryable: false so SDK auto-retries stay disabled. Other 409s stay
+  // untouched: a conflict the panel has not declared terminal may well clear.
+  if (status === 409 && body?.error?.type === 'partial_provider_output_nonretryable') {
+    return { ...partialContinuationRelayDetails(body), retryable: false }
+  }
+  // 410 Gone is terminal by definition. An expired tool continuation cannot be
+  // revived, so every retry of the same hop can only answer 410 again; forward
+  // only allowlisted kernel-supplied expiration reasons (#1215).
+  if (status === 410) {
+    const reason = body?.error?.details?.reason
+    return typeof reason === 'string' && CONTINUATION_GONE_REASONS.has(reason)
+      ? { retryable: false, reason }
+      : { retryable: false }
+  }
+  if (body?.error?.details?.retryable === false) return { retryable: false }
+  return {}
+}
+
 export function mapUpstreamError(status, body, headers = {}) {
   const upType = upstreamErrorType(body)
   const inboundCode = body?.error?.code || null
@@ -446,9 +592,25 @@ export function mapUpstreamError(status, body, headers = {}) {
       'classifier_invalid_cache',
       'invalid_request_context',
       'invalid_kernel_request',
+      'unsupported_capability',
+      'thinking_incompatible',
+      ErrorCode.IMAGE_TOO_LARGE,
     ].includes(inboundCode)
   ) {
-    return makeError({ type: ErrorType.INVALID_REQUEST, code: inboundCode, message: body.error.message, status: 400 })
+    return makeError({
+      type: ErrorType.INVALID_REQUEST,
+      code: inboundCode,
+      message: body.error.message,
+      status: 400,
+      ...(['thinking_incompatible', 'unsupported_capability', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) &&
+      body?.error?.param
+        ? { param: body.error.param }
+        : {}),
+      ...(['thinking_incompatible', 'unsupported_capability', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) &&
+      body?.error?.details
+        ? { details: body.error.details }
+        : {}),
+    })
   }
   let msg =
     body?.error?.message ||
@@ -456,7 +618,11 @@ export function mapUpstreamError(status, body, headers = {}) {
     (upType ? body?.message : null) ||
     body?.raw ||
     null
-  if (/^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(inboundCode)) {
+  if (
+    /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+      inboundCode,
+    )
+  ) {
     return makeError({
       type: ErrorType.PERMISSION,
       code: inboundCode,
@@ -497,7 +663,16 @@ export function mapUpstreamError(status, body, headers = {}) {
   }
   // Kernel slot busy on the last hop is capacity, same as a full pool queue.
   if (inboundCode === 'slot_busy' || /rust kernel has no free slot/i.test(String(msg || ''))) {
-    return poolClientError('overloaded')
+    const out = poolClientError('overloaded')
+    // Name the local CRAG queue so a 529 here is not read as provider overload (#1213).
+    const queue = /runtime queue (timeout|is full)/i.exec(String(msg || ''))
+    if (queue) {
+      out.body.error.details = {
+        source: 'local_kernel_queue',
+        reason: queue[1].toLowerCase() === 'timeout' ? 'runtime_queue_timeout' : 'runtime_queue_full',
+      }
+    }
+    return out
   }
   if (
     inboundCode === 'wrap_connection_error' ||
@@ -552,6 +727,14 @@ export function mapUpstreamError(status, body, headers = {}) {
         ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
       },
       request_id,
+    })
+  }
+  if (isThirdPartyClientMessage(msg)) {
+    return makeThirdPartyClientError({
+      requestId: request_id,
+      upstreamMessage: msg,
+      upstreamType: upType,
+      upstreamStatus: status,
     })
   }
   if (isUnanswerablePromptMessage(msg)) {
@@ -631,6 +814,18 @@ export function mapUpstreamError(status, body, headers = {}) {
     }
   }
 
+  if (isImageDimensionsTooLargeMessage(msg)) {
+    return makeImageTooLargeError({
+      requestId: request_id,
+      param: body?.error?.param || undefined,
+      details: {
+        upstream_message: String(msg).slice(0, 300),
+        upstream_type: upType,
+        upstream_status: status,
+      },
+    })
+  }
+
   if (inboundCode === ErrorCode.UPSTREAM_INVALID || status === 400 || upType === 'invalid_request_error') {
     return makeError({
       type: ErrorType.INVALID_REQUEST,
@@ -647,6 +842,7 @@ export function mapUpstreamError(status, body, headers = {}) {
         upstream_type: upType,
         upstream_status: status,
         ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
+        ...terminalRelayDetails(status, body),
       },
       request_id,
     })
@@ -711,6 +907,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       upstream_type: upType,
       upstream_status: status,
       ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
+      ...terminalRelayDetails(status, body),
     },
     request_id,
   })

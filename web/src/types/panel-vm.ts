@@ -1,3 +1,4 @@
+import type { GeminiEnvironment } from '@/features/import/gemini-environments'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -55,6 +56,8 @@ export type VmProxySnap = {
   scheme?: string
   /** 透明 TCP 把唯一 DNS 应答改写成 SOCKS 主机名。默认关。 */
   domain_forward?: boolean
+  /** 让 SVCB(64)/HTTPS(65) 返回空答案，屏蔽 HTTP/3 与加密 SNI 探测。按条生效，默认关。 */
+  dns_disable_svcb_https?: boolean
   /** 出口地理位置（IPv4）；从未检测过为 null。 */
   geo?: ProxyGeo | null
   /** 公网 IPv6 出口地理位置；从未检测过为 null。 */
@@ -70,6 +73,13 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type VmCodexCredits = {
+  has_credits?: boolean
+  unlimited?: boolean
+  balance?: string | number | null
+  fetched_at?: string | number | null
+}
+
 export type CragLicenseStatus = {
   status:
     | 'unlicensed'
@@ -82,10 +92,11 @@ export type CragLicenseStatus = {
   vm_id: string
   /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
   kind?: 'offline' | 'online'
-  /** kernel: one offline code covers every slot and machine. device: one VM. */
-  scope?: 'kernel' | 'device'
+  /** kernel: all slots; device: one VM; host: one subscription seat. */
+  scope?: 'kernel' | 'device' | 'host'
+  seat?: number
   license_id?: string
-  term?: '1m' | '6m' | '1y'
+  term?: '1m' | '3m' | '6m' | '1y'
   /** Signed UTC epoch seconds, not browser-local timestamps. */
   issued_at?: number
   not_before?: number
@@ -97,6 +108,7 @@ export type CragLicenseStatus = {
 export type CragLicenseResponse = {
   license: CragLicenseStatus
   machine_code: string
+  payload_key_id?: string
 }
 
 export type VmTelemetryState = {
@@ -112,6 +124,13 @@ export type VmTelemetryState = {
   pending_events: number
   last_upload_at: string | null
   last_error: string | null
+}
+
+export type CragTelemetryState = {
+  state: 'launch_policy'
+  enabled: boolean | null
+  error: string | null
+  upload_confirmed: false
 }
 
 export type VmKernelHealth = {
@@ -136,7 +155,7 @@ export type VmKernelSnapshot = {
   credential_owner?: string | null
   credential_state?: string | null
   proxy_state?: string | null
-  telemetry?: VmTelemetryState | null
+  telemetry?: VmTelemetryState | CragTelemetryState | null
   process_topology?: {
     rust_pid1?: boolean
     go_worker_pid1?: boolean
@@ -174,6 +193,8 @@ export type KvmProbe = {
 export type VmCreateOptions = {
   vm: unknown
   kvm: KvmProbe
+  /** CRAG support for this machine only; cluster nodes use their placement preflight. */
+  crag_supported: boolean
 }
 
 export type VmSmbios = {
@@ -237,12 +258,24 @@ export type SeatOccupant = {
   state: 'active' | 'held' | 'idle' | string
   inflight: number
   held_until?: number | null
+  subagents_running?: number
+  subagents_queued?: number
+  subagents_max?: number | null
 }
 
 export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
+export type QuotaObservation = {
+  utilization: number | null
+  status: string | null
+  reset: string | null
+  sampled_at: string | null
+  stale: boolean
+}
+
 export type Vm = {
   id: string
+  gemini?: GeminiEnvironment
   name?: string
   owner_user_id?: string | null
   /** 所在集群节点；null / 缺省 = 本机。 */
@@ -302,15 +335,27 @@ export type Vm = {
   unschedulable_reason?: string | null
   unschedulable_text?: string | null
   unschedulable_detail?: Record<string, unknown> | null
+  /** 进入不可调度（含吊销）的时刻，ISO 字符串 */
+  unschedulable_at?: string | null
   schedule_off?: boolean
   schedule_hold?: {
     reason: string
     detail?: Record<string, unknown> | null
   } | null
-  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  /** Claude 单元熔断（Codex 为 null）。连续 400/403/5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
+  /** Mutable stored quota state: official windows may be reconciled from headers. */
+  quota_observations?: {
+    official:
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
+    passive: Record<'5h' | '7d', QuotaObservation | null>
+  } | null
   utilization_5h?: number | null
   utilization_7d?: number | null
   utilization_7d_oi?: number
@@ -324,8 +369,11 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
+      label?: string
       used_percent?: number | null
       reset_at?: string | null
+      reset_after_seconds?: number | null
+      window_minutes?: number | null
     }>
     quota?: {
       utilization_5h?: number | null
@@ -343,6 +391,7 @@ export type Vm = {
     credits?: Array<{ expires_at?: string }>
     fetched_at?: string
   } | null
+  codex_credits?: VmCodexCredits | null
   /** 限额重置按钮。setup-token 标签但 scope 含 user:profile 时也为 true。 */
   can_claude_reset?: boolean
   claude_reset_credits?: {
@@ -376,6 +425,14 @@ export type Vm = {
   rate_limit_tier?: string | null
   /** Whether official usage lists a Fable window; not a subscription identifier. */
   usage_has_fable?: boolean | null
+  /** 开了 pool.fable_requires_max 且本槽不是 Max：Fable 不会派到这里。 */
+  fable_requires_max?: boolean
+  /** 上游回「Usage credits are required」后 Fable 暂停调度到此槽，`until` 前有效。 */
+  fable_credits_required?: {
+    model?: string | null
+    at?: string | null
+    until?: string | null
+  } | null
   /** anthropic | openai。缺省按 Claude 槽展示。 */
   platform?: string | null
   /** claude | codex */
@@ -418,6 +475,12 @@ export type Vm = {
   /** Claude CLI native 执行位热准入上限，也是预调度的席位上限；内核固定预开 20。 */
   session_slots?: number | null
   session_slots_override?: boolean
+  /** Claude family mode root-session cap. */
+  max_primary_sessions?: number | null
+  max_primary_sessions_override?: boolean
+  /** null = family mode disabled, children keep their own seats. */
+  max_subagents_per_session?: number | null
+  max_subagents_per_session_override?: boolean
   /** 去掉本槽覆盖（PATCH 字段传 null）后会落回的值。 */
   scheduling_inherited?: VmSchedulingInherited | null
   /** 单槽位配额覆盖；缺字段 = 跟随全局 `settings/quota`。GPT 槽位恒为 null。 */
@@ -467,9 +530,11 @@ export type Vm = {
   total_cost?: number
   /** 累计 token（含缓存），与 total_cost 同源。 */
   total_tokens?: number
+  lifetime_usage?: { cost: number; tokens: number }
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
+  oauth_registration?: 'console' | 'oauth' | null
   account_uuid?: string
   org_uuid?: string
   access_preview?: string
@@ -534,6 +599,8 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  /** 近 24h 每 30 分钟 [成功, 失败]，最后一格是当前；无请求为 null。 */
+  health_24h?: Array<[number, number]> | null
   window_fable_cost?: number
   estimate_5h?: WindowEstimate
   estimate_7d?: WindowEstimate
@@ -812,6 +879,8 @@ export type VmSchedulingInherited = {
   max_sessions?: number | null
   /** Codex 行为 null。 */
   session_slots: number | null
+  max_primary_sessions?: number | null
+  max_subagents_per_session?: number | null
 }
 
 export type OpenAIQuotaPolicy = {

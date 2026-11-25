@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../../src/lib/vm/slot-seed.mjs'
+import {
+  initializeSlotSeedFiles,
+  writeSlotSeedFiles,
+  inferProjectRootFromCliHome,
+} from '../../src/lib/vm/slot-seed.mjs'
+import { seedFreshCliHome } from '../../src/lib/vm/vm-recreate.mjs'
+import { runtimeFileOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { standardSeedPolicy } from '../../src/lib/protocol/seed-policy.mjs'
 import { KIN_SEED_SCHEMA } from '../../src/lib/identity/workstation-profile.mjs'
 import { applySeedAfterOfficialInit } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
@@ -14,6 +20,86 @@ test('inferProjectRootFromCliHome walks vms/<id>/cli-home', () => {
   assert.equal(inferProjectRootFromCliHome(home), path.resolve(root))
   assert.equal(inferProjectRootFromCliHome('/tmp/not-a-slot'), null)
 })
+
+for (const dataplane of ['wrap', 'crag']) {
+  test(`fresh ${dataplane} VM has private, VM-owned first-launch settings`, (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fresh-settings-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const vm = {
+      id: 'vm-13',
+      node_id: 'node-a',
+      dataplane,
+      timezone: 'Asia/Shanghai',
+      seed_policy: { telemetry_disabled: false, extra_env: { CLAUDE_CODE_DISABLE_TELEMETRY: '0', CUSTOM: 'kept' } },
+    }
+    const { homeDir } = seedFreshCliHome(root, vm)
+    const file = path.join(homeDir, '.claude', 'settings.json')
+    const settings = JSON.parse(fs.readFileSync(file, 'utf8'))
+    assert.equal(settings.env.TZ, 'Asia/Shanghai')
+    assert.equal(settings.env.CUSTOM, 'kept')
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+    assert.equal(settings.autoUpdates, false)
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+    for (const dir of [homeDir, path.dirname(file)]) {
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
+      if (process.getuid?.() === 0) {
+        assert.equal(fs.statSync(dir).uid, runtimeFileOwner(vm).uid)
+        assert.equal(fs.statSync(dir).gid, runtimeFileOwner(vm).gid)
+      }
+    }
+  })
+}
+
+test('seed initialization merges authoritative node settings and waits for publication', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-node-settings-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vm = { id: 'vm-13', node_id: 'node-a', timezone: 'UTC' }
+  writeSlotSeedFiles(root, vm, null, { existingSettings: { controller_only: true } })
+  let published = false
+  const seed = await initializeSlotSeedFiles(root, vm, {
+    async seedFiles() {
+      return {
+        files: { 'settings.json': JSON.stringify({ permissions: { allow: ['Read'] }, env: { CUSTOM: 'node' } }) },
+      }
+    },
+    async syncSeed(_vm, slotDir) {
+      const settings = JSON.parse(fs.readFileSync(path.join(slotDir, 'cli-home', '.claude', 'settings.json')))
+      assert.equal(settings.controller_only, undefined)
+      assert.equal(settings.env.CUSTOM, 'node')
+      assert.deepEqual(settings.permissions, { allow: ['Read'] })
+      published = true
+      return { published: true }
+    },
+  })
+  assert.equal(seed.wrote, true)
+  assert.equal(published, true)
+})
+
+for (const stage of ['read', 'parse', 'publish']) {
+  test(`seed initialization propagates ${stage} failures`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-init-failure-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    let published = false
+    await assert.rejects(
+      initializeSlotSeedFiles(
+        root,
+        { id: 'vm-13' },
+        {
+          async seedFiles() {
+            if (stage === 'read') throw new Error('node_read_failed')
+            return { files: { 'settings.json': stage === 'parse' ? '{invalid' : null } }
+          },
+          async syncSeed() {
+            published = true
+            return { published: false }
+          },
+        },
+      ),
+    )
+    assert.equal(published, stage === 'publish')
+  })
+}
 
 test('writeSlotSeedFiles writes latest settings and workstation kin-seed', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-seed-'))
@@ -44,7 +130,7 @@ test('writeSlotSeedFiles writes latest settings and workstation kin-seed', () =>
   const claudeSetting = fs.readFileSync(path.join(leftover, 'claude.setting'), 'utf8')
   const seed = JSON.parse(fs.readFileSync(path.join(leftover, 'kin-seed.json'), 'utf8'))
   assert.equal(settings.env.DISABLE_TELEMETRY, undefined)
-  assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+  assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   assert.equal(settings.env.ANTHROPIC_BASE_URL, undefined)
   assert.equal(settings.env.ANTHROPIC_API_KEY, undefined)
   assert.equal(settings.env.KEEP, '1')
@@ -172,4 +258,88 @@ test('malformed existing settings fail instead of silently overwriting VM settin
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('writeSlotSeedFiles writes CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 only when global switch enables it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-nonessential-'))
+  try {
+    const vm = { id: 'vm-14', seed_policy: { telemetry_disabled: false } }
+    const suppressed = writeSlotSeedFiles(root, vm, null, {
+      cragNativeTelemetry: true,
+      routing: { telemetry: { disable_nonessential_traffic: true } },
+    })
+    assert.equal(suppressed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+
+    const restored = writeSlotSeedFiles(root, vm, null, {
+      cragNativeTelemetry: true,
+      routing: { telemetry: { disable_nonessential_traffic: false } },
+    })
+    assert.equal(restored.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('initializeSlotSeedFiles resolves CRAG native telemetry and KIN_ROUTING_FILE via SSOT', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-crag-reinstall-'))
+  const routingFile = path.join(root, 'custom-routing.json')
+  const prevRoutingFile = process.env.KIN_ROUTING_FILE
+  t.after(() => {
+    if (prevRoutingFile === undefined) delete process.env.KIN_ROUTING_FILE
+    else process.env.KIN_ROUTING_FILE = prevRoutingFile
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  process.env.KIN_ROUTING_FILE = routingFile
+  fs.writeFileSync(routingFile, JSON.stringify({ inference: { dataplane: 'crag' }, telemetry: {} }))
+
+  const host = {
+    native: false,
+    async seedFiles() {
+      return {
+        files: {
+          'settings.json': JSON.stringify({
+            env: {
+              CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+              DISABLE_TELEMETRY: '1',
+              CLAUDE_CODE_DISABLE_TELEMETRY: '1',
+              CUSTOM: 'preserved',
+            },
+          }),
+        },
+      }
+    },
+    async syncSeed() {
+      return { published: true }
+    },
+  }
+
+  const enabledVm = {
+    id: 'vm-crag-on',
+    node_id: 'node-a',
+    seed_policy: { telemetry_disabled: false, claude_setting: 'CUSTOM_SETTING=1' },
+  }
+  const onSeed = await initializeSlotSeedFiles(root, enabledVm, host)
+  assert.equal(onSeed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  assert.equal(onSeed.settings.env.DISABLE_TELEMETRY, undefined)
+  assert.equal(onSeed.settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+  assert.equal(onSeed.settings.env.DO_NOT_TRACK, undefined)
+  assert.equal(onSeed.settings.env.CUSTOM, 'preserved')
+  assert.equal(onSeed.claude_setting, 'CUSTOM_SETTING=1')
+
+  const disabledVm = {
+    id: 'vm-crag-off',
+    node_id: 'node-a',
+    seed_policy: { telemetry_disabled: true },
+  }
+  const offSeed = await initializeSlotSeedFiles(root, disabledVm, host)
+  assert.equal(offSeed.settings.env.DISABLE_TELEMETRY, '1')
+  assert.equal(offSeed.settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, '1')
+  assert.equal(offSeed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+
+  fs.writeFileSync(
+    routingFile,
+    JSON.stringify({ inference: { dataplane: 'crag' }, telemetry: { disable_nonessential_traffic: true } }),
+  )
+  const globalSuppressed = await initializeSlotSeedFiles(root, enabledVm, host)
+  assert.equal(globalSuppressed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
 })

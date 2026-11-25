@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
-import { listVms, isCodexVm } from '../../src/lib/vm/vm-registry.mjs'
+import { listVms, isCodexVm, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
 import {
   needsRefresh,
   expiresAtToMs,
@@ -12,6 +12,8 @@ import {
   applyOauthToCfg,
   persistOauthToVm,
   healLeftoverAuthState,
+  markVmRestriction,
+  clearVmQuotaRestriction,
   markVmAuthCooldown,
   clearVmAuthCooldown,
   clearRecoverableVmCooldown,
@@ -19,6 +21,7 @@ import {
   readWorkerCredentialFile,
   readSlotCredentialIdentity,
   writeWorkerCredentialFile,
+  ensureOfficialCredentialLink,
   ensureSlotSubscriptionType,
   slotUidGidFromHomeDir,
   ensureSlotClaudeOwnership,
@@ -82,6 +85,23 @@ test('persist + apply keep other vm fields', () => {
 
 test('persistOauthToVm returns null for a missing vm file', () => {
   assert.equal(persistOauthToVm('/nonexistent/vm.json', { access_token: 'x' }), null)
+})
+
+test('OAuth enrollment survives refresh but is replaced when the slot registers again', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-registration-'))
+  const vmPath = path.join(dir, 'vm-05.json')
+  fs.writeFileSync(vmPath, JSON.stringify({ id: 'vm-05' }))
+  try {
+    const setup = { mode: 'setup-token', access_token: 'access', refresh_token: 'refresh', scope: 'user:profile' }
+    const registered = persistOauthToVm(vmPath, { ...setup, oauth_registration: 'console' }, { operatorImport: true })
+    assert.equal(summarizeVm(registered).oauth_registration, 'console')
+    assert.equal(summarizeVm(persistOauthToVm(vmPath, setup)).oauth_registration, 'console')
+    const converted = persistOauthToVm(vmPath, { ...setup, source: 'oauth-to-setup-token' }, { operatorImport: true })
+    assert.equal(summarizeVm(converted).credential_mode, 'setup-token')
+    assert.equal(summarizeVm(converted).oauth_registration, 'oauth')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('persistOauthToVm clears leftover oauth_cleared after a live credential', () => {
@@ -351,7 +371,7 @@ test('writeWorkerCredentialFile preserves full-scope setup-token metadata', () =
   fs.rmSync(home, { recursive: true, force: true })
 })
 
-test('writeWorkerCredentialFile stores claudeAiOauth and reads back', () => {
+test('writeWorkerCredentialFile stores claudeAiOauth without exposing email inside the VM', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-write-'))
   writeWorkerCredentialFile(home, {
     access_token: 'sk-ant-oat01-TEST',
@@ -359,21 +379,78 @@ test('writeWorkerCredentialFile stores claudeAiOauth and reads back', () => {
     expires_at: 1787486457,
     email: 'slot@example.com',
     account_uuid: 'acct-1',
+    org_uuid: 'org-1',
   })
   const cred = readWorkerCredentialFile(home)
   assert.equal(cred.access_token, 'sk-ant-oat01-TEST')
   assert.equal(cred.refresh_token, 'sk-ant-ort01-TEST')
-  assert.equal(cred.email, 'slot@example.com')
+  assert.equal(cred.email, null)
+  assert.equal(cred.account_uuid, 'acct-1')
+  assert.equal(cred.org_uuid, 'org-1')
   assert.equal(expiresAtToMs(cred.expires_at), 1787486457000)
   const official = path.join(home, '.claude', '.credentials.json')
   const stored = path.join(home, '.claude', 'credentials.json')
   assert.equal(fs.statSync(stored).mode & 0o777, 0o444)
-  const raw = JSON.parse(fs.readFileSync(stored, 'utf8'))
+  const text = fs.readFileSync(stored, 'utf8')
+  assert.equal(text.includes('slot@example.com'), false)
+  const raw = JSON.parse(text)
+  assert.equal(raw.email, undefined)
+  assert.equal(raw.claudeAiOauth.email, undefined)
   assert.equal(typeof raw.kinGeneration, 'number')
   assert.equal(raw.claudeAiOauth.kinGeneration, raw.kinGeneration)
   assert.equal(fs.lstatSync(official).isSymbolicLink(), true)
   assert.equal(fs.readlinkSync(official), 'credentials.json')
   fs.rmSync(home, { recursive: true, force: true })
+})
+
+test('ensureOfficialCredentialLink strips email when adopting or relinking slot credentials', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-strip-email-'))
+  try {
+    const claude = path.join(home, '.claude')
+    const worker = path.join(claude, 'credentials.json')
+    const official = path.join(claude, '.credentials.json')
+    fs.mkdirSync(claude, { recursive: true })
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        email: 'top@example.com',
+        claudeAiOauth: {
+          accessToken: 'at-adopt',
+          refreshToken: 'rt-adopt',
+          expiresAt: 2_000,
+          email: 'oauth@example.com',
+          emailAddress: 'oauth-addr@example.com',
+          email_address: 'oauth-snake@example.com',
+          accountUuid: 'acct-adopt',
+        },
+      }),
+    )
+    const adopted = ensureOfficialCredentialLink(home, { adoptOfficial: true })
+    assert.equal(adopted.linked, true)
+    assert.equal(adopted.adopted, true)
+    const afterAdopt = fs.readFileSync(worker, 'utf8')
+    assert.doesNotMatch(afterAdopt, /example\.com|emailAddress|email_address|"email"/)
+    assert.equal(readWorkerCredentialFile(home).account_uuid, 'acct-adopt')
+
+    fs.writeFileSync(
+      worker,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'at-legacy',
+          refreshToken: 'rt-legacy',
+          expiresAt: 3_000,
+          email: 'legacy@example.com',
+        },
+      }),
+    )
+    const relinked = ensureOfficialCredentialLink(home, { adoptOfficial: false })
+    assert.equal(relinked.linked, true)
+    const afterRelink = fs.readFileSync(worker, 'utf8')
+    assert.doesNotMatch(afterRelink, /legacy@example\.com|"email"/)
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-legacy')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('writeWorkerCredentialFile stores subscriptionType and falls back to the vm plan', () => {
@@ -615,4 +692,43 @@ test('clearRecoverableVmCooldown keeps Codex park when grant is dead', () => {
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   assert.equal(vm.temp_unschedulable_reason, 'oauth_revoked')
   assert.equal(vm.codex.extra.codex_limited_until, until)
+})
+
+test('custom duration quota park (quota_24h_header) is preserved by auth healing and cleared by clearVmQuotaRestriction', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-quota-24h-'))
+  try {
+    const vmPath = path.join(dir, 'vm-codex-24h.json')
+    const until = Date.now() + 60_000
+    fs.writeFileSync(
+      vmPath,
+      JSON.stringify({
+        id: 'vm-codex-24h',
+        platform: 'openai',
+        schedulable: true,
+        claude: {},
+      }),
+    )
+    markVmRestriction(vmPath, { until, reason: 'quota_24h_header' })
+
+    healLeftoverAuthState(vmPath)
+    let vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(vm.temp_unschedulable_reason, 'quota_24h_header')
+    assert.equal(vm.temp_unschedulable_until, until)
+    assert.equal(vm.claude.temp_unschedulable_reason, 'quota_24h_header')
+    assert.equal(vm.claude.temp_unschedulable_until, until)
+
+    clearVmAuthCooldown(vmPath)
+    vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(vm.temp_unschedulable_reason, 'quota_24h_header')
+    assert.equal(vm.claude.temp_unschedulable_reason, 'quota_24h_header')
+
+    clearVmQuotaRestriction(vmPath)
+    vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(vm.temp_unschedulable_reason, undefined)
+    assert.equal(vm.temp_unschedulable_until, undefined)
+    assert.equal(vm.claude.temp_unschedulable_reason, undefined)
+    assert.equal(vm.claude.temp_unschedulable_until, undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

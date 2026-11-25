@@ -113,6 +113,13 @@ const PATTERN_LEN = 400
 const RULE_MAX = 60
 const SCOPE_LIST_MAX = 200
 
+const HARD_RULE_ZH_BYPASS = String.raw`(?<!(?:不要|不得|禁止|切勿|不是|并非))(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容|道德|伦理)(?:限制|审查|过滤|策略)`
+const HARD_RULE_ZH_JAILBREAK_MODE = String.raw`(?<!(?:不要|不得|禁止|切勿|不是|并非|检测|识别|拦截|防止|防范))(?:(?:进入|开启|启用|打开|激活|切换(?:到|至)?|使用|执行|套用|运行|生成|编写|写(?:一个|一段|一条)?|给我(?:一个|一段|一条)?|提供(?:一个|一段|一条)?)(?:一个|一段|一条)?(?:越狱|破限)(?:模式|提示词|提示|指令)|(?:越狱|破限)模式(?:已)?(?:开启|启用|启动|激活))`
+const HARD_RULE_KEYGEN_WAREZ = String.raw`(?<![\w./<-])(?:warez|(?<=\b(?:(?:write|build|create|make|code|generate|download|need|want)\s+(?:a\s+|an\s+|the\s+)?|(?:crack|patch|serial|license|activation)\s+(?:and\s+|or\s+)?))keygen|keygen(?=\s+for\s+(?:[\w.-]+\s+){0,2}(?:software|app|program|game|license|activation|drm|serial)\b))(?![\w./>-])`
+const HARD_RULE_ZH_CRACK = String.raw`(?:破解补丁|注册机(?![构器制房型])|激活码生成器)`
+const HARD_RULE_EN_COT_EXTRACTION = String.raw`\b(?:perform(?:ing)?|do(?:ing)?|run(?:ning)?|execute|conduct|(?:this|it)\s+is\s+a|you\s+are\s+a|act\s+as\s+a)\s+(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction(?:\s+(?:task|agent|assistant|bot|mode|job|prompt))?\b`
+const HARD_RULE_ZH_COT_NOMINAL = String.raw`(?:(?:进行|执行|做(?:一次)?|完成|开启)\s*(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取)|(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:蒸馏|收割))`
+
 /**
  * User-authored text, including the caller's own system / instructions prompt.
  * 官方提示词 and 官方完整提示词 are whitelisted and never sent. Tool results
@@ -130,11 +137,11 @@ export const HARD_POLICY_RULES = Object.freeze([
   },
   {
     category: 'jailbreak',
-    source: String.raw`(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容)?(?:限制|审查|过滤|策略)`,
+    source: HARD_RULE_ZH_BYPASS,
   },
-  { category: 'jailbreak', source: String.raw`(?:越狱|破限)(?:模式|提示词|提示|指令)` },
-  { category: 'crack', source: String.raw`(?<![\w-])(?:keygen|warez)(?![\w-])` },
-  { category: 'crack', source: String.raw`(?:破解补丁|注册机|激活码生成器)` },
+  { category: 'jailbreak', source: HARD_RULE_ZH_JAILBREAK_MODE },
+  { category: 'crack', source: HARD_RULE_KEYGEN_WAREZ },
+  { category: 'crack', source: HARD_RULE_ZH_CRACK },
   {
     category: 'crack',
     source: String.raw`\bcrack(?:ing)?\s+(?:this\s+|the\s+)?(?:software|license|drm|activation)\b`,
@@ -152,7 +159,7 @@ export const HARD_POLICY_RULES = Object.freeze([
     category: 'distill',
     source: String.raw`\b(?:extract|export|dump|reveal|harvest|exfiltrate)(?:ing|ed|ion|s)?\s+(?:(?:the|your|a|an|full|hidden|internal|complete|raw|durable|entire)\s+){0,4}(?:chain[- ]of[- ]thoughts?|reasoning\s+traces?|hidden\s+reasoning|internal\s+reasoning|internal\s+monologues?)\b`,
   },
-  { category: 'distill', source: String.raw`\b(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction\b` },
+  { category: 'distill', source: HARD_RULE_EN_COT_EXTRACTION },
   { category: 'distill', source: String.raw`(?:思维链蒸馏|推理蒸馏|思考链蒸馏)` },
   {
     category: 'distill',
@@ -160,13 +167,33 @@ export const HARD_POLICY_RULES = Object.freeze([
   },
   {
     category: 'distill',
-    source: String.raw`(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取|蒸馏|收割)`,
+    source: HARD_RULE_ZH_COT_NOMINAL,
   },
   {
     category: 'distill',
     source: String.raw`(?:提取|导出|抽取)\s*(?:出)?\s*(?:隐藏|内部)\s*(?:的)?\s*(?:推理|思维|思考)`,
   },
   { category: 'custom', source: String.raw`\bphishing\s+kit\b` },
+])
+
+/** Unedited builtin regexes saved before #1593 upgrade in normalizeRules; edited sources or changed categories stay. */
+const LEGACY_BUILTIN_RULE_SOURCES = new Map([
+  [
+    String.raw`(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容)?(?:限制|审查|过滤|策略)`,
+    { category: 'jailbreak', source: HARD_RULE_ZH_BYPASS },
+  ],
+  [String.raw`(?:越狱|破限)(?:模式|提示词|提示|指令)`, { category: 'jailbreak', source: HARD_RULE_ZH_JAILBREAK_MODE }],
+  [String.raw`\b(?:keygen|warez)\b`, { category: 'crack', source: HARD_RULE_KEYGEN_WAREZ }],
+  [String.raw`(?<![\w-])(?:keygen|warez)(?![\w-])`, { category: 'crack', source: HARD_RULE_KEYGEN_WAREZ }],
+  [String.raw`(?:破解补丁|注册机|激活码生成器)`, { category: 'crack', source: HARD_RULE_ZH_CRACK }],
+  [
+    String.raw`\b(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction\b`,
+    { category: 'distill', source: HARD_RULE_EN_COT_EXTRACTION },
+  ],
+  [
+    String.raw`(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取|蒸馏|收割)`,
+    { category: 'distill', source: HARD_RULE_ZH_COT_NOMINAL },
+  ],
 ])
 
 export const USAGE_POLICY_INSTRUCTION =
@@ -438,11 +465,17 @@ function normalizeRules(raw) {
   const seen = new Set()
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue
-    const source = cleanPattern(item.source)
-    if (!source || seen.has(source) || out.length >= RULE_MAX) continue
+    const rawSource = cleanPattern(item.source)
+    if (!rawSource) continue
+    const hasCategory = allowed.has(item.category)
+    const legacy = LEGACY_BUILTIN_RULE_SOURCES.get(rawSource)
+    const migrated = legacy && (!hasCategory || item.category === legacy.category) ? legacy : null
+    const category = migrated ? migrated.category : hasCategory ? item.category : 'custom'
+    const source = migrated ? migrated.source : rawSource
+    if (seen.has(source) || out.length >= RULE_MAX) continue
     seen.add(source)
     out.push({
-      category: allowed.has(item.category) ? item.category : 'custom',
+      category,
       source,
       enabled: item.enabled !== false,
     })
@@ -1142,8 +1175,8 @@ const OFFICIAL_PROMPT_CHUNKS = [
   .sort((a, b) => b.length - a.length)
 
 /** Drop whitelisted official prompt text. Caller text around it stays auditable. */
-export function stripOfficialPromptWhitelist(text) {
-  let rest = cleanUserAsk(text)
+export function stripOfficialPromptWhitelist(text, keepReminders = false) {
+  let rest = keepReminders ? text : cleanUserAsk(text)
   if (OFFICIAL_PROMPT_EXACT.has(rest.trim())) return ''
   rest = rest.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*$/gim, '')
   for (const chunk of OFFICIAL_PROMPT_CHUNKS) {
@@ -1170,15 +1203,15 @@ function pushPromptContent(raw, content) {
 }
 
 /** Caller prompt fields. Official template bodies are removed before return. */
-function promptPieces(src) {
+function promptPieces(src, keepReminders) {
   if (!src || typeof src !== 'object') return []
   const raw = []
   pushPromptContent(raw, src.system)
-  if (typeof src.instructions === 'string') raw.push(src.instructions)
-  if (typeof src.developer === 'string') raw.push(src.developer)
+  pushPromptContent(raw, src.instructions)
+  pushPromptContent(raw, src.developer)
   const messages = Array.isArray(src.messages) ? src.messages : []
   for (const message of messages) {
-    if (String(message?.role || '').toLowerCase() !== 'system') continue
+    if (!['system', 'developer'].includes(String(message?.role || '').toLowerCase())) continue
     pushPromptContent(raw, message.content)
   }
   const input = Array.isArray(src.input) ? src.input : []
@@ -1187,11 +1220,15 @@ function promptPieces(src) {
     if (role !== 'system' && role !== 'developer') continue
     pushPromptContent(raw, item.content ?? item.text)
   }
-  return raw.map(stripOfficialPromptWhitelist).filter(Boolean)
+  return raw.map((text) => stripOfficialPromptWhitelist(text, keepReminders)).filter(Boolean)
 }
 
 /** Hard regex sees user turns and caller prompts. Official prompts and tool results are not scanned. */
-export function jevDocument(inbound, body = inbound, { interceptSession = null, ctx = null } = {}) {
+export function jevDocument(
+  inbound,
+  body = inbound,
+  { interceptSession = null, ctx = null, keepPromptReminders = false } = {},
+) {
   const users = refusalUserDocument(inbound, body, {
     includeToolResults: false,
     clean: cleanUserAsk,
@@ -1200,15 +1237,15 @@ export function jevDocument(inbound, body = inbound, { interceptSession = null, 
   })
   const seen = new Set()
   const prompts = []
-  for (const src of [inbound, body]) {
-    for (const piece of promptPieces(src)) {
+  for (const src of inbound === body ? [inbound] : [inbound, body]) {
+    for (const piece of promptPieces(src, keepPromptReminders)) {
       const norm = normalizeText(piece)
       if (!norm || seen.has(norm)) continue
       seen.add(norm)
       prompts.push(norm)
     }
   }
-  return [users, prompts.join('\n')].filter(Boolean).join('\n')
+  return [users, cleanUserAsk(inbound?.prompt), prompts.join('\n')].filter(Boolean).join('\n')
 }
 
 /** User text only. System prompts, env blocks, and tool payloads are not the ask. */
@@ -1217,7 +1254,27 @@ function jevModelContentText(content) {
   if (Array.isArray(content)) return content.map(jevModelContentText).filter(Boolean).join('\n')
   if (!content || typeof content !== 'object') return ''
   const type = String(content.type || '')
-  if (type === 'tool_result' || type === 'function_call_output' || type.endsWith('_tool_result')) return ''
+  if (['document', 'input_file', 'file'].includes(type)) {
+    const file = content.source || content.file || content
+    if (file.type === 'content') return jevModelContentText(file.content)
+    if (file.type === 'text' || typeof file.text === 'string') return cleanUserAsk(file.data ?? file.text)
+    const data = file.data ?? file.file_data
+    if (typeof data !== 'string') return ''
+    const inline = /^data:(text\/[\w.+-]+|application\/(?:json|xml))(?:;charset=utf-8)?;base64,/i.exec(data)
+    const media = file.media_type || file.mime_type || ''
+    const encoded = inline
+      ? data.slice(inline[0].length)
+      : /^(?:text\/|application\/(?:json|xml)$)/i.test(media)
+        ? data
+        : ''
+    if (!encoded || encoded.length > 86_000 || !/^[\da-z+/]+={0,2}$/i.test(encoded)) return ''
+    try {
+      return cleanUserAsk(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64')))
+    } catch {
+      return ''
+    }
+  }
+  if (type && !['text', 'input_text', 'message'].includes(type)) return ''
   if (typeof content.text === 'string') return cleanUserAsk(content.text)
   if (typeof content.content === 'string') return cleanUserAsk(content.content)
   if (Array.isArray(content.content)) return jevModelContentText(content.content)
@@ -1233,11 +1290,6 @@ export function jevCurrentAsk(document) {
   return block.replace(/^\[user (?:message|input) \d+\]\n/, '').trim()
 }
 
-/**
- * Caller prompts plus user turns. 官方提示词 and 官方完整提示词 are omitted.
- * The current ask stays the last user turn when one exists. Assistant and tool
- * turns stay out.
- */
 function buildJevModelParts(inbound, body = inbound, { interceptSession = null, ctx = null } = {}) {
   const seen = new Set(interceptSession?.modelSeen || [])
   const parts =
@@ -1259,11 +1311,7 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
     parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {
-    if (!messageStart) {
-      promptPieces(src).forEach((piece, index) => {
-        push(`system prompt ${index + 1}`, piece)
-      })
-    }
+    if (typeof src?.prompt === 'string') push('user input 1', cleanUserAsk(src.prompt))
     const messages = Array.isArray(src?.messages) ? src.messages : []
     messages.slice(messageStart).forEach((message, offset) => {
       const index = messageStart + offset
@@ -1278,6 +1326,7 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
         push(`user input ${index + 1}`, cleanUserAsk(item))
         return
       }
+      if (item?.type && !['message', 'input_text', 'input_file', 'file', 'document'].includes(item.type)) return
       const role = String(item?.role || 'user').toLowerCase()
       if (role !== 'user' && role !== '') return
       push(`user input ${index + 1}`, jevModelContentText(item?.content ?? item))
@@ -1350,20 +1399,28 @@ export function parsePolicyDecision(payload, cfg = {}) {
   const custom = storedSafetyInstruction(cfg.safety_instruction)
   const ids = custom ? [...asked, 'custom'] : asked
   const hits = []
-  let saw = false
+  const scores = []
+  const readScore = (answer) => {
+    const value = answer?.noul
+    if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null
+    const score = Number(value)
+    return Number.isFinite(score) && score >= 0 && score <= 1 ? score : null
+  }
   for (const id of ids) {
-    const score = Number(answers[id]?.noul)
-    if (!Number.isFinite(score)) continue
-    saw = true
+    const score = readScore(answers[id])
+    if (score === null) continue
+    scores.push(score)
     if (scoreBlocks(score, cfg)) hits.push({ category: id, score })
   }
-  if (!saw) {
-    const score = Number(answers.safety?.noul)
-    if (!Number.isFinite(score)) return null
-    const hits = scoreBlocks(score, cfg) ? [{ category: 'safety', score }] : []
-    return { hits: dropLoneNearMiss(hits, cfg) }
+  if (!scores.length) {
+    const score = readScore(answers.safety)
+    if (score === null) return null
+    scores.push(score)
+    if (scoreBlocks(score, cfg)) hits.push({ category: 'safety', score })
   }
-  return { hits: dropLoneNearMiss(hits, cfg) }
+  const score = cfg.block_if_below === false ? Math.max(...scores) : Math.min(...scores)
+  const margin = cfg.block_if_below === false ? policyLine(cfg) - score : score - policyLine(cfg)
+  return { hits: dropLoneNearMiss(hits, cfg), score, margin: Math.max(0, margin) }
 }
 
 function noulQuestion(instructions) {
@@ -2038,7 +2095,7 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
       attemptUsage.usage = responsePayload?.usage
       attemptUsage.response_model = responsePayload?.model
       const decision = parsePolicyDecision(responsePayload, config)
-      if (!decision) return { action: 'pass', reason: 'invalid', state: document }
+      if (!decision) return unavailable(config, '审核评分无效')
       attemptUsage.outcome = 'success'
       const verdict = decision.hits.length
         ? {
@@ -2047,7 +2104,7 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
             categories: decision.hits.map((hit) => hit.category),
             state: document,
           }
-        : { action: 'pass', reason: 'safe', state: document }
+        : { action: 'pass', reason: 'safe', state: document, score: decision.score, margin: decision.margin }
       if (windowMs > 0) verdictCache.set(key, { verdict, at: now })
       return verdict
     } catch {

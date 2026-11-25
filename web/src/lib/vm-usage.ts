@@ -247,12 +247,8 @@ export function vmWindowTokens(
   }
 }
 
-/**
- * 账号累计官方价费用。`/api/panel/vms` 不带任何费用字段，累计值只在 `/usage`
- * 账号行和 `/dashboard` 的槽位里；两边都可能缺，取较大者，和 `vmTodayView`
- * 同一取舍——累计只增不减，较小的一定是过期或缺失。
- */
 export function vmTotalCost(vm: Vm, accounts?: UsageAccountRow[]): number {
+  if (vm.lifetime_usage) return vm.lifetime_usage.cost
   return Math.max(
     num(vm.total_cost),
     num(usageAccountForVm(vm, accounts)?.total_cost)
@@ -261,6 +257,7 @@ export function vmTotalCost(vm: Vm, accounts?: UsageAccountRow[]): number {
 
 /** 累计 token，与 `vmTotalCost` 同源同取舍。 */
 export function vmTotalTokens(vm: Vm, accounts?: UsageAccountRow[]): number {
+  if (vm.lifetime_usage) return vm.lifetime_usage.tokens
   return Math.max(
     num(vm.total_tokens),
     num(usageAccountForVm(vm, accounts)?.total_tokens)
@@ -270,6 +267,8 @@ export function vmTotalTokens(vm: Vm, accounts?: UsageAccountRow[]): number {
 export type VmLedgerRow = {
   key: '5h' | '7d' | 'total'
   label: string
+  /** 总计行口径的完整措辞，作为悬停提示补充 `label`，不承载 `label` 缺少的信息。 */
+  note?: string
   cost: number
   tokens: number
 }
@@ -286,7 +285,14 @@ export function vmCostLedger(
     { key: '7d', label: '7D', cost: cost.d7, tokens: tok.d7 },
     {
       key: 'total',
-      label: '总计',
+      // 两种口径不能共用一个标签：`账号总计` 是账号全生命周期的真实总额，
+      // `日志合计` 只是尚未被裁剪的日志之和，是个下界。把两者都写成「总计」会把
+      // 一个下界说成全部，而区分只留在 `note`（`title` 原生提示）里——触屏没有悬停、
+      // 这里是 `<td>`/`<span>` 本就不可聚焦、屏幕阅读器对非交互元素的 `title`
+      // 播报也不一致，于是「这个数完不完整」在这些场景里直接消失。
+      // 可见文本保留区分，同时让最长的标签从 `保留日志合计`(6) 缩到 4 个字。
+      label: vm.lifetime_usage ? '账号总计' : '日志合计',
+      note: vm.lifetime_usage ? '账号总计' : '保留日志合计',
       cost: vmTotalCost(vm, accounts),
       tokens: vmTotalTokens(vm, accounts),
     },

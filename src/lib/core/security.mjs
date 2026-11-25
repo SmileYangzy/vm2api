@@ -20,6 +20,18 @@ export function redactSecrets(obj) {
     .replace(/sk-ant-[a-z0-9-]{8,}/gi, (m) => m.slice(0, 14) + '***REDACTED***')
     .replace(/sk-(?:kin|vm)-[a-f0-9]{8,}/gi, (m) => m.slice(0, 10) + '***REDACTED***')
     .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer ***REDACTED***')
+    .replace(/([?&]key=)[^&"'\s\\]+/gi, '$1***REDACTED***')
+}
+
+function isGoogleGeminiApiPath(rawUrl) {
+  if (typeof rawUrl !== 'string') return false
+  const pathname = rawUrl.split('?', 1)[0]
+  return (
+    pathname === '/v1beta/models' ||
+    pathname.startsWith('/v1beta/models/') ||
+    pathname === '/v1/models' ||
+    pathname.startsWith('/v1/models/')
+  )
 }
 
 export function extractApiKey(req) {
@@ -31,11 +43,24 @@ export function extractApiKey(req) {
     return t
   }
   if (req.headers['x-api-key']) return String(req.headers['x-api-key']).trim()
+  if (req.headers['x-goog-api-key']) {
+    const t = String(req.headers['x-goog-api-key']).trim()
+    if (t.startsWith('kin-panel-')) return ''
+    return t
+  }
+  if (isGoogleGeminiApiPath(req.url)) {
+    try {
+      const q = new URL(req.url, 'http://127.0.0.1').searchParams.get('key')
+      const t = typeof q === 'string' ? q.trim() : ''
+      if (t && !t.startsWith('kin-panel-')) return t
+    } catch {}
+  }
   return ''
 }
 
-/** Simple token bucket per key */
+/** Simple token bucket per key; non-positive capacity or refill disables throttling. */
 export function createRateLimiter({ capacity = 60, refillPerSec = 1 } = {}) {
+  if (!(capacity > 0) || !(refillPerSec > 0)) return () => true
   const buckets = new Map()
   return function allow(key) {
     const now = Date.now()
@@ -117,7 +142,7 @@ function loadSessions() {
     for (const [storedKey, s] of Object.entries(raw || {})) {
       if (s && s.exp > now) {
         const key = storedKey.startsWith('kin-panel-') ? panelSessionKey(storedKey) : storedKey
-        panelSessions.set(key, { user: s.user, role: s.role || null, exp: s.exp })
+        panelSessions.set(key, { user: s.user, role: s.role || null, exp: s.exp, buyer: s.buyer })
       }
     }
   } catch (err) {
@@ -152,6 +177,7 @@ export function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {})
   panelSessions.set(panelSessionKey(token), {
     user: username,
     role,
+    buyer: extra.buyer,
     exp: Date.now() + ttlMs,
   })
   saveSessions()

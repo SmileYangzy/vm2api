@@ -1,12 +1,14 @@
 /**
- * Claude Code OAuth beta sets, aligned with sub2api claude/constants.go.
+ * Claude Code OAuth beta sets.
  *
  * KIN only overwrites VM identity (device / account / stainless).
- * Protocol betas follow sub2api:
+ * Protocol beta handling:
  *   official + client beta → passthrough (plus oauth if missing, minus 1M by matrix)
  *   official + empty       → DefaultBetaHeader / HaikuBetaHeader
  *   unofficial / mimic     → FullClaudeCodeMimicryBetas (Haiku: HAIKU_BETA_HEADER), never context-1m
  */
+import { isEmptyEffortValue } from './log-fields.mjs'
+
 export const BETA_OAUTH = 'oauth-2025-04-20'
 export const BETA_CLAUDE_CODE = 'claude-code-20250219'
 export const BETA_INTERLEAVED = 'interleaved-thinking-2025-05-14'
@@ -37,6 +39,7 @@ const PER_TURN_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
 }
 const MID_TOOL_CHANGE_MODELS = {
   'claude-haiku-5-5': true,
@@ -47,6 +50,7 @@ const MID_TOOL_CHANGE_MODELS = {
   'claude-fable-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
   'claude-mythos-5-1': true,
 }
 const FAST_MODE_MODELS = {
@@ -61,6 +65,7 @@ const MID_OUTPUT_CONFIG_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
   'claude-mythos-5-1': true,
 }
 
@@ -103,7 +108,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (Object.hasOwn(PER_TURN_MODELS, model)) add('per-turn-control-2026-07-01', BETA_MID_CONVERSATION_TOOL_CHANGES)
   if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model) || model === 'auto') add(BETA_MID_CONVERSATION_TOOL_CHANGES)
   if (body.thread != null && Object.hasOwn(MID_OUTPUT_CONFIG_MODELS, model)) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
-  if (body.output_config?.effort != null) add(BETA_EFFORT)
+  if (!isEmptyEffortValue(body.output_config?.effort)) add(BETA_EFFORT)
   if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES, BETA_EXTENDED_CACHE_TTL)
   if (Array.isArray(body.safeguards) && body.safeguards.some((item) => item?.type === 'dangerous_tool_use'))
     add(BETA_DANGEROUS_TOOL_USE)
@@ -147,7 +152,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
       const config = message.output_config
       if (!config || typeof config !== 'object') continue
       hasMessageOutputConfig = true
-      if (config.effort != null) hasMessageEffort = true
+      if (!isEmptyEffortValue(config.effort)) hasMessageEffort = true
       if (config.format) hasMessageFormat = true
       if (config.task_budget) hasMessageTaskBudget = true
     }
@@ -239,7 +244,7 @@ export function ensureMimicryBetas(header = '', required = DEFAULT_BETA_HEADER) 
   return have.join(',')
 }
 
-/** sub2api getBetaHeader: official client list must contain oauth-2025-04-20. */
+/** Ensure the official client beta list contains oauth-2025-04-20. */
 export function ensureOauthBeta(header = '') {
   const parts = String(header || '')
     .split(',')

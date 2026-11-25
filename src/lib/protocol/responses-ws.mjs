@@ -30,10 +30,14 @@ export function responsesWsErrorFrame({
   code,
   message,
   param,
+  details,
   requestId,
 } = {}) {
   const error = { type, code, message }
   if (param) error.param = param
+  if (details && typeof details === 'object' && Object.keys(details).length) {
+    error.details = details
+  }
   const event = { type: 'error', status, error }
   if (requestId) {
     event.request_id = requestId
@@ -370,7 +374,9 @@ function createProtocolRes() {
   res._headers = {}
   res.writeHead = function writeHead(status, headers) {
     this.statusCode = status
-    this._headers = headers || {}
+    for (const [name, value] of Object.entries(headers || {})) {
+      this._headers[String(name).toLowerCase()] = value
+    }
     this.headersSent = true
   }
   res.setHeader = function setHeader(name, value) {
@@ -424,6 +430,7 @@ function httpErrorToFrame(status, raw) {
       code: err.code || 'invalid_request_error',
       message: err.message || 'request failed',
       param: err.param,
+      details: err.details,
     })
   }
   return responsesWsErrorFrame({
@@ -461,9 +468,14 @@ export function createResponsesWsHandler({
       statusCode: 200,
       headersSent: false,
       _headers: {},
+      setHeader(name, value) {
+        this._headers[String(name).toLowerCase()] = value
+      },
       writeHead(status, headers) {
         this.statusCode = status
-        this._headers = headers || {}
+        for (const [name, value] of Object.entries(headers || {})) {
+          this._headers[String(name).toLowerCase()] = value
+        }
         this.headersSent = true
       },
       end(data) {
@@ -615,7 +627,10 @@ export function createResponsesWsHandler({
           }
           if (bridge.terminal === 'completed') {
             const snap = bridge.snapshot()
-            if (snap && !isProtocolWarmup(decoded.body)) {
+            // A warmup settles with an id the client may continue from, so it
+            // enters the replay cache like any other hop. The cache still lives
+            // only on this connection: `store` never turns into persistence.
+            if (snap) {
               replay.remember(snap.id, { input: hopBody.input, output: snap.output })
             }
             continue

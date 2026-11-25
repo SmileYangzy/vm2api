@@ -4,6 +4,7 @@ import {
   API_DEFAULTS,
   DIRECT,
   draftFromStored,
+  endpointModelRequest,
   endpointSaveRequest,
 } from './endpoint-save'
 
@@ -20,6 +21,28 @@ describe('anthropic console endpoint save', () => {
     expect(stored.keyId).toBe('ek_1')
     expect(stored.authScheme).toBe('authorization_bearer')
     expect(stored.riskReviewEnabled).toBe(false)
+  })
+
+  it('refreshes the saved channel but previews a changed address or credential', () => {
+    expect(endpointModelRequest(stored)).toMatchObject({
+      apply: true,
+      path: '/api/panel/api-endpoints/ep_1/fetch-models',
+      body: { key_id: 'ek_1' },
+    })
+    const changed = {
+      ...stored,
+      baseUrl: 'https://new.example',
+      apiKey: 'sk-fresh',
+    }
+    expect(endpointModelRequest(changed)).toMatchObject({
+      apply: false,
+      path: '/api/panel/api-endpoints/fetch-models',
+      body: {
+        base_url: changed.baseUrl,
+        api_key: changed.apiKey,
+        key_id: 'ek_1',
+      },
+    })
   })
 
   it('saving an unchanged stored row never sends name, models or proxy', () => {
@@ -139,6 +162,36 @@ describe('anthropic console endpoint save', () => {
     ).toMatchObject({ risk_review_enabled: true })
   })
 
+  it('saves body policy on creation and sends only changed stored values', () => {
+    const row = draftFromStored({ id: 'policy', body_policy: 'caller' })
+    expect(row.bodyPolicy).toBe('caller')
+    expect(endpointSaveRequest(row, 'm').body).not.toHaveProperty('body_policy')
+    expect(
+      endpointSaveRequest({ ...row, bodyPolicy: 'persona' }, 'm').body
+    ).toMatchObject({ body_policy: 'persona' })
+    expect(
+      endpointSaveRequest({ ...stored, bodyPolicy: 'caller' }, 'm').body
+    ).toMatchObject({ body_policy: 'caller' })
+    expect(
+      endpointSaveRequest({ ...row, storedId: undefined }, 'm').body
+    ).toMatchObject({ body_policy: 'caller' })
+  })
+
+  it('defaults body policy to persona and keeps OpenAI endpoints out of it', () => {
+    expect(draftFromStored({ id: 'plain' }).bodyPolicy).toBe('persona')
+    const oai = draftFromStored({
+      id: 'oai',
+      protocol: 'openai',
+      body_policy: 'caller',
+    })
+    expect(
+      endpointSaveRequest({ ...oai, bodyPolicy: 'persona' }, 'm').body
+    ).not.toHaveProperty('body_policy')
+    expect(
+      endpointSaveRequest({ ...oai, storedId: undefined }, 'm').body
+    ).not.toHaveProperty('body_policy')
+  })
+
   it('does not enroll OpenAI endpoints in the Anthropic risk toggle', () => {
     const row = draftFromStored({
       id: 'oai',
@@ -151,5 +204,46 @@ describe('anthropic console endpoint save', () => {
     expect(
       endpointSaveRequest({ ...row, storedId: undefined }, 'm').body
     ).not.toHaveProperty('risk_review_enabled')
+  })
+
+  it('defaults Gemini protocol to native official URL and x-goog-api-key auth', () => {
+    expect(API_DEFAULTS.gemini).toEqual({
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      authScheme: 'x_goog_api_key',
+    })
+    const official = draftFromStored({
+      id: 'ep_gem',
+      protocol: 'gemini',
+      base_url: 'https://generativelanguage.googleapis.com',
+      api_key_entries: [{ id: 'ek_gem' }],
+    })
+    expect(official.protocol).toBe('gemini')
+    expect(official.authScheme).toBe('x_goog_api_key')
+    const createOfficial = endpointSaveRequest(
+      {
+        ...official,
+        storedId: undefined,
+        apiKey: 'AIza-test',
+        fetchedModels: ['gemini-2.5-pro'],
+      },
+      ''
+    )
+    expect(createOfficial.body).toMatchObject({
+      kind: 'gemini',
+      protocol: 'gemini',
+      auth_scheme: 'x_goog_api_key',
+      models: [{ name: 'gemini-2.5-pro', alias: 'gemini-2.5-pro' }],
+    })
+    expect(createOfficial.body).not.toHaveProperty('risk_review_enabled')
+    expect(createOfficial.body).not.toHaveProperty('body_policy')
+
+    const customBearer = draftFromStored({
+      id: 'ep_gem_custom',
+      protocol: 'gemini',
+      base_url: 'https://kin.fkcodex.com',
+      auth_scheme: 'authorization_bearer',
+      api_key_entries: [{ id: 'ek_gem_2' }],
+    })
+    expect(customBearer.authScheme).toBe('authorization_bearer')
   })
 })

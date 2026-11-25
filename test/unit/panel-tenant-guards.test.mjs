@@ -24,7 +24,7 @@ const { parseAllowedVms } = await import('../../src/lib/admin/key-scope.mjs')
 const { parseKeyAllowedModels } = await import('../../src/lib/admin/key-models.mjs')
 const { createVmPool } = await import('../../src/lib/admin/vm-pools.mjs')
 const { VmPoolsRepo } = await import('../../src/lib/db/repos/vm-pools-repo.mjs')
-const { createDatabase } = await import('../../src/lib/db/database.mjs')
+const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
 const { createPanelSession, verifyPanelSession } = await import('../../src/lib/core/security.mjs')
 const { readCodexAccounts, upsertCodexAccount } = await import('../../src/lib/vm/codex-slot.mjs')
 
@@ -541,9 +541,12 @@ test('tenant key create/patch vm_pool_id guard; admin can set pool', async (t) =
 
 function usersFixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tenant-guards-users-'))
-  const db = createDatabase({ dataDir: dir })
+  // The user routes read the 2FA flag through a bare `SettingsRepo()`, which
+  // resolves the process-wide handle, so a detached `createDatabase()` is not
+  // enough here. Close it afterwards so the handle does not outlive the test.
+  const db = openDatabase({ dataDir: dir })
   t.after(() => {
-    db.close()
+    closeDatabase()
     fs.rmSync(dir, { recursive: true, force: true })
   })
   const panelUsers = new PanelUserStore({ db })
@@ -688,4 +691,20 @@ test('tenant test-models: own slot lists models, foreign slot 404s, refresh neve
   const admin = await makeHandler(root, ADMIN, null).call('GET', '/api/panel/test-models?vm_id=vm-other&refresh=1')
   assert.equal(admin.status, 200)
   assert.ok(dials > 0, 'admin refresh still goes live')
+})
+
+test('active usage query enforces slot ownership before reading credentials', async (t) => {
+  const root = makeProject(t)
+  claudeVm(root, 'vm-mine', 'u-1')
+  claudeVm(root, 'vm-other', 'u-2')
+  const url = (id) => `/api/panel/vms/${id}/usage/query`
+  const foreign = await makeHandler(root, TENANT, {}).call('POST', url('vm-other'))
+  assert.equal(foreign.status, 404)
+  const own = await makeHandler(root, TENANT, {}).call('POST', url('vm-mine'))
+  assert.equal(own.status, 400)
+  assert.equal(own.body.error.code, 'no_oauth_token')
+  const missing = await makeHandler(root, ADMIN, {}).call('POST', url('vm-missing'))
+  assert.equal(missing.status, 404)
+  const denied = await makeHandler(root, { ...TENANT, panelRole: 'super' }, {}).call('POST', url('vm-mine'))
+  assert.equal(denied.status, 403)
 })
