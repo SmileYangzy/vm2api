@@ -31,7 +31,7 @@ type GeminiProxy = {
 export const geminiProxyOptions = queryOptions({
   queryKey: ['panel', 'gemini-egress-options'],
   queryFn: ({ signal }) =>
-    api<{ proxies: GeminiProxy[] }>('/api/panel/proxies', { signal }),
+    api<{ proxies: GeminiProxy[] }>(`${GEMINI_ROOT}/proxies`, { signal }),
 })
 
 export function isGeminiProxy(proxy: GeminiProxy) {

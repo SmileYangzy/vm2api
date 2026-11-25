@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
@@ -745,8 +746,42 @@ function authorizationInput(body) {
   }
 }
 
+const PRIVATE_PROXY_ID = 'gemini-private-egress'
+const PRIVATE_PROXY_SECRET = '/run/secrets/vm2api-gemini-egress'
+
+function privateProxyUrl() {
+  let descriptor
+  try {
+    descriptor = fs.openSync(PRIVATE_PROXY_SECRET, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+    const info = fs.fstatSync(descriptor)
+    if (!info.isFile() || info.uid !== 0 || (info.mode & 0o077) || info.size < 1 || info.size > 1024) return null
+    const url = new URL(fs.readFileSync(descriptor, 'utf8').trim())
+    if (!url.username || !url.password) return null
+    return checkedSocksUrl(url)
+  } catch {
+    return null
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
+  }
+}
+
+function checkedSocksUrl(url) {
+  if (
+    (url.protocol === 'socks5:' || url.protocol === 'socks5h:') &&
+    isIP(url.hostname) === 4 && url.port &&
+    !/^(?:127\.|169\.254\.|22[4-9]\.|23[0-9]\.|0\.0\.0\.0$|255\.255\.255\.255$)/.test(url.hostname) &&
+    (!url.pathname || url.pathname === '/') && !url.hash && !url.search
+  ) return url.href.replace(/^socks5:/, 'socks5h:')
+  throw hostError('gemini_proxy_unavailable', 409)
+}
+
 function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = null } = {}) {
   if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
+  if (proxyId === PRIVATE_PROXY_ID) {
+    const url = privateProxyUrl()
+    if (url) return url
+    throw hostError('gemini_proxy_unavailable', 409)
+  }
   const targetOwner = normalizeOwnerId(ownerUserId)
   const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
   let proxy = scopedList.find((entry) => entry.id === proxyId)
@@ -767,21 +802,10 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = nu
   }
   try {
     const url = new URL(proxyPool.getProxyByIdWithAuth(proxyId)?.url)
-    if (
-      (url.protocol === 'socks5:' || url.protocol === 'socks5h:') &&
-      isIP(url.hostname) === 4 &&
-      url.port &&
-      !/^(?:127\.|169\.254\.|22[4-9]\.|23[0-9]\.|0\.0\.0\.0$|255\.255\.255\.255$)/.test(url.hostname) &&
-      (!url.pathname || url.pathname === '/') &&
-      !url.hash &&
-      !url.search
-    ) {
-      return url.href.replace(/^socks5:/, 'socks5h:')
-    }
+    return checkedSocksUrl(url)
   } catch {
     throw hostError('gemini_proxy_unavailable', 409)
   }
-  throw hostError('gemini_proxy_unavailable', 409)
 }
 
 async function readEnvironment(callHost, id) {
@@ -992,6 +1016,17 @@ export function createGeminiPanelHandler({
       return maintenance(req, res, pathname)
     }
     try {
+      if (req.method === 'GET' && pathname === `${PANEL_PATH}/proxies`) {
+        const proxies = (proxyPool()?.snapshot({ ownerUserId: null })?.proxies || [])
+          .filter((entry) => !entry.owner_user_id && entry.kind === 'socks5' && entry.id !== PRIVATE_PROXY_ID)
+          .map(({ id, label, enabled, kind, address_family, status, blocked_reason }) =>
+            ({ id, label, enabled, kind, address_family, status, blocked_reason }))
+        if (privateProxyUrl()) proxies.unshift({
+          id: PRIVATE_PROXY_ID, label: 'Gemini 专用出口', enabled: true, kind: 'socks5',
+          address_family: 4, status: 'unknown', blocked_reason: null,
+        })
+        return ok({ proxies })
+      }
       if (req.method === 'GET' && pathname === `${PANEL_PATH}/daemon-status`) {
         try {
           const data = await callHost('daemon-status', {})
